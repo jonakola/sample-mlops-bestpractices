@@ -319,6 +319,24 @@ Resources:
                 Condition:
                   StringEquals:
                     'iam:PassedToService': 'sagemaker.amazonaws.com'
+        - PolicyName: SageMakerImageAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:DescribeImageVersion'
+                  - 'sagemaker:DescribeImage'
+                  - 'sagemaker:ListImageVersions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:DescribeImages'
+                Resource: '*'
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-execution-role'
