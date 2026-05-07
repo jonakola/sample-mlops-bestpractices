@@ -12,27 +12,101 @@ Follow these steps to implement the 11-step architecture shown above. Each step 
 
 ### Prerequisites
 
-**SageMaker AI Domain Setup**
+**This solution requires:**
+- SageMaker AI domain with MLflow tracking server
+- SageMaker execution role with permissions for S3, Athena, Lambda, SQS, SNS, EventBridge
+- S3 bucket for data storage
 
-This solution requires a SageMaker AI domain with MLflow tracking server. If you don't have one set up already, use this CloudFormation template to create a domain with VPC configuration:
+**Choose your setup path:**
 
-[SageMaker Domain with VPC Setup](https://github.com/aws-samples/genai-ml-platform-examples/blob/main/platform/genai-ml-stdzn-on-smai/sagemaker-domain-with-vpc.yaml)
+#### Option A: Automated Setup with CloudFormation (Recommended for New Users)
 
-### Step 1: Configure Environment
+**Use this if you DON'T have an existing SageMaker domain.**
 
-Copy `.env.example` to `.env` and update with your specific environment variables. Settings in `.env` will override all other defaults and settings in `config.yaml`.
+Deploy the provided CloudFormation template to create all required infrastructure:
 
 ```bash
-git clone https://github.com/aws-samples/sample-mlops-bestpractices.git
-cd sagemaker-automated-drift-and-trend-monitoring
-cp .env.example .env
+aws cloudformation create-stack \
+  --stack-name fraud-detection-sagemaker-setup \
+  --template-body file://cloudformation/sagemaker-mlflow-setup.yaml \
+  --parameters ParameterKey=ProjectName,ParameterValue=fraud-detection-monitoring \
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
-**Required `.env` settings:**
-- `SAGEMAKER_EXEC_ROLE` - ARN of SageMaker execution role
-- `MLFLOW_TRACKING_URI` - ARN of SageMaker MLflow tracking server
-- `DATA_S3_BUCKET` - S3 bucket name for data storage
-- `AWS_DEFAULT_REGION` - AWS region (must match your domain region)
+**What gets created:**
+- VPC with public/private subnets and NAT Gateway
+- SageMaker Domain with user profile
+- MLflow Tracking Server for experiment tracking
+- JupyterLab Space pre-configured with Data Science image
+- S3 Bucket for data storage
+- Execution Role with all required permissions
+
+**Wait for completion** (~15-20 minutes):
+```bash
+aws cloudformation wait stack-create-complete --stack-name fraud-detection-sagemaker-setup
+```
+
+**Automatic repository setup:** The CloudFormation stack includes a Lifecycle Configuration that runs when you launch the JupyterLab space and automatically:
+1. ✅ Clones this repository to `~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring`
+2. ✅ Creates `.env` file with all CloudFormation outputs pre-populated
+3. ✅ Creates `CLOUDFORMATION_SETUP_COMPLETE.md` with next steps
+
+**Access JupyterLab:**
+Navigate to **SageMaker Console → Domains → fraud-detection-monitoring-domain → User: fraud-detection-user → Launch → Space: fraud-detection-monitoring-jupyter-space**
+
+Once launched, notebooks and `.env` are ready to use immediately.
+
+---
+
+#### Option B: Manual Setup (For Existing SageMaker Domains)
+
+**Use this if you ALREADY have a SageMaker domain with MLflow tracking server.**
+
+1. **Clone repository in your JupyterLab environment:**
+   ```bash
+   git clone https://github.com/aws-samples/sample-mlops-bestpractices.git
+   cd sagemaker-automated-drift-and-trend-monitoring
+   ```
+
+2. **Create and configure `.env` file:**
+   ```bash
+   cp .env.example .env
+   ```
+
+3. **Edit `.env` and populate these required values:**
+   - `SAGEMAKER_EXEC_ROLE` - ARN of your SageMaker execution role
+   - `MLFLOW_TRACKING_URI` - ARN of your MLflow tracking server
+   - `DATA_S3_BUCKET` - Name of your S3 bucket for data storage
+   - `AWS_DEFAULT_REGION` - Your AWS region (e.g., us-east-1)
+
+4. **Verify configuration:**
+   ```python
+   from dotenv import load_dotenv
+   import os
+   
+   load_dotenv()
+   print(f"✅ Region: {os.getenv('AWS_DEFAULT_REGION')}")
+   print(f"✅ Exec Role: {os.getenv('SAGEMAKER_EXEC_ROLE')}")
+   print(f"✅ MLflow URI: {os.getenv('MLFLOW_TRACKING_URI')}")
+   print(f"✅ S3 Bucket: {os.getenv('DATA_S3_BUCKET')}")
+   ```
+
+### Step 1: Verify Environment Configuration
+
+**If you used CloudFormation (Option A):** Your environment is already configured. Verify in a notebook:
+
+```python
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+print(f"✅ Region: {os.getenv('AWS_DEFAULT_REGION')}")
+print(f"✅ Exec Role: {os.getenv('SAGEMAKER_EXEC_ROLE')}")
+print(f"✅ MLflow URI: {os.getenv('MLFLOW_TRACKING_URI')}")
+print(f"✅ S3 Bucket: {os.getenv('DATA_S3_BUCKET')}")
+```
+
+**If you used Manual Setup (Option B):** Verify your `.env` file contains all four required values, then run the verification code above.
 
 ### Steps 1-5: Training Pipeline (`1_training_pipeline.ipynb`)
 

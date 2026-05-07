@@ -1,0 +1,595 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SageMaker Domain setup for Automated Drift and Trend Monitoring solution.
+  Creates: VPC with private subnets, SageMaker Domain, MLflow Tracking Server,
+  Execution Role, JupyterLab Space, and S3 bucket for data storage.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'fraud-detection-monitoring'
+    Description: 'Project name (lowercase letters, numbers, hyphens only)'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for private subnet 1
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for private subnet 2 (required for MLflow)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PublicSubnetCIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for public subnet (NAT Gateway)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  UserProfileName:
+    Type: String
+    Default: 'fraud-detection-user'
+    Description: Name for SageMaker user profile
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+
+  JupyterLabInstance:
+    Type: String
+    Default: 'ml.t3.medium'
+    Description: Instance type for JupyterLab space
+    AllowedValues:
+      - ml.t3.medium
+      - ml.t3.large
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+
+Resources:
+  # ====================================================================
+  # Network Infrastructure
+  # ====================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-2'
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PublicSubnetCIDR
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-eip'
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gateway'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NATGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for SageMaker Domain resources
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-sg'
+
+  SecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: '-1'
+      GroupId: !Ref SecurityGroup
+      SourceSecurityGroupId: !Ref SecurityGroup
+      Description: Allow traffic within security group
+
+  # ====================================================================
+  # S3 Bucket for Data Storage
+  # ====================================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-bucket'
+
+  # ====================================================================
+  # IAM Roles
+  # ====================================================================
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-SageMakerExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonAthenaFullAccess'
+        - 'arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess'
+      Policies:
+        - PolicyName: MLflowAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:CreateMlflowTrackingServer'
+                  - 'sagemaker:UpdateMlflowTrackingServer'
+                  - 'sagemaker:DeleteMlflowTrackingServer'
+                  - 'sagemaker:DescribeMlflowTrackingServer'
+                  - 'sagemaker:ListMlflowTrackingServers'
+                Resource: '*'
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:CreateFunction'
+                  - 'lambda:UpdateFunctionCode'
+                  - 'lambda:UpdateFunctionConfiguration'
+                  - 'lambda:GetFunction'
+                  - 'lambda:DeleteFunction'
+                Resource: '*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:CreateQueue'
+                  - 'sqs:DeleteQueue'
+                  - 'sqs:GetQueueAttributes'
+                  - 'sqs:SetQueueAttributes'
+                  - 'sqs:SendMessage'
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                Resource: '*'
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:CreateTopic'
+                  - 'sns:Subscribe'
+                  - 'sns:Publish'
+                Resource: '*'
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutRule'
+                  - 'events:PutTargets'
+                  - 'events:DeleteRule'
+                  - 'events:RemoveTargets'
+                Resource: '*'
+        - PolicyName: IAMPassRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'sagemaker.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-execution-role'
+
+  # ====================================================================
+  # SageMaker Domain
+  # ====================================================================
+  SageMakerDomain:
+    Type: AWS::SageMaker::Domain
+    Properties:
+      DomainName: !Sub '${ProjectName}-domain'
+      AuthMode: IAM
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        SecurityGroups:
+          - !Ref SecurityGroup
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-domain'
+
+  # ====================================================================
+  # User Profile
+  # ====================================================================
+  UserProfile:
+    Type: AWS::SageMaker::UserProfile
+    DependsOn: SpaceLifecycleConfig
+    Properties:
+      DomainId: !Ref SageMakerDomain
+      UserProfileName: !Ref UserProfileName
+      UserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        JupyterLabAppSettings:
+          LifecycleConfigArns:
+            - !GetAtt SpaceLifecycleConfig.StudioLifecycleConfigArn
+          DefaultResourceSpec:
+            InstanceType: !Ref JupyterLabInstance
+            SageMakerImageArn: !Sub 'arn:aws:sagemaker:${AWS::Region}:081325390199:image/sagemaker-data-science-310-v1'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-user-profile'
+
+  # ====================================================================
+  # Lifecycle Configuration
+  # ====================================================================
+  SpaceLifecycleConfig:
+    Type: AWS::SageMaker::StudioLifecycleConfig
+    Properties:
+      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script'
+      StudioLifecycleConfigAppType: JupyterLab
+      StudioLifecycleConfigContent: !Base64
+        Fn::Sub: |
+          #!/bin/bash
+          set -e
+
+          # Wait for Jupyter to be fully ready
+          sleep 10
+
+          # Set up environment as the default notebook user
+          WORK_DIR="/home/sagemaker-user"
+          cd "$WORK_DIR"
+
+          # Clone repository if not already present
+          if [ ! -d "sample-mlops-bestpractices" ]; then
+            echo "Cloning repository..."
+            git clone https://github.com/aws-samples/sample-mlops-bestpractices.git
+          fi
+
+          # Navigate to project directory
+          cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
+
+          # Create .env file with CloudFormation outputs
+          echo "Creating .env file with CloudFormation outputs..."
+          cat > .env << 'EOF'
+          # AWS Configuration
+          AWS_DEFAULT_REGION=${AWS::Region}
+
+          # SageMaker Configuration
+          SAGEMAKER_EXEC_ROLE=${SageMakerExecutionRole.Arn}
+
+          # MLflow Configuration
+          MLFLOW_TRACKING_URI=${MLflowTrackingServer.TrackingServerArn}
+
+          # S3 Configuration
+          DATA_S3_BUCKET=${DataBucket}
+
+          # Athena Configuration
+          ATHENA_DATABASE=fraud_detection
+          ATHENA_WORKGROUP=primary
+
+          # Auto-generated by CloudFormation stack: ${AWS::StackName}
+          # Stack creation time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          EOF
+
+          # Set proper ownership
+          chown sagemaker-user:sagemaker-user .env
+          chmod 600 .env
+
+          # Create a README for the user
+          cat > CLOUDFORMATION_SETUP_COMPLETE.md << 'EOF'
+          # CloudFormation Setup Complete! ✅
+
+          Your environment has been automatically configured. The following steps were completed:
+
+          1. ✅ Repository cloned to: `~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring`
+          2. ✅ `.env` file created with all CloudFormation outputs
+          3. ✅ Environment variables configured:
+             - SAGEMAKER_EXEC_ROLE
+             - MLFLOW_TRACKING_URI
+             - DATA_S3_BUCKET
+             - AWS_DEFAULT_REGION
+
+          ## Next Steps
+
+          Open the notebooks in order:
+          1. `notebooks/1_training_pipeline.ipynb` - Train the fraud detection model
+          2. `notebooks/2a_inference_monitoring.ipynb` - Set up monitoring
+          3. `notebooks/3_governance_dashboard.ipynb` - Create QuickSight dashboard
+
+          ## Verify Configuration
+
+          Run this in a notebook cell to verify:
+          ```python
+          from dotenv import load_dotenv
+          import os
+
+          load_dotenv()
+          print(f"Region: {os.getenv('AWS_DEFAULT_REGION')}")
+          print(f"Exec Role: {os.getenv('SAGEMAKER_EXEC_ROLE')}")
+          print(f"MLflow: {os.getenv('MLFLOW_TRACKING_URI')}")
+          print(f"S3 Bucket: {os.getenv('DATA_S3_BUCKET')}")
+          ```
+
+          ## CloudFormation Stack
+
+          Stack Name: ${AWS::StackName}
+          Region: ${AWS::Region}
+
+          EOF
+
+          chown sagemaker-user:sagemaker-user CLOUDFORMATION_SETUP_COMPLETE.md
+
+          echo "Setup complete! Repository cloned and .env configured."
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lifecycle-config'
+
+  # ====================================================================
+  # JupyterLab Space
+  # ====================================================================
+  JupyterSpace:
+    Type: AWS::SageMaker::Space
+    DependsOn:
+      - MLflowTrackingServer
+      - SpaceLifecycleConfig
+    Properties:
+      DomainId: !Ref SageMakerDomain
+      SpaceName: !Sub '${ProjectName}-jupyter-space'
+      OwnershipSettings:
+        OwnerUserProfileName: !Ref UserProfileName
+      SpaceSettings:
+        AppType: JupyterLab
+        JupyterLabAppSettings:
+          DefaultResourceSpec:
+            InstanceType: !Ref JupyterLabInstance
+            SageMakerImageArn: !Sub 'arn:aws:sagemaker:${AWS::Region}:081325390199:image/sagemaker-data-science-310-v1'
+            LifecycleConfigArn: !GetAtt SpaceLifecycleConfig.StudioLifecycleConfigArn
+      SpaceSharingSettings:
+        SharingType: Private
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-jupyter-space'
+
+  # ====================================================================
+  # MLflow Tracking Server
+  # ====================================================================
+  MLflowTrackingServer:
+    Type: AWS::SageMaker::MlflowTrackingServer
+    Properties:
+      TrackingServerName: !Sub '${ProjectName}-mlflow'
+      ArtifactStoreUri: !Sub 's3://${DataBucket}/mlflow-artifacts'
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      AutomaticModelRegistration: true
+      WeeklyMaintenanceWindowStart: 'Sun:03:00'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mlflow'
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  DataBucketName:
+    Description: S3 Bucket for data storage
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  SageMakerExecutionRoleArn:
+    Description: SageMaker Execution Role ARN (use this in .env as SAGEMAKER_EXEC_ROLE)
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
+  SageMakerDomainId:
+    Description: SageMaker Domain ID
+    Value: !Ref SageMakerDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainId'
+
+  UserProfileName:
+    Description: User Profile Name
+    Value: !Ref UserProfileName
+    Export:
+      Name: !Sub '${AWS::StackName}-UserProfileName'
+
+  JupyterSpaceName:
+    Description: JupyterLab Space Name
+    Value: !Sub '${ProjectName}-jupyter-space'
+    Export:
+      Name: !Sub '${AWS::StackName}-JupyterSpaceName'
+
+  MLflowTrackingServerArn:
+    Description: MLflow Tracking Server ARN (use this in .env as MLFLOW_TRACKING_URI)
+    Value: !GetAtt MLflowTrackingServer.TrackingServerArn
+    Export:
+      Name: !Sub '${AWS::StackName}-MLflowArn'
+
+  MLflowTrackingBrowserUrl:
+    Description: MLflow Browser URL for UI access
+    Value: !Sub 'https://${MLflowTrackingServer.TrackingServerArn}.mlflow.${AWS::Region}.sagemaker.aws/jupyter'
+
+  SetupInstructions:
+    Description: Next steps to complete setup
+    Value: !Sub |
+      1. Copy these values to your .env file:
+         SAGEMAKER_EXEC_ROLE=${SageMakerExecutionRole.Arn}
+         MLFLOW_TRACKING_URI=${MLflowTrackingServer.TrackingServerArn}
+         DATA_S3_BUCKET=${DataBucket}
+         AWS_DEFAULT_REGION=${AWS::Region}
+
+      2. Access JupyterLab:
+         - Go to SageMaker Console -> Domains -> ${ProjectName}-domain
+         - Select user profile: ${UserProfileName}
+         - Click "Launch" -> "Space: ${ProjectName}-jupyter-space"
+
+      3. Clone repository and run notebooks:
+         git clone https://github.com/aws-samples/sample-mlops-bestpractices.git
+         cd sagemaker-automated-drift-and-trend-monitoring
+         Open: 1_training_pipeline.ipynb
