@@ -225,69 +225,91 @@ Resources:
       Timeout: 900  # 15 minutes max
       Code:
         ZipFile: |
-          import json
           import boto3
           import cfnresponse
           import time
 
           ec2 = boto3.client('ec2')
 
+          def try_delete_eni(eni):
+              """Best-effort delete of a single ENI. Returns True if deleted."""
+              eni_id = eni['NetworkInterfaceId']
+              status = eni.get('Status')
+              att = eni.get('Attachment') or {}
+              att_id = att.get('AttachmentId')
+
+              if att_id and status == 'in-use':
+                  try:
+                      ec2.detach_network_interface(AttachmentId=att_id, Force=True)
+                      print(f'  Force-detached {eni_id}')
+                      time.sleep(5)
+                  except Exception as e:
+                      print(f'  Detach {eni_id} failed: {e}')
+
+              try:
+                  ec2.delete_network_interface(NetworkInterfaceId=eni_id)
+                  print(f'  Deleted ENI {eni_id}')
+                  return True
+              except Exception as e:
+                  print(f'  Delete {eni_id} failed: {e}')
+                  return False
+
           def handler(event, context):
               try:
-                  subnet_ids = event['ResourceProperties'].get('SubnetIds', [])
-
-                  if event['RequestType'] == 'Delete':
-                      print(f'Waiting for ENIs to be cleaned up from subnets: {subnet_ids}')
-
-                      max_wait = 840  # 14 minutes (leave 60s for Lambda overhead)
-                      interval = 15   # Check every 15 seconds
-                      elapsed = 0
-
-                      while elapsed < max_wait:
-                          all_clear = True
-
-                          for subnet_id in subnet_ids:
-                              try:
-                                  response = ec2.describe_network_interfaces(
-                                      Filters=[{'Name': 'subnet-id', 'Values': [subnet_id]}]
-                                  )
-
-                                  eni_count = len(response['NetworkInterfaces'])
-
-                                  if eni_count > 0:
-                                      print(f'Subnet {subnet_id} still has {eni_count} ENI(s)')
-                                      all_clear = False
-
-                                      # Log ENI details for troubleshooting
-                                      for eni in response['NetworkInterfaces']:
-                                          print(f"  ENI: {eni['NetworkInterfaceId']}, "
-                                                f"Status: {eni['Status']}, "
-                                                f"Description: {eni.get('Description', 'N/A')}")
-                              except Exception as e:
-                                  print(f'Error checking subnet {subnet_id}: {str(e)}')
-
-                          if all_clear:
-                              print('✅ All ENIs have been cleaned up!')
-                              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                              return
-
-                          print(f'Waiting... ({elapsed}/{max_wait} seconds)')
-                          time.sleep(interval)
-                          elapsed += interval
-
-                      # Timeout reached, but don't fail - CloudFormation will retry subnet deletion
-                      print(f'⚠️ Timeout reached after {max_wait} seconds, but continuing...')
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                     {'Message': 'Timeout reached but proceeding'})
-                  else:
-                      # Create/Update - nothing to do
+                  if event['RequestType'] != 'Delete':
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  subnet_ids = event['ResourceProperties'].get('SubnetIds', [])
+                  print(f'Cleaning ENIs in subnets: {subnet_ids}')
+
+                  # Phase 1: polite wait — let SageMaker/EFS release ENIs naturally
+                  polite_wait = 300  # 5 min
+                  interval = 15
+                  elapsed = 0
+                  while elapsed < polite_wait:
+                      all_clear = True
+                      for subnet_id in subnet_ids:
+                          resp = ec2.describe_network_interfaces(
+                              Filters=[{'Name': 'subnet-id', 'Values': [subnet_id]}])
+                          enis = resp.get('NetworkInterfaces', [])
+                          if enis:
+                              all_clear = False
+                              print(f'  {subnet_id}: {len(enis)} ENI(s) remaining')
+                      if all_clear:
+                          print('✅ All ENIs released naturally')
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          return
+                      time.sleep(interval)
+                      elapsed += interval
+
+                  # Phase 2: force — delete remaining ENIs directly
+                  print('Polite wait timed out, force-deleting remaining ENIs...')
+                  force_wait = 420  # 7 min
+                  elapsed = 0
+                  while elapsed < force_wait:
+                      all_clear = True
+                      for subnet_id in subnet_ids:
+                          resp = ec2.describe_network_interfaces(
+                              Filters=[{'Name': 'subnet-id', 'Values': [subnet_id]}])
+                          for eni in resp.get('NetworkInterfaces', []):
+                              all_clear = False
+                              try_delete_eni(eni)
+                      if all_clear:
+                          print('✅ All ENIs cleaned up')
+                          break
+                      time.sleep(interval)
+                      elapsed += interval
+
+                  # Always send SUCCESS — if ENIs still linger, subnet
+                  # deletion will fail cleanly with a clear error and can
+                  # be retried without the stack being stuck on this resource.
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
 
               except Exception as e:
-                  print(f'Error: {str(e)}')
-                  # Don't fail the stack deletion even if Lambda fails
+                  print(f'Error (continuing with SUCCESS): {e}')
                   cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                 {'Error': str(e), 'Message': 'Error occurred but continuing'})
+                                   {'Error': str(e)})
 
   WaitForENICleanupRole:
     Type: AWS::IAM::Role
@@ -311,7 +333,142 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:DescribeNetworkInterfaces
+                  - ec2:DetachNetworkInterface
+                  - ec2:DeleteNetworkInterface
                 Resource: '*'
+
+  # ====================================================================
+  # Lambda Function to Clean Up EFS Filesystem Created by SageMaker Domain
+  # ====================================================================
+  # SageMaker Domain creates an EFS filesystem + mount targets that are
+  # NOT tracked by CloudFormation. When the domain is deleted, the EFS
+  # filesystem (and its mount target ENIs) persist, which blocks the
+  # subnets from being deleted.
+  #
+  # On Delete: finds the HomeEfsFileSystemId from the domain, deletes
+  # all mount targets, waits for them to clear, then deletes the EFS.
+  # No-op on Create/Update.
+  # ====================================================================
+  EfsCleanupFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Sub '${ProjectName}-efs-cleanup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EfsCleanupRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          sm = boto3.client('sagemaker')
+          efs = boto3.client('efs')
+
+          def delete_efs(domain_id):
+              try:
+                  desc = sm.describe_domain(DomainId=domain_id)
+                  efs_id = desc.get('HomeEfsFileSystemId')
+              except Exception as e:
+                  print(f'Cannot describe domain {domain_id}: {e}')
+                  return
+
+              if not efs_id:
+                  print('No EFS attached to domain')
+                  return
+
+              print(f'Cleaning EFS {efs_id}')
+
+              # Delete mount targets
+              try:
+                  mts = efs.describe_mount_targets(FileSystemId=efs_id).get('MountTargets', [])
+                  for mt in mts:
+                      try:
+                          efs.delete_mount_target(MountTargetId=mt['MountTargetId'])
+                          print(f"Deleted mount target {mt['MountTargetId']}")
+                      except Exception as e:
+                          print(f"Mount target delete error: {e}")
+              except efs.exceptions.FileSystemNotFound:
+                  print(f'EFS {efs_id} already gone')
+                  return
+
+              # Wait for mount targets (and their ENIs) to fully clear
+              for i in range(40):
+                  try:
+                      remaining = efs.describe_mount_targets(FileSystemId=efs_id).get('MountTargets', [])
+                  except efs.exceptions.FileSystemNotFound:
+                      remaining = []
+                  if not remaining:
+                      print('All mount targets cleared')
+                      break
+                  print(f'  {len(remaining)} mount target(s) still present, waiting 15s ({i+1}/40)')
+                  time.sleep(15)
+
+              # Delete the filesystem
+              try:
+                  efs.delete_file_system(FileSystemId=efs_id)
+                  print(f'Deleted EFS {efs_id}')
+              except efs.exceptions.FileSystemNotFound:
+                  print(f'EFS {efs_id} already deleted')
+              except Exception as e:
+                  print(f'EFS delete error: {e}')
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      domain_id = event['ResourceProperties'].get('DomainId')
+                      if domain_id:
+                          delete_efs(domain_id)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f'Error: {e}')
+                  # Never block stack deletion
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {'Error': str(e)})
+
+  EfsCleanupRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-EfsCleanup'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:DescribeDomain
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:DeleteFileSystem
+                  - elasticfilesystem:DescribeFileSystems
+                Resource: '*'
+
+  EfsCleanup:
+    Type: Custom::EfsCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    DependsOn:
+      - SageMakerDomain
+      - UserProfile
+      - JupyterSpace
+      - AppCleanup
+    Properties:
+      ServiceToken: !GetAtt EfsCleanupFunction.Arn
+      DomainId: !Ref SageMakerDomain
 
   WaitForENICleanup:
     Type: Custom::WaitForENICleanup
@@ -321,6 +478,8 @@ Resources:
       - SageMakerDomain
       - UserProfile
       - JupyterSpace
+      - AppCleanup
+      - EfsCleanup
     Properties:
       ServiceToken: !GetAtt WaitForENICleanupFunction.Arn
       SubnetIds:
@@ -334,6 +493,165 @@ Resources:
           - !Ref ExistingSubnet2Id
 
   # ====================================================================
+  # Lambda Function to Clean Up SageMaker Apps Before Space Deletion
+  # ====================================================================
+  # Handles a CloudFormation gap: AWS::SageMaker::App is not managed by
+  # this template (apps are launched by users), but a Space cannot be
+  # deleted while it has non-Deleted apps attached.
+  #
+  # On Create: deletes any pre-existing apps (covers the "failed app
+  #   blocking stack update" recovery path).
+  # On Update: uses OldResourceProperties to clean apps in the old
+  #   space when the domain is being replaced.
+  # On Delete: cleans apps so the space can be deleted cleanly.
+  # ====================================================================
+  AppCleanupFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Sub '${ProjectName}-app-cleanup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AppCleanupRole.Arn
+      Timeout: 900  # 15 minutes — app deletion can take several minutes
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          sm = boto3.client('sagemaker')
+
+          def delete_apps_in_space(domain_id, space_name):
+              """Delete all non-deleted apps in a space and wait for cleanup."""
+              try:
+                  resp = sm.list_apps(
+                      DomainIdEquals=domain_id,
+                      SpaceNameEquals=space_name,
+                  )
+                  apps = resp.get('Apps', [])
+                  print(f'Found {len(apps)} app(s) in space {space_name}')
+
+                  for app in apps:
+                      status = app['Status']
+                      if status == 'Deleted':
+                          continue
+                      try:
+                          sm.delete_app(
+                              DomainId=domain_id,
+                              SpaceName=space_name,
+                              AppType=app['AppType'],
+                              AppName=app['AppName'],
+                          )
+                          print(f"Initiated delete for {app['AppName']} (status was {status})")
+                      except sm.exceptions.ResourceInUse:
+                          print(f"{app['AppName']} already being deleted")
+                      except Exception as e:
+                          print(f"Error deleting {app['AppName']}: {e}")
+
+                  # Wait for apps to reach Deleted state
+                  max_wait = 780  # 13 minutes (leave buffer for Lambda overhead)
+                  interval = 15
+                  elapsed = 0
+                  while elapsed < max_wait:
+                      resp = sm.list_apps(
+                          DomainIdEquals=domain_id,
+                          SpaceNameEquals=space_name,
+                      )
+                      pending = [
+                          (a['AppName'], a['Status'])
+                          for a in resp.get('Apps', [])
+                          if a['Status'] != 'Deleted'
+                      ]
+                      if not pending:
+                          print('✅ All apps deleted')
+                          return
+                      print(f'Waiting... {len(pending)} app(s) remaining: {pending}')
+                      time.sleep(interval)
+                      elapsed += interval
+
+                  print(f'⚠️ Timeout after {max_wait}s, continuing anyway')
+              except sm.exceptions.ClientError as e:
+                  # If domain/space no longer exists, that's fine — nothing to clean
+                  code = e.response.get('Error', {}).get('Code', '')
+                  if code in ('ResourceNotFound', 'ValidationException'):
+                      print(f'Domain/space not found (already deleted): {e}')
+                      return
+                  raise
+
+          def handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  print(f'RequestType: {request_type}')
+
+                  if request_type == 'Create':
+                      # Clean any pre-existing apps (e.g., failed apps from
+                      # previous manual launches that now block stack updates)
+                      props = event['ResourceProperties']
+                      delete_apps_in_space(props['DomainId'], props['SpaceName'])
+
+                  elif request_type == 'Update':
+                      # If domain is being replaced, clean apps in the OLD space
+                      old = event.get('OldResourceProperties', {})
+                      new = event.get('ResourceProperties', {})
+                      if old.get('DomainId') and old['DomainId'] != new.get('DomainId'):
+                          print('Domain replacement detected, cleaning old space apps')
+                          delete_apps_in_space(old['DomainId'], old['SpaceName'])
+
+                  elif request_type == 'Delete':
+                      props = event['ResourceProperties']
+                      delete_apps_in_space(props['DomainId'], props['SpaceName'])
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f'Error: {e}')
+                  # Never fail the stack operation on cleanup errors
+                  cfnresponse.send(
+                      event, context, cfnresponse.SUCCESS,
+                      {'Error': str(e), 'Message': 'Error during cleanup, continuing'},
+                  )
+
+  AppCleanupRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-AppCleanup'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:ListApps
+                  - sagemaker:DeleteApp
+                  - sagemaker:DescribeApp
+                Resource: '*'
+
+  AppCleanup:
+    Type: Custom::AppCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # DependsOn JupyterSpace so that on stack delete/replace, this runs
+    # BEFORE the space is deleted (reverse dependency order on Delete).
+    DependsOn: JupyterSpace
+    Properties:
+      ServiceToken: !GetAtt AppCleanupFunction.Arn
+      DomainId: !Ref SageMakerDomain
+      SpaceName: !Sub '${ProjectName}-space'
+      UserProfileName: !Ref UserProfileName
+
+  # ====================================================================
   # Lambda Function to Empty S3 Bucket on Stack Deletion
   # ====================================================================
   EmptyS3BucketFunction:
@@ -345,32 +663,57 @@ Resources:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt EmptyS3BucketRole.Arn
-      Timeout: 300
+      Timeout: 900
       Code:
         ZipFile: |
-          import json
           import boto3
           import cfnresponse
+          from botocore.exceptions import ClientError
 
           s3 = boto3.resource('s3')
+          s3_client = boto3.client('s3')
+
+          def empty_and_delete_bucket(bucket_name):
+              # Check if bucket exists — if not, nothing to do
+              try:
+                  s3_client.head_bucket(Bucket=bucket_name)
+              except ClientError as e:
+                  code = e.response.get('Error', {}).get('Code', '')
+                  if code in ('404', 'NoSuchBucket'):
+                      print(f'Bucket {bucket_name} does not exist — skipping')
+                      return
+                  raise
+
+              bucket = s3.Bucket(bucket_name)
+
+              # Delete all object versions (for versioned buckets)
+              try:
+                  bucket.object_versions.delete()
+              except ClientError as e:
+                  print(f'object_versions.delete() error: {e}')
+
+              # Delete any remaining current-version objects
+              try:
+                  bucket.objects.delete()
+              except ClientError as e:
+                  print(f'objects.delete() error: {e}')
+
+              print(f'Emptied bucket: {bucket_name}')
 
           def handler(event, context):
+              # ALWAYS send SUCCESS on Delete — cleanup failures should never
+              # block stack deletion. The worst case (orphaned bucket) is
+              # easy to clean up manually; a stuck stack is not.
               try:
                   bucket_name = event['ResourceProperties']['BucketName']
-
                   if event['RequestType'] == 'Delete':
                       print(f'Emptying bucket: {bucket_name}')
-                      bucket = s3.Bucket(bucket_name)
-
-                      # Delete all versions and delete markers
-                      bucket.object_versions.delete()
-
-                      print(f'Successfully emptied bucket: {bucket_name}')
-
+                      empty_and_delete_bucket(bucket_name)
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
               except Exception as e:
-                  print(f'Error: {str(e)}')
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  print(f'Error (continuing with SUCCESS to unblock stack): {e}')
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {'Error': str(e)})
 
   EmptyS3BucketRole:
     Type: AWS::IAM::Role
@@ -545,7 +888,7 @@ Resources:
             - CreateNewSecurityGroup
             - !Ref SecurityGroup
             - !Ref ExistingSecurityGroupId
-      AppNetworkAccessType: VpcOnly
+      AppNetworkAccessType: PublicInternetOnly
       VpcId: !If
         - CreateNewVPC
         - !Ref VPC
@@ -596,29 +939,46 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script'
+      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-v2'
       StudioLifecycleConfigAppType: JupyterLab
       StudioLifecycleConfigContent:
         Fn::Base64:
           Fn::Sub: |
             #!/bin/bash
-            set -e
+            set -x  # Debug mode - log all commands
+
+            # Log function
+            log() {
+              echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+            }
+
+            log "Starting lifecycle configuration..."
 
             # Wait for Jupyter to be fully ready
             sleep 10
 
             # Set up environment as the default notebook user
             WORK_DIR="/home/sagemaker-user"
-            cd "$WORK_DIR"
+            cd "$WORK_DIR" || exit 1
 
             # Clone repository if not already present
             if [ ! -d "sample-mlops-bestpractices" ]; then
-              echo "Cloning repository..."
-              git clone ${GitHubRepo}
+              log "Cloning repository from ${GitHubRepo}..."
+              if git clone ${GitHubRepo}; then
+                log "Repository cloned successfully"
+              else
+                log "ERROR: Failed to clone repository. Exit code: $?"
+                log "Checking network connectivity..."
+                curl -I https://github.com || log "Cannot reach GitHub"
+                exit 1
+              fi
+            else
+              log "Repository already exists, skipping clone"
             fi
 
             # Navigate to project directory
-            cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
+            cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
+            log "Changed to project directory"
 
             # Create .env file with CloudFormation outputs
             echo "Creating .env file with CloudFormation outputs..."
@@ -684,7 +1044,8 @@ Resources:
 
             chown sagemaker-user:sagemaker-user CLOUDFORMATION_SETUP_COMPLETE.md
 
-            echo "Setup complete! Check CLOUDFORMATION_SETUP_COMPLETE.md for next steps."
+            log "Setup complete! Check CLOUDFORMATION_SETUP_COMPLETE.md for next steps."
+            exit 0
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-lifecycle-config'
@@ -702,7 +1063,7 @@ Resources:
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-jupyter-space-v2'
+      SpaceName: !Sub '${ProjectName}-space'
       OwnershipSettings:
         OwnerUserProfileName: !Ref UserProfileName
       SpaceSettings:
@@ -754,7 +1115,7 @@ Outputs:
 
   JupyterSpaceName:
     Description: JupyterLab Space Name
-    Value: !Sub '${ProjectName}-jupyter-space'
+    Value: !Sub '${ProjectName}-space'
     Export:
       Name: !Sub '${AWS::StackName}-JupyterSpaceName'
 
