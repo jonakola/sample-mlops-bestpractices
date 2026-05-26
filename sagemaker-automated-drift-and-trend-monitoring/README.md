@@ -18,7 +18,7 @@ Follow these steps to implement the 11-step architecture shown above. Each step 
 
 ### Setup: Deploy with CloudFormation
 
-The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, and IAM execution role with all required permissions (S3, Athena, Glue, Lambda, SQS, EventBridge, KMS, Lake Formation, CloudWatch Logs, MLflow). On first space launch, the lifecycle script auto-clones this repo, generates synthetic datasets, uploads data to S3, creates Athena tables, and writes a populated `.env` file.
+The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, SQS inference logging queue, Lambda inference logger with event source mapping, and IAM execution role with all required permissions (S3, Athena, Glue, Lambda, SQS, EventBridge, KMS, Lake Formation, CloudWatch Logs, CloudWatch Metrics/Alarms/Dashboards, MLflow). On first space launch, the lifecycle script auto-clones this repo, generates synthetic datasets, uploads data to S3, creates Athena tables, and writes a populated `.env` file (including SQS queue URL).
 
 **Deploy:**
 
@@ -530,37 +530,37 @@ After deploying the CloudFormation stack and running the JupyterLab space (see [
 - Created the Athena database and Iceberg tables
 - Written a populated `.env` file
 
-### Add CloudWatch Permissions (for Drift Monitoring Dashboard & Alarms)
+### CloudWatch Permissions (for Drift Monitoring Dashboard & Alarms)
 
-The CloudFormation execution role includes `CloudWatchLogsFullAccess` but does **not** include CloudWatch Metrics/Alarms/Dashboards permissions. To publish custom metrics, create alarms, and build dashboards (Cell 40 in `2a_inference_monitoring.ipynb`), add this inline policy to your execution role:
+The CloudFormation execution role **automatically includes** CloudWatch Metrics/Alarms/Dashboards permissions via the `${ProjectName}-CloudWatchMetricsAccess` inline policy. No manual action is required for standard deployments.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "cloudwatch:PutMetricData",
-        "cloudwatch:PutMetricAlarm",
-        "cloudwatch:DescribeAlarms",
-        "cloudwatch:PutDashboard",
-        "cloudwatch:GetDashboard",
-        "cloudwatch:ListDashboards"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
+> **If using `UseExistingRole=true`:** Your existing role must include the following permissions for Cell 40 in `2a_inference_monitoring.ipynb` to work (publish custom metrics, create alarms, and build dashboards):
+>
+> ```json
+> {
+>   "Version": "2012-10-17",
+>   "Statement": [
+>     {
+>       "Effect": "Allow",
+>       "Action": [
+>         "cloudwatch:PutMetricData",
+>         "cloudwatch:PutMetricAlarm",
+>         "cloudwatch:DescribeAlarms",
+>         "cloudwatch:PutDashboard",
+>         "cloudwatch:GetDashboard",
+>         "cloudwatch:ListDashboards"
+>       ],
+>       "Resource": "*"
+>     }
+>   ]
+> }
+> ```
 
-### Setup SQS + Lambda
+### SQS + Lambda Inference Logging (Auto-Provisioned)
 
-```bash
-uv run main.py setup-logging
-```
+The CloudFormation stack **automatically provisions** the SQS queue (`${ProjectName}-inference-logging`), Lambda inference logger (`${ProjectName}-inference-logger`), and event source mapping (batch size 10, 30s window). The `.env` file is pre-populated with `SQS_URL`, `SQS_QUEUE_NAME`, and `LAMBDA_LOGGER_NAME`. No manual action is required for standard deployments.
 
-Update the `SQS_URL` in `.env` with the created SQS queue.
+> **If not using CloudFormation:** Run `uv run main.py setup-logging` manually, then update `SQS_URL` in `.env` with the created queue URL.
 
 ### Run Complete Pipeline
 
