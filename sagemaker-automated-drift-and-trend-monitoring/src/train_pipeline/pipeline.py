@@ -322,9 +322,20 @@ class FraudDetectionPipeline:
         )
 
         # Build job arguments
+        # Pass the same S3 URIs used by the ProcessingOutput entries below as
+        # explicit output-dir args. This forces preprocessing_pyspark.py to run
+        # its `if output_dir.startswith('s3://')` branch, which uses Spark to
+        # write part-files then boto3 to consolidate them into train.csv/test.csv
+        # at the train/test prefixes. Without these args the script falls back to
+        # POSIX defaults and the local shutil consolidation branch, which fails to
+        # produce the CSVs (only the JSON metadata reached S3), causing the
+        # downstream training step to fail with "train.csv not found".
         job_arguments = [
             "--athena-table", params['athena_table'],
             "--target-column", params['target_column'],
+            "--train-output-dir", f"s3://{self.bucket}/fraud-detection/preprocessing/train",
+            "--test-output-dir", f"s3://{self.bucket}/fraud-detection/preprocessing/test",
+            "--stats-output-dir", f"s3://{self.bucket}/fraud-detection/preprocessing/stats",
         ]
 
         # Processing step with PySpark script — v3 uses step_args from processor.run()

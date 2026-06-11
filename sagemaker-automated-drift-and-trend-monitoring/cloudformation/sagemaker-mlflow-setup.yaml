@@ -648,7 +648,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt AppCleanupFunction.Arn
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-space-v17'
+      SpaceName: !Sub '${ProjectName}-space-v18'
       UserProfileName: !Ref UserProfileName
 
   # ====================================================================
@@ -1009,7 +1009,7 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-v17'
+      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-v18'
       StudioLifecycleConfigAppType: JupyterLab
       StudioLifecycleConfigContent:
         Fn::Base64:
@@ -1019,7 +1019,7 @@ Resources:
             sleep 10
             cd /home/sagemaker-user || exit 1
             if [ ! -d "sample-mlops-bestpractices" ]; then
-              git clone ${GitHubRepo} || exit 1
+              git clone -b cfn-data-pipeline-setup ${GitHubRepo} || exit 1
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
 
@@ -1299,7 +1299,7 @@ Resources:
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-space-v17'
+      SpaceName: !Sub '${ProjectName}-space-v18'
       OwnershipSettings:
         OwnerUserProfileName: !Ref UserProfileName
       SpaceSettings:
@@ -1477,7 +1477,7 @@ Outputs:
 
   JupyterSpaceName:
     Description: JupyterLab Space Name
-    Value: !Sub '${ProjectName}-space-v17'
+    Value: !Sub '${ProjectName}-space-v18'
     Export:
       Name: !Sub '${AWS::StackName}-JupyterSpaceName'
 
@@ -1532,7 +1532,7 @@ Outputs:
       1. Navigate to SageMaker Console: https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/domains
       2. Click on Domain: ${ProjectName}-domain
       3. Select User Profile: ${UserProfileName}
-      4. Go to Spaces and open: ${ProjectName}-space-v17
+      4. Go to Spaces and open: ${ProjectName}-space-v18
       5. Click "Run Space" to start JupyterLab
       6. Once JupyterLab loads, check CLOUDFORMATION_SETUP_COMPLETE.md for next steps
 
