@@ -38,8 +38,8 @@ import boto3
 from src.config.config import (
     DATA_S3_BUCKET,
     ATHENA_DATABASE,
-    S3_TRAINING_DATA,
-    S3_GROUND_TRUTH,
+    S3_CSV_TRAINING_DATA,
+    S3_CSV_GROUND_TRUTH,
 )
 from src.train_pipeline.athena.iceberg_manager import IcebergManager
 from src.train_pipeline.athena.schema_definitions import list_all_tables
@@ -191,8 +191,8 @@ def migrate_csv_data(manager: IcebergManager) -> dict:
 
     # Migration mappings: S3 data path -> table name
     migrations = [
-        (S3_TRAINING_DATA, 'training_data'),
-        (S3_GROUND_TRUTH, 'ground_truth'),
+        (S3_CSV_TRAINING_DATA, 'training_data'),
+        (S3_CSV_GROUND_TRUTH, 'ground_truth'),
     ]
 
     logger.info("Migrating data from S3 to Athena Iceberg tables...")
@@ -358,6 +358,11 @@ def main():
         action='store_true',
         help='Skip S3 bucket creation'
     )
+    parser.add_argument(
+        '--force-recreate',
+        action='store_true',
+        help='Drop and recreate all tables (fixes broken Iceberg metadata)'
+    )
 
     args = parser.parse_args()
 
@@ -398,8 +403,17 @@ def main():
         logger.error("Failed to create database, aborting")
         return 1
 
+    # Step 2.5: Force-recreate - drop all existing tables if requested
+    if args.force_recreate:
+        logger.info("Force-recreate mode: dropping all existing tables to fix broken Iceberg metadata...")
+        for table_name in list_all_tables():
+            try:
+                manager.drop_table(table_name, if_exists=True)
+            except Exception as e:
+                logger.warning(f"Could not drop {table_name}: {e}")
+
     # Step 3: Create tables
-    table_results = setup_tables(manager, skip_existing=True)
+    table_results = setup_tables(manager, skip_existing=not args.force_recreate)
     if not table_results:
         logger.error("Failed to create tables, aborting")
         return 1
