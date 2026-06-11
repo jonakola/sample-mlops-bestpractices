@@ -30,13 +30,21 @@ if _CONFIG_YAML_PATH.exists():
 
 
 def _get(yaml_section: str, yaml_key: str, env_var: str, default=None):
-    """Return env-var override → YAML value → default, in that priority."""
+    """Return env-var override → YAML value → default, in that priority.
+
+    Empty values (empty string / whitespace) are treated as "not set" so the
+    next source in the priority chain is used. This prevents blank placeholders
+    in config.yaml or the environment from masking derived account-agnostic
+    defaults (e.g. S3 bucket/path constants resolving to "").
+    """
     env_val = os.environ.get(env_var)
-    if env_val is not None:
+    if env_val is not None and env_val.strip() != "":
         return env_val
     section = _yaml_cfg.get(yaml_section, {})
     if isinstance(section, dict) and yaml_key in section:
-        return section[yaml_key]
+        yaml_val = section[yaml_key]
+        if not (isinstance(yaml_val, str) and yaml_val.strip() == ""):
+            return yaml_val
     return default
 
 
@@ -134,7 +142,36 @@ ATHENA_MONITORING_RESPONSES_TABLE: str = _get(
 # ===================================================================
 # S3 Paths
 # ===================================================================
-DATA_S3_BUCKET: str = _get("s3", "bucket", "DATA_S3_BUCKET", "")
+def _derive_data_bucket() -> str:
+    """Derive the data bucket account-agnostically.
+
+    Priority: DATA_S3_BUCKET env/yaml -> ${PROJECT_NAME}-data-${account_id}.
+    The CFN data bucket follows the convention ``${ProjectName}-data-${AWS::AccountId}``,
+    so when no explicit bucket is configured we reconstruct it from PROJECT_NAME and
+    the caller's AWS account ID. This keeps the config valid in any account/deployment
+    without hardcoding a bucket name.
+    """
+    explicit = _get("s3", "bucket", "DATA_S3_BUCKET", "")
+    if explicit:
+        return explicit
+
+    project_name = _get("project", "name", "PROJECT_NAME", "")
+    if not project_name:
+        return ""
+
+    try:
+        import boto3
+
+        account_id = boto3.client(
+            "sts", region_name=AWS_DEFAULT_REGION
+        ).get_caller_identity()["Account"]
+    except Exception:
+        return ""
+
+    return f"{project_name}-data-{account_id}"
+
+
+DATA_S3_BUCKET: str = _derive_data_bucket()
 DATA_S3_PREFIX: str = _get("s3", "prefix", "DATA_S3_PREFIX", "fraud-detection/")
 
 
