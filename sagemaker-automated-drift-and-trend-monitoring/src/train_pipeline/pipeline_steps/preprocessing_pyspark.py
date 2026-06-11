@@ -302,10 +302,17 @@ def convert_boolean_columns(df: DataFrame) -> DataFrame:
                 categories = sorted(list(unique_vals))
                 mapping = {cat: idx for idx, cat in enumerate(categories)}
 
-                # Apply mapping using when/otherwise chain
-                encoding_expr = F.lit(-1)  # Default for NULL
+                # Apply mapping using when/otherwise chain.
+                # `categories` were derived from a LOWERCASED set of distinct
+                # values, so the column value must also be lowered before
+                # comparison. Comparing raw 'Male' against 'male' silently
+                # fails and leaves the category unencoded (the source of the
+                # "could not convert string to float: 'Male'" training error).
+                encoding_expr = F.lit(-1)  # Default for NULL / unmatched
                 for cat, idx in mapping.items():
-                    encoding_expr = F.when(F.col(col) == cat, idx).otherwise(encoding_expr)
+                    encoding_expr = F.when(
+                        F.lower(F.col(col)) == cat, idx
+                    ).otherwise(encoding_expr)
 
                 df = df.withColumn(col, encoding_expr)
 
