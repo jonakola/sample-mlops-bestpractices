@@ -648,7 +648,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt AppCleanupFunction.Arn
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-space-v18'
+      SpaceName: !Sub '${ProjectName}-space-v19'
       UserProfileName: !Ref UserProfileName
 
   # ====================================================================
@@ -848,6 +848,10 @@ Resources:
                   - 'events:DeleteRule'
                   - 'events:RemoveTargets'
                   - 'events:DescribeRule'
+                  - 'events:EnableRule'
+                  - 'events:DisableRule'
+                  - 'events:ListRules'
+                  - 'events:ListTargetsByRule'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-IAMPassRole'
           PolicyDocument:
@@ -884,6 +888,14 @@ Resources:
                   - 'ecr:GetDownloadUrlForLayer'
                   - 'ecr:BatchGetImage'
                   - 'ecr:DescribeImages'
+                  # ECR push: notebook (deploy_lambda_container.sh) creates an
+                  # ECR repo and pushes the drift-monitor container image.
+                  - 'ecr:CreateRepository'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:PutImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-LambdaAccess'
           PolicyDocument:
@@ -903,6 +915,10 @@ Resources:
                   - 'lambda:GetEventSourceMapping'
                   - 'lambda:ListEventSourceMappings'
                   - 'lambda:UpdateEventSourceMapping'
+                  - 'lambda:AddPermission'
+                  - 'lambda:RemovePermission'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:GetPolicy'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-SQSAccess'
           PolicyDocument:
@@ -933,6 +949,147 @@ Resources:
                   - 'cloudwatch:PutDashboard'
                   - 'cloudwatch:GetDashboard'
                   - 'cloudwatch:ListDashboards'
+                Resource: '*'
+        # CloudWatch Logs read: the 2A notebook tails the drift-monitor
+        # Lambda logs (describe_log_streams / get_log_events) to surface
+        # execution output after invoking the monitoring Lambda.
+        - PolicyName: !Sub '${ProjectName}-CloudWatchLogsAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:GetLogEvents'
+                  - 'logs:FilterLogEvents'
+                Resource: '*'
+        # SNS: deploy_lambda_container.sh creates the drift-alerts topic,
+        # subscribes endpoints, and the monitoring path publishes alerts.
+        - PolicyName: !Sub '${ProjectName}-SNSAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:CreateTopic'
+                  - 'sns:DeleteTopic'
+                  - 'sns:Subscribe'
+                  - 'sns:Unsubscribe'
+                  - 'sns:Publish'
+                  - 'sns:GetTopicAttributes'
+                  - 'sns:SetTopicAttributes'
+                  - 'sns:ListTopics'
+                  - 'sns:ListSubscriptionsByTopic'
+                Resource: '*'
+        # IAM role management for the drift-monitor / monitoring-writer
+        # Lambda roles. The notebook (cell-33) and deploy_monitoring_writer
+        # create+configure roles named fraud-detection-*. Scope is limited to
+        # those role names in THIS account (account-agnostic via
+        # ${AWS::AccountId}). SelfAdminAccess (below) covers the execution
+        # role itself; this covers the Lambda roles it provisions.
+        - PolicyName: !Sub '${ProjectName}-LambdaRoleManagement'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:CreateRole'
+                  - 'iam:DeleteRole'
+                  - 'iam:AttachRolePolicy'
+                  - 'iam:DetachRolePolicy'
+                  - 'iam:PutRolePolicy'
+                  - 'iam:DeleteRolePolicy'
+                  - 'iam:GetRole'
+                  - 'iam:GetRolePolicy'
+                  - 'iam:TagRole'
+                  - 'iam:ListRolePolicies'
+                  - 'iam:ListAttachedRolePolicies'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/fraud-detection-*'
+        # Self-administration: the setup script
+        # (src/setup/create_or_update_sagemaker_role.py) attaches managed
+        # policies to THIS role at runtime. Scope iam:AttachRolePolicy/
+        # DetachRolePolicy/PutRolePolicy to this role only (account-agnostic
+        # via ${AWS::AccountId} + ${ProjectName}).
+        - PolicyName: !Sub '${ProjectName}-SelfAdminAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:AttachRolePolicy'
+                  - 'iam:DetachRolePolicy'
+                  - 'iam:PutRolePolicy'
+                  - 'iam:DeleteRolePolicy'
+                  - 'iam:GetRole'
+                  - 'iam:GetRolePolicy'
+                  - 'iam:ListAttachedRolePolicies'
+                  - 'iam:ListRolePolicies'
+                  - 'iam:UpdateAssumeRolePolicy'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole'
+        # Lake Formation: the setup script grants DB/table permissions to this
+        # role at runtime (lf_client.grant_permissions). Allow the LF grant/
+        # admin actions so that self-grant succeeds in any account.
+        - PolicyName: !Sub '${ProjectName}-LakeFormationAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lakeformation:GrantPermissions'
+                  - 'lakeformation:RevokePermissions'
+                  - 'lakeformation:BatchGrantPermissions'
+                  - 'lakeformation:BatchRevokePermissions'
+                  - 'lakeformation:ListPermissions'
+                  - 'lakeformation:GetDataLakeSettings'
+                  - 'lakeformation:PutDataLakeSettings'
+                  - 'lakeformation:GetDataAccess'
+                  - 'lakeformation:GetResourceLFTags'
+                  - 'lakeformation:ListResources'
+                  - 'lakeformation:DescribeResource'
+                  - 'lakeformation:RegisterResource'
+                Resource: '*'
+        # QuickSight: the governance notebook (3_governance_dashboard.ipynb)
+        # builds the QuickSight datasource, datasets, analysis, and dashboard
+        # programmatically (create/describe/update + permissions grants + embed
+        # URL). QuickSight resource ARNs are account/region-specific and the
+        # actions span account-settings, users, datasource, dataset, analysis,
+        # and dashboard, so Resource is '*'.
+        - PolicyName: !Sub '${ProjectName}-QuickSightAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'quicksight:DescribeAccountSettings'
+                  - 'quicksight:ListUsers'
+                  - 'quicksight:CreateDataSource'
+                  - 'quicksight:DescribeDataSource'
+                  - 'quicksight:UpdateDataSource'
+                  - 'quicksight:DescribeDataSourcePermissions'
+                  - 'quicksight:UpdateDataSourcePermissions'
+                  - 'quicksight:PassDataSource'
+                  - 'quicksight:DeleteDataSource'
+                  - 'quicksight:CreateDataSet'
+                  - 'quicksight:DescribeDataSet'
+                  - 'quicksight:UpdateDataSet'
+                  - 'quicksight:DescribeDataSetPermissions'
+                  - 'quicksight:UpdateDataSetPermissions'
+                  - 'quicksight:PassDataSet'
+                  - 'quicksight:DeleteDataSet'
+                  - 'quicksight:CreateAnalysis'
+                  - 'quicksight:DescribeAnalysis'
+                  - 'quicksight:UpdateAnalysis'
+                  - 'quicksight:DeleteAnalysis'
+                  - 'quicksight:RestoreAnalysis'
+                  - 'quicksight:CreateDashboard'
+                  - 'quicksight:DescribeDashboard'
+                  - 'quicksight:UpdateDashboard'
+                  - 'quicksight:UpdateDashboardPublishedVersion'
+                  - 'quicksight:DeleteDashboard'
+                  - 'quicksight:ListDashboardVersions'
+                  - 'quicksight:QueryDashboard'
+                  - 'quicksight:GetDashboardEmbedUrl'
                 Resource: '*'
       Tags:
         - Key: Name
@@ -1009,7 +1166,7 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-v18'
+      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-v19'
       StudioLifecycleConfigAppType: JupyterLab
       StudioLifecycleConfigContent:
         Fn::Base64:
@@ -1019,7 +1176,7 @@ Resources:
             sleep 10
             cd /home/sagemaker-user || exit 1
             if [ ! -d "sample-mlops-bestpractices" ]; then
-              git clone -b cfn-data-pipeline-setup ${GitHubRepo} || exit 1
+              git clone ${GitHubRepo} || exit 1
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
 
@@ -1299,7 +1456,7 @@ Resources:
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-space-v18'
+      SpaceName: !Sub '${ProjectName}-space-v19'
       OwnershipSettings:
         OwnerUserProfileName: !Ref UserProfileName
       SpaceSettings:
@@ -1477,7 +1634,7 @@ Outputs:
 
   JupyterSpaceName:
     Description: JupyterLab Space Name
-    Value: !Sub '${ProjectName}-space-v18'
+    Value: !Sub '${ProjectName}-space-v19'
     Export:
       Name: !Sub '${AWS::StackName}-JupyterSpaceName'
 
@@ -1532,7 +1689,7 @@ Outputs:
       1. Navigate to SageMaker Console: https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/domains
       2. Click on Domain: ${ProjectName}-domain
       3. Select User Profile: ${UserProfileName}
-      4. Go to Spaces and open: ${ProjectName}-space-v18
+      4. Go to Spaces and open: ${ProjectName}-space-v19
       5. Click "Run Space" to start JupyterLab
       6. Once JupyterLab loads, check CLOUDFORMATION_SETUP_COMPLETE.md for next steps
 

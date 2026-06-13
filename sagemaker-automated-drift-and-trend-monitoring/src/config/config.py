@@ -174,6 +174,12 @@ def _derive_data_bucket() -> str:
 DATA_S3_BUCKET: str = _derive_data_bucket()
 DATA_S3_PREFIX: str = _get("s3", "prefix", "DATA_S3_PREFIX", "fraud-detection/")
 
+# Derive the Athena query-results location from the data bucket when not set
+# explicitly (account-agnostic, matches the CFN lifecycle/Lambda convention
+# ``s3://${ProjectName}-data-${AWS::AccountId}/athena-results/``).
+if not ATHENA_OUTPUT_S3 and DATA_S3_BUCKET:
+    ATHENA_OUTPUT_S3 = f"s3://{DATA_S3_BUCKET}/athena-results/"
+
 
 def _s3_path(yaml_key: str, env_var: str, suffix: str) -> str:
     """Build S3 path from config or derive from bucket + prefix + suffix."""
