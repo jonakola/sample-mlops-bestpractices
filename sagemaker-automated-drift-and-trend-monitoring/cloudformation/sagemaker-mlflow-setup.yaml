@@ -984,10 +984,11 @@ Resources:
                 Resource: '*'
         # IAM role management for the drift-monitor / monitoring-writer
         # Lambda roles. The notebook (cell-33) and deploy_monitoring_writer
-        # create+configure roles named fraud-detection-*. Scope is limited to
-        # those role names in THIS account (account-agnostic via
-        # ${AWS::AccountId}). SelfAdminAccess (below) covers the execution
-        # role itself; this covers the Lambda roles it provisions.
+        # create+configure roles named fraud-* (e.g. fraud-detection-* and
+        # fraud-monitoring-results-writer-role). Scope is limited to those
+        # role names in THIS account (account-agnostic via ${AWS::AccountId}).
+        # SelfAdminAccess (below) covers the execution role itself; this
+        # covers the Lambda roles it provisions.
         - PolicyName: !Sub '${ProjectName}-LambdaRoleManagement'
           PolicyDocument:
             Version: '2012-10-17'
@@ -1005,7 +1006,7 @@ Resources:
                   - 'iam:TagRole'
                   - 'iam:ListRolePolicies'
                   - 'iam:ListAttachedRolePolicies'
-                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/fraud-detection-*'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/fraud-*'
         # Self-administration: the setup script
         # (src/setup/create_or_update_sagemaker_role.py) attaches managed
         # policies to THIS role at runtime. Scope iam:AttachRolePolicy/
