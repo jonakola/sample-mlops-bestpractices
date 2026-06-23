@@ -1142,15 +1142,10 @@ Resources:
             log "Installing minimal Python dependencies..."
             pip install python-dotenv pyyaml
 
-            # Generate synthetic datasets
-            log "Generating synthetic datasets..."
-            python data/generate_datasets.py
-
-            # Rename generated files (drop "generated_" prefix)
-            log "Renaming generated datasets..."
-            mv data/generated_creditcard_predictions_final.csv data/creditcard_predictions_final.csv
-            mv data/generated_creditcard_drifted.csv data/creditcard_drifted.csv
-            mv data/generated_creditcard_ground_truth.csv data/creditcard_ground_truth.csv
+            # Download Kaggle training dataset
+            log "Downloading Kaggle credit card fraud dataset..."
+            pip install kagglehub
+            python data/download_kaggle_dataset.py
 
             # Upload data to S3 (direct aws cli — avoids Python config loading issues)
             DATA_BUCKET="${ProjectName}-data-${AWS::AccountId}"
@@ -1158,8 +1153,6 @@ Resources:
 
             log "Uploading data to s3://$DATA_BUCKET/$S3_PREFIX/ ..."
             aws s3 cp data/creditcard_predictions_final.csv "s3://$DATA_BUCKET/$S3_PREFIX/creditcard_predictions_final.csv"
-            aws s3 cp data/creditcard_ground_truth.csv "s3://$DATA_BUCKET/$S3_PREFIX/creditcard_ground_truth.csv"
-            aws s3 cp data/creditcard_drifted.csv "s3://$DATA_BUCKET/$S3_PREFIX/creditcard_drifted.csv"
             log "S3 upload complete"
 
             # Setup Athena tables

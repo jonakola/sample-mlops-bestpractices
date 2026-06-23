@@ -89,7 +89,7 @@ source .env 2>/dev/null || export $(cat .env | grep -v '^#' | xargs)
 pip install .
 
 # Generate datasets (downloads real Kaggle fraud dataset for training data)
-python data/generate_datasets.py
+python data/download_kaggle_dataset.py
 
 # Upload to S3
 python -m src.setup.upload_data_to_s3
@@ -101,8 +101,6 @@ Verify the upload succeeded:
 aws s3 ls s3://${DATA_S3_BUCKET}/fraud-detection/data/
 # Expected output:
 #   creditcard_predictions_final.csv
-#   creditcard_ground_truth.csv
-#   creditcard_drifted.csv
 ```
 
 #### If Athena table creation failed
@@ -141,7 +139,7 @@ cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
 pip install .
 
 # Generate and upload data (downloads real Kaggle fraud dataset for training)
-python data/generate_datasets.py
+python data/download_kaggle_dataset.py
 python -m src.setup.upload_data_to_s3
 
 # Create Athena tables
@@ -171,7 +169,7 @@ If any values are missing, check the `.env` file was created correctly by the li
 
 **Step 1 - Data Ingestion**
 - S3 data loaded into Training Data table
-- The repository provides `generate_datasets.py` which downloads the real Kaggle credit card fraud dataset and renames columns to the project schema. Drifted and ground truth files are synthetically generated for monitoring tests only.
+- The repository provides `download_kaggle_dataset.py` which downloads the real Kaggle credit card fraud dataset and renames columns to the project schema.
 - Alternatively, you can replace `training_data` with your own dataset
 
 **Step 2 - Feature Engineering**
@@ -192,7 +190,7 @@ If any values are missing, check the `.env` file was created correctly by the li
 - Once deployed, the inference handler writes all inferences to SQS and Lambda
 - All notebooks include convenience script invocations for role creation and infrastructure setup (SQS, Lambda, roles, etc.)
 
-### Steps 6-10: Inference Monitoring (`2a_inference_monitoring.ipynb`)
+### Steps 6-10: Inference Monitoring (`2_inference_monitoring.ipynb`)
 
 **Step 6 - Real-Time Inference Logging**
 - Endpoint logs predictions to SQS → Lambda → Athena `inference_responses` table
@@ -347,7 +345,7 @@ MLflow serves as the **unified monitoring dashboard** where all monitoring workf
 - `drift_reports/drift_summary_*.json` - Structured JSON drift summary
 
 **5. Monitoring Workflows**
-- **Manual**: Data scientists run `2a_inference_monitoring.ipynb` → query Athena → run Evidently reports → log interactive HTML reports to MLflow
+- **Manual**: Data scientists run `2_inference_monitoring.ipynb` → query Athena → run Evidently reports → log interactive HTML reports to MLflow
 - **Automated**: EventBridge triggers Lambda daily → runs Evidently DataDriftPreset + ClassificationPreset → logs HTML reports & metrics to MLflow → sends SNS alert if drift detected
 
 **6. Alerting**
@@ -450,15 +448,14 @@ sagemaker-automated-drift-and-trend-monitoring/
 │       └── setup_quicksight_governance.py    # QuickSight governance dashboard setup
 ├── notebooks/
 │   ├── 1_training_pipeline.ipynb              # Interactive pipeline control notebook
-│   ├── 2a_inference_monitoring.ipynb            # Monitoring & drift detection notebook
+│   ├── 2_inference_monitoring.ipynb            # Monitoring & drift detection notebook
 │   ├── inference_monitoring_with_pipeline.ipynb # Pipeline-based automated drift monitoring with Evidently
 │   ├── 3_governance_dashboard.ipynb            # QuickSight governance dashboard setup
 │   ├── 4_optional_version_validation.ipynb  # Version consistency validation (MLflow, SageMaker, Athena)
 │   └── 5_optional_cleanup.ipynb             # Resource cleanup (Lambda, SageMaker, Athena, S3, IAM)
 ├── data/
-│   ├── creditcard_predictions_final.csv      # Training data (284K rows, 30 features)
-│   ├── creditcard_ground_truth.csv           # Ground truth labels
-│   └── creditcard_drifted.csv                # Drifted data for testing
+│   ├── download_kaggle_dataset.py            # Downloads Kaggle dataset, renames columns
+│   └── creditcard_predictions_final.csv      # Training data (284K rows, 30 features)
 ├── docs/
 │   ├── MetaMonitoring.png                    # 11-step end-to-end architecture diagram
 │   ├── inference_monitoring_processflow.png  # 13-step inference monitoring flow
@@ -526,7 +523,7 @@ After deploying the CloudFormation stack and running the JupyterLab space (see [
 
 The CloudFormation execution role **automatically includes** CloudWatch Metrics/Alarms/Dashboards permissions via the `${ProjectName}-CloudWatchMetricsAccess` inline policy. No manual action is required for standard deployments.
 
-> **If using `UseExistingRole=true`:** Your existing role must include the following permissions for Cell 40 in `2a_inference_monitoring.ipynb` to work (publish custom metrics, create alarms, and build dashboards):
+> **If using `UseExistingRole=true`:** Your existing role must include the following permissions for Cell 40 in `2_inference_monitoring.ipynb` to work (publish custom metrics, create alarms, and build dashboards):
 >
 > ```json
 > {
@@ -585,7 +582,7 @@ python main.py pipeline status --pipeline-name fraud-detection-pipeline
 
 ```bash
 # 1. Open monitoring notebook
-# notebooks/2a_inference_monitoring.ipynb
+# notebooks/2_inference_monitoring.ipynb
 
 # 2. Run inference tests (Cells 1-9 in the notebook)
 # Or via CLI:
@@ -597,7 +594,7 @@ python -m src.monitoring.simulate_ground_truth_from_athena --accuracy 0.85
 # 4. Apply ground truth updates
 python -m src.monitoring.update_ground_truth --mode batch
 
-# 5. Run monitoring & drift detection (Cells 27-40 in 2a_inference_monitoring.ipynb)
+# 5. Run monitoring & drift detection (Cells 27-40 in 2_inference_monitoring.ipynb)
 # Generates 8+ charts, calculates metrics, detects drift
 ```
 
@@ -1082,7 +1079,7 @@ A feature is flagged as drifted if **either** its PSI ≥ 0.2 **or** its KS test
 
 **Feature Extraction for Drift Detection:**
 
-The drift detection process (Cell 31 in `2a_inference_monitoring.ipynb`) analyzes **all 30 training features** by parsing the `input_features` JSON column:
+The drift detection process (Cell 31 in `2_inference_monitoring.ipynb`) analyzes **all 30 training features** by parsing the `input_features` JSON column:
 
 ```python
 import json
@@ -1300,9 +1297,9 @@ All reports are logged to MLflow experiment: `credit-card-fraud-detection-monito
 | Precision-Recall Curve | Performance at thresholds | MLflow Training Run | During evaluation |
 | Confusion Matrix | Classification accuracy | MLflow Training Run | During evaluation |
 | **Monitoring (Evidently)** |
-| Data Drift HTML Report | Per-feature drift analysis (PSI, KS, distributions) | MLflow `evidently_reports/` | 2a_inference_monitoring.ipynb Cell 37 |
-| Classification HTML Report | Model performance (ROC, PR, confusion matrix, F1) | MLflow `evidently_reports/` | 2a_inference_monitoring.ipynb Cell 37 |
-| Drift Summary JSON | Structured drift summary | MLflow `drift_reports/` | 2a_inference_monitoring.ipynb Cell 37 |
+| Data Drift HTML Report | Per-feature drift analysis (PSI, KS, distributions) | MLflow `evidently_reports/` | 2_inference_monitoring.ipynb Cell 37 |
+| Classification HTML Report | Model performance (ROC, PR, confusion matrix, F1) | MLflow `evidently_reports/` | 2_inference_monitoring.ipynb Cell 37 |
+| Drift Summary JSON | Structured drift summary | MLflow `drift_reports/` | 2_inference_monitoring.ipynb Cell 37 |
 
 **Accessing in MLflow:**
 ```
@@ -1322,7 +1319,7 @@ All reports are logged to MLflow experiment: `credit-card-fraud-detection-monito
 
 Drift detection compares current inference feature distributions against a **baseline**. The baseline should represent the data the model was trained on.
 
-**Current approach** (`2a_inference_monitoring.ipynb`):
+**Current approach** (`2_inference_monitoring.ipynb`):
 ```python
 baseline_df = pd.read_csv(CSV_TRAINING_DATA)
 ```
@@ -1412,7 +1409,7 @@ EventBridge Rule → Lambda Function → SNS Topic → Email
 ### Quick Setup
 
 **Option 1: Using Notebook (Recommended)**
-1. Open `notebooks/2a_inference_monitoring.ipynb`
+1. Open `notebooks/2_inference_monitoring.ipynb`
 2. Navigate to **Section 6: Automated Drift Monitoring Setup**
 3. Run cells 6.1-6.3 to deploy infrastructure
 4. Confirm email subscription
@@ -1547,7 +1544,7 @@ aws logs tail /aws/lambda/fraud-detection-drift-monitor --follow
 - `src/drift_monitoring/generate_drift_dataset.py` - Generate test drift data
 - `src/setup/setup_drift_monitoring.py` - Interactive setup
 - `src/setup/deploy_drift_monitoring.sh` - CI/CD deployment script
-- `notebooks/2a_inference_monitoring.ipynb` - Section 6 (setup cells)
+- `notebooks/2_inference_monitoring.ipynb` - Section 6 (setup cells)
 
 ### Thresholds Explained
 
@@ -1571,7 +1568,7 @@ aws logs tail /aws/lambda/fraud-detection-drift-monitor --follow
 
 **Change Thresholds:**
 ```python
-# In 2a_inference_monitoring.ipynb, Cell 6.6
+# In 2_inference_monitoring.ipynb, Cell 6.6
 lambda_client.update_function_configuration(
     FunctionName='fraud-detection-drift-monitor',
     Environment={
@@ -1669,7 +1666,7 @@ aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account}:fraud-detection
 
 ### Lambda Redeployment Control
 
-By default, `2a_inference_monitoring.ipynb` checks if Lambda functions already exist before deploying them. This prevents unnecessary redeployment during notebook reruns.
+By default, `2_inference_monitoring.ipynb` checks if Lambda functions already exist before deploying them. This prevents unnecessary redeployment during notebook reruns.
 
 **Configuration Flag (Cell 26):**
 ```python
@@ -1693,7 +1690,7 @@ REDEPLOY_LAMBDAS = False  # Default: skip if exists
 
 The ground truth simulator allows configurable drift scenarios for testing the monitoring system. This is critical for validating that drift detection triggers correctly before deploying to production.
 
-**Configuration (Cell 15 in `2a_inference_monitoring.ipynb`):**
+**Configuration (Cell 15 in `2_inference_monitoring.ipynb`):**
 ```python
 # Ground Truth Simulation Configuration
 SIM_ACCURACY = 0.85              # Base model accuracy (0.0-1.0)
@@ -1943,7 +1940,7 @@ The governance dashboard automatically refreshes daily with the latest drift mon
               └─ Dashboard shows updated data by morning
 ```
 
-**Components Created (Cells 74-75 in `2a_inference_monitoring.ipynb`):**
+**Components Created (Cells 74-75 in `2_inference_monitoring.ipynb`):**
 
 1. **Lambda Function**: `quicksight-dashboard-refresh`
    - Runtime: Python 3.11
@@ -2243,7 +2240,7 @@ ModelError: Expected 30 features, got 32
 
 **Solution:**
 - Model expects exactly 30 training features
-- Check `TRAINING_FEATURES` list in `2a_inference_monitoring.ipynb` Cell 4
+- Check `TRAINING_FEATURES` list in `2_inference_monitoring.ipynb` Cell 4
 - Do not include `transaction_id` or `transaction_timestamp` (metadata columns)
 
 ---
@@ -2484,14 +2481,14 @@ python main.py pipeline start --pipeline-name fraud-detection-pipeline --wait
 
 ### 3. Run Inference & Monitoring
 
-**Open:** `notebooks/2a_inference_monitoring.ipynb`
+**Open:** `notebooks/2_inference_monitoring.ipynb`
 
 This notebook handles the complete inference and monitoring workflow:
 
 #### 3a. Test Inference (Cells 1-9)
 
 ```bash
-# In 2a_inference_monitoring.ipynb:
+# In 2_inference_monitoring.ipynb:
 # Cell 1-2: Setup (load environment, initialize clients)
 # Cell 4: Load test data and verify features
 # Cell 5: Quick single test (optional)
@@ -2516,7 +2513,7 @@ This notebook handles the complete inference and monitoring workflow:
 **For Development/Testing:**
 
 ```bash
-# In 2a_inference_monitoring.ipynb:
+# In 2_inference_monitoring.ipynb:
 # Cell 20: Run ground truth simulator
 # - Simulates fraud investigation outcomes
 # - Creates realistic confirmation delays
@@ -2538,7 +2535,7 @@ Replace simulation with actual fraud investigation system that writes to `ground
 #### 3c. Apply Ground Truth Updates (Cell 19 or CLI)
 
 ```bash
-# In 2a_inference_monitoring.ipynb:
+# In 2_inference_monitoring.ipynb:
 # Cell 19: Apply updates using notebook
 
 # Or via CLI:
@@ -2630,7 +2627,7 @@ The entire PoC is driven by **three notebooks** in SageMaker Studio. Each notebo
 | Notebook | Purpose | Key Cells |
 |----------|---------|-----------|
 | **`1_training_pipeline.ipynb`** | Training, evaluation, model registration, endpoint deployment | Cells 1-5 |
-| **`2a_inference_monitoring.ipynb`** | Inference testing, ground truth, drift detection, CloudWatch alarms | Cells 1-40 |
+| **`2_inference_monitoring.ipynb`** | Inference testing, ground truth, drift detection, CloudWatch alarms | Cells 1-40 |
 | **`inference_monitoring_with_pipeline.ipynb`** | Pipeline-based automated monitoring: creates a SageMaker Pipeline (`fraud-detection-monitoring-pipeline`) with steps for ground truth simulation, drift computation, MLflow logging, Athena writes, threshold checks, and alarm creation | Cells 1-end |
 | **`3_governance_dashboard.ipynb`** | QuickSight governance dashboard: creates Athena data source, dataset, analysis with 6 visuals, and published dashboard — all via API | Cells 1-11 |
 | **`4_optional_version_validation.ipynb`** | Version traceability: validates MLflow model version matches SageMaker endpoint and Athena logs | Cells 1-20 |
@@ -2639,10 +2636,10 @@ The entire PoC is driven by **three notebooks** in SageMaker Studio. Each notebo
 **Workflow:**
 
 1. **Train & Deploy:** `1_training_pipeline.ipynb` → Cells 1-5 (creates pipeline, trains model, deploys endpoint)
-2. **Test Inference:** `2a_inference_monitoring.ipynb` → Cells 1-9 (single + bulk predictions, auto-logged to Athena)
-3. **Simulate Ground Truth:** `2a_inference_monitoring.ipynb` → Cells 19-24 (generate and apply ground truth labels)
-4. **Monitor & Detect Drift:** `2a_inference_monitoring.ipynb` → Cells 26-39 (performance metrics, data drift, model drift, MLflow logging)
-5. **CloudWatch Alarms:** `2a_inference_monitoring.ipynb` → Cell 40 (publish metrics, create alarms & dashboard)
+2. **Test Inference:** `2_inference_monitoring.ipynb` → Cells 1-9 (single + bulk predictions, auto-logged to Athena)
+3. **Simulate Ground Truth:** `2_inference_monitoring.ipynb` → Cells 19-24 (generate and apply ground truth labels)
+4. **Monitor & Detect Drift:** `2_inference_monitoring.ipynb` → Cells 26-39 (performance metrics, data drift, model drift, MLflow logging)
+5. **CloudWatch Alarms:** `2_inference_monitoring.ipynb` → Cell 40 (publish metrics, create alarms & dashboard)
 6. **MLflow Review:** SageMaker Studio → Partner AI Apps → MLflow
 7. **Retrain:** `1_training_pipeline.ipynb` → Cell 5 (re-execute pipeline)
 
@@ -2808,10 +2805,10 @@ Each notebook cell has a direct CLI equivalent. For CI/CD pipelines, replace not
 | SQS + Lambda | `1_training_pipeline.ipynb` Cell 3 | `python main.py setup-logging` |
 | Create Pipeline | `1_training_pipeline.ipynb` Cell 4 | `python main.py pipeline create --pipeline-name fraud-detection-pipeline` |
 | Train & Deploy | `1_training_pipeline.ipynb` Cell 5 | `python main.py pipeline start --pipeline-name fraud-detection-pipeline --wait` |
-| Test Inference | `2a_inference_monitoring.ipynb` Cells 6-9 | `python main.py test --endpoint-name fraud-detector-endpoint --num-samples 100` |
-| Simulate Ground Truth | `2a_inference_monitoring.ipynb` Cell 19 | `python -m src.monitoring.simulate_ground_truth_from_athena --accuracy 0.85` |
-| Apply Ground Truth | `2a_inference_monitoring.ipynb` Cell 24 | `python -m src.monitoring.update_ground_truth --mode batch` |
-| Monitor Drift | `2a_inference_monitoring.ipynb` Cells 26-39 | `python -m src.monitoring.monitor_model_performance --days 30` |
+| Test Inference | `2_inference_monitoring.ipynb` Cells 6-9 | `python main.py test --endpoint-name fraud-detector-endpoint --num-samples 100` |
+| Simulate Ground Truth | `2_inference_monitoring.ipynb` Cell 19 | `python -m src.monitoring.simulate_ground_truth_from_athena --accuracy 0.85` |
+| Apply Ground Truth | `2_inference_monitoring.ipynb` Cell 24 | `python -m src.monitoring.update_ground_truth --mode batch` |
+| Monitor Drift | `2_inference_monitoring.ipynb` Cells 26-39 | `python -m src.monitoring.monitor_model_performance --days 30` |
 
 ### Scheduled Monitoring
 

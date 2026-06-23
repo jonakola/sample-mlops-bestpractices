@@ -516,7 +516,7 @@ def send_sns_alert(data_drift_result, model_drift_result):
         "3. Consider retraining model with recent data",
         "4. Review and adjust decision thresholds if needed",
         "",
-        "View detailed Evidently reports in MLflow artifacts or 2a_inference_monitoring.ipynb",
+        "View detailed Evidently reports in MLflow artifacts or 2_inference_monitoring.ipynb",
         "=" * 80,
     ])
 
