@@ -1438,7 +1438,71 @@ Resources:
             chown sagemaker-user:sagemaker-user .env
             chmod 600 .env
 
-            log "Setup complete! .env created with MLflow/S3/SageMaker config."
+            # Install minimal dependencies (numpy, pandas, boto3 are pre-installed)
+            log "Installing minimal Python dependencies..."
+            pip install python-dotenv pyyaml
+
+            # Download Kaggle training dataset
+            log "Downloading Kaggle credit card fraud dataset..."
+            pip install kagglehub
+            python data/download_kaggle_dataset.py
+
+            # Upload data to S3 (direct aws cli — avoids Python config loading issues)
+            DATA_BUCKET="${ProjectName}-data-${AWS::AccountId}"
+            S3_PREFIX="fraud-detection/data"
+
+            log "Uploading data to s3://$DATA_BUCKET/$S3_PREFIX/ ..."
+            aws s3 cp data/creditcard_predictions_final.csv "s3://$DATA_BUCKET/$S3_PREFIX/creditcard_predictions_final.csv"
+            log "S3 upload complete"
+
+            # Setup Athena tables
+            log "Setting up Athena tables..."
+            python -m src.setup.setup_athena_tables
+
+            # Create README with setup instructions
+            cat > CLOUDFORMATION_SETUP_COMPLETE.md << 'SETUPEOF'
+            # CloudFormation Setup Complete!
+
+            ## Environment Variables Configured
+
+            Your .env file has been automatically created with all necessary configurations:
+            - AWS Region and SageMaker Execution Role
+            - MLflow Tracking Server URL
+            - S3 Data Bucket
+
+            ## Next Steps
+
+            1. Open a terminal and verify the environment:
+               ```bash
+               cat .env
+               ```
+
+            2. Install dependencies:
+               ```bash
+               pip install -r requirements.txt
+               ```
+
+            3. Run the notebooks in order:
+               - 1_training_pipeline.ipynb
+               - 2a_inference_monitoring.ipynb
+               - 3_governance_dashboard.ipynb
+               - 4_optional_version_validation.ipynb
+               - 5_optional_cleanup.ipynb
+               - 6_shap_explainability.ipynb
+
+            ## MLflow Tracking Server
+
+            Your MLflow tracking server ARN:
+            ${MLflowTrackingServer.TrackingServerArn}
+
+            To get the MLflow UI URL, run:
+            aws sagemaker describe-mlflow-tracking-server --tracking-server-name ${ProjectName}-mlflow --query 'TrackingServerUrl' --output text
+
+            SETUPEOF
+
+            chown sagemaker-user:sagemaker-user CLOUDFORMATION_SETUP_COMPLETE.md
+
+            log "Setup complete! Check CLOUDFORMATION_SETUP_COMPLETE.md for next steps."
             exit 0
       Tags:
         - Key: Name

@@ -25,7 +25,7 @@ This directory contains screenshots for documentation and tutorials.
    ```
 
 **Referenced in:**
-- `notebooks/2a_inference_monitoring.ipynb` - Cell 8
+- `notebooks/2_inference_monitoring.ipynb` - Cell 8
 - `README.md` - "Testing in SageMaker Studio Endpoint Playground" section
 
 **How to capture:**
@@ -52,7 +52,7 @@ grep -r "DirectTestingInSGPlayground-custom-handler.png" .
 
 ## Evidently Interactive Reports
 
-**Note**: Notebooks in `2a_inference_monitoring.ipynb` contain embedded Evidently HTML reports. These work when running notebooks locally but don't render on GitHub (security limitation). See [evidently/](evidently/) folder for example screenshots.
+**Note**: Notebooks in `2_inference_monitoring.ipynb` contain embedded Evidently HTML reports. These work when running notebooks locally but don't render on GitHub (security limitation). See [evidently/](evidently/) folder for example screenshots.
 
 ## Notes
 

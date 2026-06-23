@@ -387,7 +387,7 @@ def main():
 
         print("\n📝 Next Steps:")
         print("  1. Confirm email subscription (check inbox/spam)")
-        print("  2. Test manual invocation: See 2a_inference_monitoring.ipynb")
+        print("  2. Test manual invocation: See 2_inference_monitoring.ipynb")
         print("  3. Wait for scheduled run or trigger manually")
         print("  4. Monitor CloudWatch logs for drift checks")
 
