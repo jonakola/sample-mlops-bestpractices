@@ -18,7 +18,7 @@ Follow these steps to implement the 11-step architecture shown above. Each step 
 
 ### Setup: Deploy with CloudFormation
 
-The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, SQS inference logging queue, Lambda inference logger with event source mapping, and IAM execution role with all required permissions (S3, Athena, Glue, Lambda, SQS, EventBridge, KMS, Lake Formation, CloudWatch Logs, CloudWatch Metrics/Alarms/Dashboards, MLflow). On first space launch, the lifecycle script auto-clones this repo, generates synthetic datasets, uploads data to S3, creates Athena tables, and writes a populated `.env` file (including SQS queue URL).
+The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, SQS inference logging queue, Lambda inference logger with event source mapping, and IAM execution role with all required permissions (S3, Athena, Glue, Lambda, SQS, EventBridge, KMS, Lake Formation, CloudWatch Logs, CloudWatch Metrics/Alarms/Dashboards, MLflow). On first space launch, the lifecycle script auto-clones this repo, downloads the Kaggle training dataset, generates monitoring test datasets, uploads data to S3, creates Athena tables, and writes a populated `.env` file (including SQS queue URL).
 
 **Deploy:**
 
@@ -77,7 +77,7 @@ The lifecycle script runs automatically on first space launch. If it fails partw
 
 #### If S3 data upload failed
 
-The lifecycle script generates synthetic datasets and uploads them to S3. If this step failed, run it manually from the JupyterLab terminal:
+The lifecycle script downloads the Kaggle training dataset and generates monitoring test datasets, then uploads them to S3. If this step failed, run it manually from the JupyterLab terminal:
 
 ```bash
 cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
@@ -88,13 +88,8 @@ source .env 2>/dev/null || export $(cat .env | grep -v '^#' | xargs)
 # Install dependencies (if not already installed)
 pip install .
 
-# Generate synthetic datasets
+# Generate datasets (downloads real Kaggle fraud dataset for training data)
 python data/generate_datasets.py
-
-# Rename generated files (drop "generated_" prefix)
-mv data/generated_creditcard_predictions_final.csv data/creditcard_predictions_final.csv
-mv data/generated_creditcard_drifted.csv data/creditcard_drifted.csv
-mv data/generated_creditcard_ground_truth.csv data/creditcard_ground_truth.csv
 
 # Upload to S3
 python -m src.setup.upload_data_to_s3
@@ -145,11 +140,8 @@ cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
 # Install dependencies
 pip install .
 
-# Generate and upload data
+# Generate and upload data (downloads real Kaggle fraud dataset for training)
 python data/generate_datasets.py
-mv data/generated_creditcard_predictions_final.csv data/creditcard_predictions_final.csv
-mv data/generated_creditcard_drifted.csv data/creditcard_drifted.csv
-mv data/generated_creditcard_ground_truth.csv data/creditcard_ground_truth.csv
 python -m src.setup.upload_data_to_s3
 
 # Create Athena tables
@@ -179,7 +171,7 @@ If any values are missing, check the `.env` file was created correctly by the li
 
 **Step 1 - Data Ingestion**
 - S3 data loaded into Training Data table
-- The repository provides scripts to generate the training dataset (`generate_datasets.py`) if you would like to test with the sample dataset
+- The repository provides `generate_datasets.py` which downloads the real Kaggle credit card fraud dataset and renames columns to the project schema. Drifted and ground truth files are synthetically generated for monitoring tests only.
 - Alternatively, you can replace `training_data` with your own dataset
 
 **Step 2 - Feature Engineering**
@@ -526,7 +518,7 @@ For full details on deploying, updating, and deleting the stack — including pa
 After deploying the CloudFormation stack and running the JupyterLab space (see [Setup: Deploy with CloudFormation](#setup-deploy-with-cloudformation)), the environment is ready to use. The lifecycle script has already:
 
 - Cloned the repository
-- Generated synthetic datasets and uploaded them to S3
+- Downloaded the Kaggle training dataset and generated monitoring test datasets, uploaded to S3
 - Created the Athena database and Iceberg tables
 - Written a populated `.env` file
 

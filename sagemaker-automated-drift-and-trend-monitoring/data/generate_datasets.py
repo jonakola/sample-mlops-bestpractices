@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """
-Generate synthetic CSV datasets for the fraud detection pipeline.
+Generate CSV datasets for the fraud detection pipeline.
 
-Produces three files that mirror the structure and statistical properties
-of the real datasets so the pipeline can run without the original data:
+Downloads the real Kaggle credit card fraud dataset (mlg-ulb/creditcardfraud)
+and renames columns to match the project's business-friendly schema.
 
-  - generated_creditcard_predictions_final.csv  (284,807 rows)
-  - generated_creditcard_drifted.csv            (5,000 rows)
-  - generated_creditcard_ground_truth.csv       (50,000 rows)
+The drifted and ground truth datasets are synthetically generated
+(they are used for monitoring/testing, not model training).
+
+Produces:
+  - creditcard_predictions_final.csv       (284,807 rows - from Kaggle)
+  - creditcard_drifted.csv                 (5,000 rows - synthetic)
+  - creditcard_ground_truth.csv            (50,000 rows - synthetic)
 
 Usage:
     python data/generate_datasets.py                # generate all three
-    python data/generate_datasets.py --predictions   # only predictions
-    python data/generate_datasets.py --drifted       # only drifted
-    python data/generate_datasets.py --ground-truth  # only ground truth
+    python data/generate_datasets.py --predictions   # only predictions (Kaggle download)
+    python data/generate_datasets.py --drifted       # only drifted (synthetic)
+    python data/generate_datasets.py --ground-truth  # only ground truth (synthetic)
 
-After generation, rename (drop the "generated_" prefix) to use them
-in place of the originals, or update config.yaml / .env to point at them.
+Requirements:
+    pip install -e .  (installs kagglehub via pyproject.toml)
 """
 
 import argparse
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import kagglehub
 import numpy as np
 import pandas as pd
 
@@ -33,15 +37,45 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).parent
 RANDOM_STATE = 42
 
-# Row counts matching the real files
-N_PREDICTIONS = 284_807
 N_DRIFTED = 5_000
 N_GROUND_TRUTH = 50_000
 
-# Fraud rate in the original dataset (~0.17%)
 FRAUD_RATE = 0.00173
 
-# 30 feature columns (PCA-normalised in the original dataset)
+KAGGLE_COLUMN_MAP = {
+    "Time": "transaction_timestamp",
+    "V1": "transaction_hour",
+    "V2": "transaction_day_of_week",
+    "V3": "customer_age",
+    "V4": "account_age_days",
+    "V5": "merchant_category_code",
+    "V6": "distance_from_home_km",
+    "V7": "distance_from_last_transaction_km",
+    "V8": "online_transaction",
+    "V9": "chip_transaction",
+    "V10": "pin_used",
+    "V11": "recurring_transaction",
+    "V12": "international_transaction",
+    "V13": "high_risk_country",
+    "V14": "num_transactions_24h",
+    "V15": "num_transactions_7days",
+    "V16": "avg_transaction_amount_30days",
+    "V17": "max_transaction_amount_30days",
+    "V18": "card_present",
+    "V19": "address_verification_match",
+    "V20": "cvv_match",
+    "V21": "velocity_score",
+    "V22": "merchant_reputation_score",
+    "V23": "time_since_last_transaction_min",
+    "V24": "transaction_type_code",
+    "V25": "customer_tenure_months",
+    "V26": "credit_limit",
+    "V27": "available_credit_ratio",
+    "V28": "previous_fraud_incidents",
+    "Amount": "transaction_amount",
+    "Class": "is_fraud",
+}
+
 FEATURE_COLUMNS = [
     "transaction_hour",
     "transaction_day_of_week",
@@ -78,115 +112,101 @@ GENDER_WEIGHTS = [0.45, 0.45, 0.10]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Generators
 # ---------------------------------------------------------------------------
 
-def _generate_features(rng: np.random.Generator, n: int) -> dict:
-    """Return a dict of feature arrays drawn from N(0,1), matching the
-    PCA-normalised distributions in the original dataset."""
-    return {col: rng.standard_normal(n) for col in FEATURE_COLUMNS}
+def generate_predictions(out_dir: Path) -> Path:
+    """Download Kaggle dataset and transform to project schema."""
+    rng = np.random.default_rng(RANDOM_STATE)
 
+    print("Downloading Kaggle credit card fraud dataset (mlg-ulb/creditcardfraud)...")
+    dataset_path = kagglehub.dataset_download("mlg-ulb/creditcardfraud")
+    csv_path = Path(dataset_path) / "creditcard.csv"
 
-def _generate_predictions_df(rng: np.random.Generator, n: int) -> pd.DataFrame:
-    """Build a DataFrame that mirrors creditcard_predictions_final.csv."""
-    features = _generate_features(rng, n)
+    print("Transforming to project schema...")
+    df = pd.read_csv(csv_path)
+    df = df.rename(columns=KAGGLE_COLUMN_MAP)
 
-    is_fraud = rng.random(n) < FRAUD_RATE
+    n = len(df)
+    is_fraud = df["is_fraud"].astype(bool).values
+
     fraud_prob = np.where(
         is_fraud,
         rng.uniform(0.5, 0.99, n),
         rng.uniform(0.01, 0.25, n),
     )
-    fraud_prediction = fraud_prob > 0.5
 
-    # transaction_amount: lognormal to mimic real dollar amounts (mean ~88)
-    transaction_amount = np.round(rng.lognormal(mean=3.5, sigma=1.5, size=n), 2)
-    # transaction_timestamp: uniform 0..172_800 (matches original range)
-    transaction_timestamp = np.round(rng.uniform(0, 172_800, n), 1)
+    df.insert(0, "transaction_id", np.arange(n))
+    df["fraud_prediction"] = fraud_prob > 0.5
+    df["fraud_probability"] = np.round(fraud_prob, 16)
+    df["customer_gender"] = rng.choice(GENDERS, size=n, p=GENDER_WEIGHTS)
 
-    gender = rng.choice(GENDERS, size=n, p=GENDER_WEIGHTS)
+    col_order = [
+        "transaction_id", "transaction_timestamp",
+        *FEATURE_COLUMNS,
+        "transaction_amount", "fraud_prediction", "fraud_probability",
+        "customer_gender", "is_fraud",
+    ]
+    df = df[col_order]
 
-    df = pd.DataFrame(
-        {
-            "transaction_id": np.arange(n),
-            "transaction_timestamp": transaction_timestamp,
-            **features,
-            "transaction_amount": transaction_amount,
-            "fraud_prediction": fraud_prediction,
-            "fraud_probability": np.round(fraud_prob, 16),
-            "customer_gender": gender,
-            "is_fraud": is_fraud,
-        }
-    )
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Generators
-# ---------------------------------------------------------------------------
-
-def generate_predictions(out_dir: Path) -> Path:
-    """Generate generated_creditcard_predictions_final.csv."""
-    rng = np.random.default_rng(RANDOM_STATE)
-    print(f"Generating predictions ({N_PREDICTIONS:,} rows) ...")
-    df = _generate_predictions_df(rng, N_PREDICTIONS)
-    path = out_dir / "generated_creditcard_predictions_final.csv"
+    path = out_dir / "creditcard_predictions_final.csv"
     df.to_csv(path, index=False)
     print(f"  -> {path}  ({path.stat().st_size / 1024 / 1024:.1f} MB)")
     return path
 
 
 def generate_drifted(out_dir: Path) -> Path:
-    """Generate generated_creditcard_drifted.csv by sampling from a fresh
-    predictions set and applying the same drift config used by
-    src/drift_monitoring/generate_drift_dataset.py."""
+    """Generate creditcard_drifted.csv with intentional feature drift."""
     rng = np.random.default_rng(RANDOM_STATE + 1)
     print(f"Generating drifted dataset ({N_DRIFTED:,} rows) ...")
 
-    df = _generate_predictions_df(rng, N_DRIFTED)
+    features = {col: rng.standard_normal(N_DRIFTED) for col in FEATURE_COLUMNS}
+    is_fraud = rng.random(N_DRIFTED) < FRAUD_RATE
+    fraud_prob = np.where(
+        is_fraud,
+        rng.uniform(0.5, 0.99, N_DRIFTED),
+        rng.uniform(0.01, 0.25, N_DRIFTED),
+    )
 
-    # Apply drift (mirrors DRIFT_CONFIG in generate_drift_dataset.py)
+    df = pd.DataFrame({
+        "transaction_id": np.arange(N_DRIFTED),
+        "transaction_timestamp": np.round(rng.uniform(0, 172_800, N_DRIFTED), 1),
+        **features,
+        "transaction_amount": np.round(rng.lognormal(mean=3.5, sigma=1.5, size=N_DRIFTED), 2),
+        "fraud_prediction": fraud_prob > 0.5,
+        "fraud_probability": np.round(fraud_prob, 16),
+        "customer_gender": rng.choice(GENDERS, size=N_DRIFTED, p=GENDER_WEIGHTS),
+        "is_fraud": is_fraud,
+    })
+
+    # Apply drift
     drift_rng = np.random.default_rng(123)
     n = len(df)
-
-    # transaction_amount: +40% multiplicative
-    df["transaction_amount"] *= drift_rng.uniform(1.26, 1.54, n)
-    df["transaction_amount"] = np.round(df["transaction_amount"], 2)
-
-    # transaction_timestamp: +50k additive
+    df["transaction_amount"] = np.round(df["transaction_amount"] * drift_rng.uniform(1.26, 1.54, n), 2)
     df["transaction_timestamp"] += drift_rng.uniform(45_000, 55_000, n)
-
-    # distance_from_home_km: 2x multiplicative
     df["distance_from_home_km"] *= drift_rng.uniform(1.4, 2.6, n)
-
-    # velocity_score: 1.5x multiplicative
     df["velocity_score"] *= drift_rng.uniform(1.2, 1.8, n)
+    df["num_transactions_24h"] = np.round(df["num_transactions_24h"] + drift_rng.uniform(2, 4, n))
 
-    # num_transactions_24h: +3 additive
-    df["num_transactions_24h"] += drift_rng.uniform(2, 4, n)
-    df["num_transactions_24h"] = np.round(df["num_transactions_24h"])
-
-    path = out_dir / "generated_creditcard_drifted.csv"
+    path = out_dir / "creditcard_drifted.csv"
     df.to_csv(path, index=False)
     print(f"  -> {path}  ({path.stat().st_size / 1024 / 1024:.1f} MB)")
     return path
 
 
 def generate_ground_truth(out_dir: Path) -> Path:
-    """Generate generated_creditcard_ground_truth.csv matching the schema
-    of the real ground truth file (50,000 rows, 10 windows of 5,000)."""
+    """Generate creditcard_ground_truth.csv (synthetic windowed ground truth)."""
     rng = np.random.default_rng(RANDOM_STATE + 2)
     print(f"Generating ground truth ({N_GROUND_TRUTH:,} rows) ...")
 
     num_windows = 10
     samples_per_window = N_GROUND_TRUTH // num_windows
     rows = []
-
     base_ts = datetime(2025, 11, 19, 16, 59, 39)
 
     for window_id in range(1, num_windows + 1):
         window_ts = base_ts + timedelta(hours=window_id)
-        features = _generate_features(rng, samples_per_window)
+        features = {col: rng.standard_normal(samples_per_window) for col in FEATURE_COLUMNS}
 
         is_fraud = rng.random(samples_per_window) < FRAUD_RATE
         fraud_prob = np.where(
@@ -194,38 +214,25 @@ def generate_ground_truth(out_dir: Path) -> Path:
             rng.uniform(0.5, 0.99, samples_per_window),
             rng.uniform(0.01, 0.25, samples_per_window),
         )
-        # observed_fraud: mostly matches ground_truth, with some noise
         observed = is_fraud.copy()
         flip_mask = rng.random(samples_per_window) < 0.05
         observed[flip_mask] = ~observed[flip_mask]
 
-        transaction_timestamp = np.round(
-            rng.uniform(50_000, 200_000, samples_per_window), 1
-        )
-        transaction_amount = np.round(
-            rng.lognormal(mean=3.5, sigma=1.5, size=samples_per_window), 2
-        )
-
-        window_df = pd.DataFrame(
-            {
-                "transaction_id": [
-                    f"TXN_{window_id}_{i:05d}"
-                    for i in range(samples_per_window)
-                ],
-                "prediction_timestamp": str(window_ts),
-                "window_id": window_id,
-                "transaction_timestamp": transaction_timestamp,
-                **features,
-                "transaction_amount": transaction_amount,
-                "ground_truth_fraud": is_fraud,
-                "observed_fraud": observed,
-                "fraud_probability": np.round(fraud_prob, 16),
-            }
-        )
+        window_df = pd.DataFrame({
+            "transaction_id": [f"TXN_{window_id}_{i:05d}" for i in range(samples_per_window)],
+            "prediction_timestamp": str(window_ts),
+            "window_id": window_id,
+            "transaction_timestamp": np.round(rng.uniform(50_000, 200_000, samples_per_window), 1),
+            **features,
+            "transaction_amount": np.round(rng.lognormal(mean=3.5, sigma=1.5, size=samples_per_window), 2),
+            "ground_truth_fraud": is_fraud,
+            "observed_fraud": observed,
+            "fraud_probability": np.round(fraud_prob, 16),
+        })
         rows.append(window_df)
 
     df = pd.concat(rows, ignore_index=True)
-    path = out_dir / "generated_creditcard_ground_truth.csv"
+    path = out_dir / "creditcard_ground_truth.csv"
     df.to_csv(path, index=False)
     print(f"  -> {path}  ({path.stat().st_size / 1024 / 1024:.1f} MB)")
     return path
@@ -237,7 +244,7 @@ def generate_ground_truth(out_dir: Path) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate synthetic CSV datasets for the fraud detection pipeline."
+        description="Generate CSV datasets for the fraud detection pipeline."
     )
     parser.add_argument("--predictions", action="store_true", help="Generate predictions CSV only")
     parser.add_argument("--drifted", action="store_true", help="Generate drifted CSV only")
@@ -254,9 +261,7 @@ def main():
     if generate_all or args.ground_truth:
         generate_ground_truth(out_dir)
 
-    print("\nDone. To use these in the pipeline, either:")
-    print("  1. Rename them (drop 'generated_' prefix), or")
-    print("  2. Set CSV_TRAINING_DATA / CSV_GROUND_TRUTH / CSV_DRIFTED_DATA in .env")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

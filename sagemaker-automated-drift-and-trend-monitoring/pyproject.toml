@@ -25,4 +25,5 @@ dependencies = [
     "statsmodels>=0.14.4",     # Required by Evidently for statistical tests
     "shap>=0.43.0",            # SHAP explainability for model interpretability
     "ipykernel>=6.29.0",       # Jupyter kernel for notebook execution
+    "kagglehub>=0.2.0",        # Download Kaggle datasets for training data
 ]

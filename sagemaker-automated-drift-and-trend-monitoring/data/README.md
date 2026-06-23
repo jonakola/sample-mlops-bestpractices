@@ -4,35 +4,35 @@ This directory holds the CSV datasets used by the fraud detection pipeline. The 
 
 ## Generating the Data
 
+**Prerequisites:**
 ```bash
-# Generate all three CSVs
+pip install -e .   # installs kagglehub and other dependencies via pyproject.toml
+```
+
+```bash
+# Generate all three CSVs (downloads Kaggle dataset for training data)
 python data/generate_datasets.py
 
-# Rename to drop the "generated_" prefix
-cd data
-mv generated_creditcard_predictions_final.csv creditcard_predictions_final.csv
-mv generated_creditcard_drifted.csv creditcard_drifted.csv
-mv generated_creditcard_ground_truth.csv creditcard_ground_truth.csv
+# Or generate individual files:
+python data/generate_datasets.py --predictions   # downloads from Kaggle
+python data/generate_datasets.py --drifted       # synthetic (monitoring only)
+python data/generate_datasets.py --ground-truth  # synthetic (monitoring only)
 ```
 
-You can also generate individual files:
+The training dataset (`creditcard_predictions_final.csv`) is downloaded from the real [Kaggle Credit Card Fraud Detection dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) and columns are renamed to match the project's business-friendly schema. This ensures the model can learn real fraud patterns and achieve strong ROC-AUC scores.
 
-```bash
-python data/generate_datasets.py --predictions
-python data/generate_datasets.py --drifted
-python data/generate_datasets.py --ground-truth
-```
+The drifted and ground truth files are synthetically generated — they are used for drift monitoring and testing, not for model training.
 
 ## Dataset Descriptions
 
 ### creditcard_predictions_final.csv
 
-The primary training and inference dataset.
+The primary training and inference dataset, sourced from the Kaggle credit card fraud dataset with renamed columns.
 
 - Rows: 284,807
-- Columns: 35 (30 features + transaction_id, transaction_timestamp, transaction_amount, fraud_prediction, fraud_probability, customer_gender, is_fraud)
+- Columns: 35 (28 PCA features renamed to business concepts + transaction_id, transaction_timestamp, transaction_amount, fraud_prediction, fraud_probability, customer_gender, is_fraud)
 - Fraud rate: ~0.17% (highly imbalanced, realistic for credit card fraud)
-- Features: PCA-normalised floats drawn from N(0,1), plus real-valued transaction_amount (lognormal, mean ~$88)
+- Features: PCA-normalised floats from real credit card transactions with genuine fraud patterns
 
 When to use:
 - Training the XGBoost model via SageMaker Pipelines (`notebooks/1_training_pipeline.ipynb`)
@@ -42,7 +42,7 @@ When to use:
 
 ### creditcard_drifted.csv
 
-A smaller dataset with intentional feature drift applied, used to validate that the monitoring system detects distribution shifts.
+A smaller synthetic dataset with intentional feature drift applied, used to validate that the monitoring system detects distribution shifts.
 
 - Rows: 5,000 (configurable via `drift_generation.num_samples` in `src/config/config.yaml`)
 - Columns: Same 35 as predictions_final
@@ -82,7 +82,7 @@ When to use:
 
 ## Column Reference
 
-The 30 feature columns map to fraud detection concepts:
+The 28 PCA feature columns are renamed from Kaggle's V1-V28 to business-friendly names:
 
 | Feature Group | Columns |
 |---|---|
@@ -96,4 +96,4 @@ The 30 feature columns map to fraud detection concepts:
 
 ## Reproducibility
 
-The generator uses fixed random seeds (`RANDOM_STATE = 42` for predictions/ground truth, `123` for drift application) so repeated runs produce identical output.
+The generator uses fixed random seeds (`RANDOM_STATE = 42` for synthetic columns added to Kaggle data, `RANDOM_STATE + 1` for drifted, `123` for drift application) so repeated runs produce identical output for the synthetic portions.
