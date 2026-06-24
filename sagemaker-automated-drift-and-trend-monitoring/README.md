@@ -18,22 +18,32 @@ Follow these steps to implement the 11-step architecture shown above. Each step 
 
 ### Setup: Deploy with CloudFormation
 
-The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, SQS inference logging queue, Lambda inference logger with event source mapping, and IAM execution role with all required permissions (S3, Athena, Glue, Lambda, SQS, EventBridge, KMS, Lake Formation, CloudWatch Logs, CloudWatch Metrics/Alarms/Dashboards, MLflow). On first space launch, the lifecycle script auto-clones this repo, downloads the Kaggle training dataset, generates monitoring test datasets, uploads data to S3, creates Athena tables, and writes a populated `.env` file (including SQS queue URL).
+The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, SQS inference logging queue, Lambda inference logger, and IAM execution role with all required permissions. On first space launch, the lifecycle script clones this repo, downloads the Kaggle training dataset, uploads data to S3, creates Athena tables, and writes a populated `.env` file.
 
-**Deploy:**
+**Deploy (create-or-update):**
 
 ```bash
-aws cloudformation create-stack \
-  --stack-name fraud-detection-monitoring \
-  --template-body file://cloudformation/sagemaker-mlflow-setup.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region <your-region>
-
-# Wait for stack creation (~10-15 minutes)
-aws cloudformation wait stack-create-complete \
-  --stack-name fraud-detection-monitoring \
-  --region <your-region>
+./cloudformation/deploy-stack.sh                       # default: fraud-detection-monitoring in us-west-2
+./cloudformation/deploy-stack.sh my-stack              # override stack name
+AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh  # override region
 ```
+
+Idempotent — re-runs create if missing, update if present, no-op if no changes. First create takes ~10–15 minutes.
+
+**Pull latest repo code into a running Space (no stack change needed):**
+
+The lifecycle script runs `git pull --ff-only` on every Space start, so to pick up new commits:
+
+SageMaker Studio → **Spaces** → **Stop Space**, then **Run Space**. Uncommitted local edits are preserved.
+
+**Recover from a failed create (reuses retained VPC/IAM/S3 resources):**
+
+```bash
+python3 scripts/redeploy_with_existing.py --stack-name fraud-detection-monitoring --region <region> --dry-run   # preview
+python3 scripts/redeploy_with_existing.py --stack-name fraud-detection-monitoring --region <region>             # execute
+```
+
+Requires `boto3` (`pip install boto3` or `uv add boto3`).
 
 **After deploy:**
 
