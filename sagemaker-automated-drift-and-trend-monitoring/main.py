@@ -251,7 +251,7 @@ def full_command(args):
     print("Please use the SageMaker Pipeline notebooks for end-to-end workflows.")
     print("\n📓 To run the full pipeline:")
     print("  1. Training: notebooks/1_training_pipeline.ipynb")
-    print("  2. Monitoring: notebooks/2a_inference_monitoring.ipynb")
+    print("  2. Monitoring: notebooks/2_inference_monitoring.ipynb")
     print("  3. Dashboard: notebooks/3_governance_dashboard.ipynb")
     print("\nThese notebooks provide better visibility and control.")
     print("=" * 80)

@@ -7,6 +7,16 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
+# Project
+# ---------------------------------------------------------------------------
+# Used to derive the account-agnostic data bucket when DATA_S3_BUCKET / s3.bucket
+# are not set: ${project.name}-data-${AWS::AccountId}. This must match the
+# ProjectName parameter used by the CloudFormation stack so the same bucket
+# resolves in any account/deployment without relying on a local .env file.
+project:
+  name: fraud-detection-monitoring
+
+# ---------------------------------------------------------------------------
 # AWS
 # ---------------------------------------------------------------------------
 aws:

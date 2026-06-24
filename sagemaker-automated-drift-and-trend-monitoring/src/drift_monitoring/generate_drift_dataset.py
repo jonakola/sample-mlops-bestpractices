@@ -27,13 +27,33 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.config.config import (
     CSV_TRAINING_DATA,
     CSV_DRIFTED_DATA,
+    S3_CSV_TRAINING_DATA,
+    S3_CSV_DRIFTED_DATA,
     DRIFT_GEN_DEFAULT_CONFIG,
     DRIFT_GEN_NUM_SAMPLES,
     DRIFT_GEN_RANDOM_STATE,
 )
 
+
+def _resolve_source(local_path, s3_path, label: str) -> str:
+    """Return the local file if present, else the S3 fallback.
+
+    In a local checkout the CSV lives under data/. In CFN deployments the file
+    is only uploaded to S3 (under its original name), so fall back to the
+    account-agnostic S3 URI when the local file is absent.
+    """
+    if local_path and Path(local_path).exists():
+        return str(local_path)
+    if s3_path:
+        print(f"  Local {label} not found, using S3 source: {s3_path}")
+        return s3_path
+    return str(local_path)
+
+
 # Configuration (now read from config.yaml)
-ORIGINAL_DATA_PATH = CSV_TRAINING_DATA
+ORIGINAL_DATA_PATH = _resolve_source(
+    CSV_TRAINING_DATA, S3_CSV_TRAINING_DATA, "training data"
+)
 DRIFTED_DATA_PATH = CSV_DRIFTED_DATA
 NUM_SAMPLES = DRIFT_GEN_NUM_SAMPLES
 RANDOM_STATE = DRIFT_GEN_RANDOM_STATE

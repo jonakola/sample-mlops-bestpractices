@@ -393,9 +393,54 @@ class IcebergManager:
             logger.error(f"Error expiring snapshots for {table_name}: {e}")
             return False
 
+    def _get_row_count(self, table_name: str) -> int:
+        """
+        Return the row count for a table via Athena.
+
+        Runs COUNT(*) using execute_athena_query and reads the scalar
+        result back with get_query_results. Replaces the previous
+        awswrangler-based path so the module has no awswrangler
+        dependency.
+
+        Args:
+            table_name: Name of the table
+
+        Returns:
+            Row count as an int (0 if the result set is empty).
+        """
+        count_query = (
+            f"SELECT COUNT(*) as row_count FROM {self.database}.{table_name}"
+        )
+
+        query_execution_id = execute_athena_query(
+            sql=count_query,
+            database=self.database,
+            workgroup=self.workgroup,
+            s3_output=self.s3_output,
+            boto3_session=self.boto3_session,
+            wait=True,
+        )
+
+        athena = self.boto3_session.client('athena')
+        result = athena.get_query_results(QueryExecutionId=query_execution_id)
+
+        # Row 0 is the header (column names); row 1 holds the value.
+        rows = result['ResultSet']['Rows']
+        if len(rows) < 2:
+            return 0
+
+        data = rows[1]['Data']
+        if not data or 'VarCharValue' not in data[0]:
+            return 0
+
+        return int(data[0]['VarCharValue'])
+
     def get_table_stats(self, table_name: str) -> Dict[str, Any]:
         """
         Get statistics for Iceberg table.
+
+        Uses Athena for the row count and the Glue catalog for table
+        metadata (location, table type). No awswrangler dependency.
 
         Args:
             table_name: Name of table
@@ -406,30 +451,24 @@ class IcebergManager:
         try:
             logger.info(f"Getting stats for: {self.database}.{table_name}")
 
-            # Get row count
-            count_query = f"SELECT COUNT(*) as row_count FROM {self.database}.{table_name}"
-            count_df = wr.athena.read_sql_query(
-                sql=count_query,
-                database=self.database,
-                workgroup=self.workgroup,
-                s3_output=self.s3_output,
-                boto3_session=self.boto3_session,
-            )
-            row_count = int(count_df['row_count'].iloc[0]) if not count_df.empty else 0
+            # Row count via Athena.
+            row_count = self._get_row_count(table_name)
 
-            # Get table metadata
-            table_metadata = wr.catalog.table(
-                database=self.database,
-                table=table_name,
-                boto3_session=self.boto3_session,
-            )
+            # Table metadata via the Glue catalog (same client used by
+            # table_exists / database_exists).
+            glue = self.boto3_session.client('glue')
+            table_metadata = glue.get_table(
+                DatabaseName=self.database,
+                Name=table_name,
+            ).get('Table', {})
+            storage = table_metadata.get('StorageDescriptor', {})
 
             stats = {
                 'table_name': table_name,
                 'database': self.database,
                 'row_count': row_count,
-                'location': table_metadata['Location'].iloc[0] if 'Location' in table_metadata.columns and not table_metadata.empty else 'unknown',
-                'table_type': table_metadata['TableType'].iloc[0] if 'TableType' in table_metadata.columns and not table_metadata.empty else 'unknown',
+                'location': storage.get('Location', 'unknown'),
+                'table_type': table_metadata.get('TableType', 'unknown'),
                 'is_iceberg': table_name in get_iceberg_tables(),
                 'is_partitioned': table_name in get_partitioned_tables(),
             }

@@ -37,8 +37,6 @@ logging.basicConfig(
 # Mapping of local CSV filenames to their S3 sub-paths under the prefix
 CSV_S3_MAPPING = {
     "creditcard_predictions_final.csv": "data/creditcard_predictions_final.csv",
-    "creditcard_ground_truth.csv": "data/creditcard_ground_truth.csv",
-    "creditcard_drifted.csv": "data/creditcard_drifted.csv",
 }
 
 
