@@ -85,7 +85,7 @@ Top 5 Drifting Features:
 ## 🚀 Implementation Steps
 
 ### Step 1: Add Dataset (5 minutes)
-1. Open `3_governance_dashboard.ipynb`
+1. Open `4_governance_dashboard.ipynb`
 2. Insert new cell after Cell 17 (feature drift dataset)
 3. Paste code from `add_feature_level_visuals.py` → CELL 1
 4. Run cell → creates `FEATURE_LEVEL_DATASET_ARN`

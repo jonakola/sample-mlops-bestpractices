@@ -266,7 +266,7 @@ This mathematical guarantee ensures explanations are **consistent** and **additi
 
 To regenerate these SHAP plots with updated model or data:
 
-1. Open `notebooks/6_shap_explainability.ipynb`
+1. Open `notebooks/7_shap_explainability.ipynb`
 2. Update `MODEL_RUN_ID` to desired model version (or use latest)
 3. Run all cells
 4. New plots will be saved to this directory
@@ -290,4 +290,4 @@ To regenerate these SHAP plots with updated model or data:
 **Generated**: 2026-05-10  
 **Model Version**: 24  
 **Experiment**: credit-card-fraud-detection-training  
-**Analysis Notebook**: `notebooks/6_shap_explainability.ipynb`
+**Analysis Notebook**: `notebooks/7_shap_explainability.ipynb`

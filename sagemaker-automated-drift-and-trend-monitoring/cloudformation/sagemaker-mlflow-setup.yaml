@@ -1055,7 +1055,7 @@ Resources:
                   - 'lakeformation:DescribeResource'
                   - 'lakeformation:RegisterResource'
                 Resource: '*'
-        # QuickSight: the governance notebook (3_governance_dashboard.ipynb)
+        # QuickSight: the governance notebook (4_governance_dashboard.ipynb)
         # builds the QuickSight datasource, datasets, analysis, and dashboard
         # programmatically (create/describe/update + permissions grants + embed
         # URL). QuickSight resource ARNs are account/region-specific and the

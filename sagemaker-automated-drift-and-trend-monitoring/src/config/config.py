@@ -297,7 +297,7 @@ RANDOM_STATE: int = int(_get("training", "random_state", "RANDOM_STATE", "42"))
 
 # Target column name in the Kaggle dataset post-rename. Not in config.yaml
 # because it's a fixed property of data/download_kaggle_dataset.py — exposed
-# here so notebooks/2_inference_monitoring.ipynb can reference it.
+# here so notebooks/3_inference_monitoring.ipynb can reference it.
 TARGET_COLUMN: str = os.environ.get("TARGET_COLUMN", "is_fraud")
 
 # The 30 feature columns (PCA components V1-V28 + transaction_amount-style
@@ -400,7 +400,7 @@ DRIFT_GEN_NUM_SAMPLES_PER_RUN: int = int(_drift_gen_cfg.get("num_samples_per_run
 DRIFT_GEN_RANDOM_STATE: int = int(_drift_gen_cfg.get("random_state", "123"))
 
 # ===================================================================
-# QuickSight (used by notebooks/3_governance_dashboard.ipynb)
+# QuickSight (used by notebooks/4_governance_dashboard.ipynb)
 # ===================================================================
 # These IDs and display names are constants of the deployed dashboard, not
 # tunables — they live here as plain literals (no YAML mirror).

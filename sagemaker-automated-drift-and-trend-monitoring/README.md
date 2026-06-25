@@ -42,36 +42,43 @@ Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/
 
 | # | Notebook | Purpose | Time |
 |---|----------|---------|------|
-| 1 | `1_training_pipeline.ipynb` | Builds and executes the SageMaker training pipeline: preprocessing → XGBoost training → evaluation (quality gate at ROC-AUC ≥ 0.70) → MLflow registration → endpoint deployment with custom Athena-logging handler. | ~25 min |
-| 2 | `2_inference_monitoring.ipynb` | Tests the deployed endpoint, simulates ground truth, applies ground truth via Athena MERGE, runs Evidently data + model drift detection, logs interactive reports to MLflow, and sets up the daily-scheduled drift Lambda. | ~30 min |
-| 3 | `3_governance_dashboard.ipynb` | Creates a QuickSight governance dashboard (datasource, datasets, analysis, published dashboard) with auto-refresh via EventBridge + Lambda. Requires QuickSight Enterprise subscription. | ~15 min |
+| 1 | `1_training_pipeline.ipynb` | Builds and executes the SageMaker training pipeline: preprocessing → XGBoost training → evaluation (quality gate at ROC-AUC ≥ 0.70) → MLflow registration. Does NOT deploy endpoint — see notebook 2 for deployment. | ~20 min |
+| 2 | `2_deployment.ipynb` | Deploys the trained model to a SageMaker serverless endpoint with custom Athena-logging inference handler. Select model from registry, configure resources, test deployment. | ~10 min |
+| 3 | `3_inference_monitoring.ipynb` | Tests the deployed endpoint, simulates ground truth, applies ground truth via Athena MERGE, runs Evidently data + model drift detection, logs interactive reports to MLflow, and sets up the daily-scheduled drift Lambda. | ~30 min |
+| 4 | `4_governance_dashboard.ipynb` | Creates a QuickSight governance dashboard (datasource, datasets, analysis, published dashboard) with auto-refresh via EventBridge + Lambda. Requires QuickSight Enterprise subscription. | ~15 min |
 
 **Optional notebooks** (run as needed):
 
 | # | Notebook | Purpose |
 |---|----------|---------|
-| 4 | `4_optional_version_validation.ipynb` | Verifies MLflow model version matches the deployed endpoint and Athena inference logs (traceability check). |
-| 5 | `5_optional_cleanup.ipynb` | Deletes all AWS resources created outside CloudFormation (Lambda functions, endpoints, SNS topics, dashboards, CloudWatch alarms). |
-| 6 | `6_shap_explainability.ipynb` | Generates SHAP global and per-prediction feature importance plots for the trained model. |
+| 5 | `5_optional_version_validation.ipynb` | Verifies MLflow model version matches the deployed endpoint and Athena inference logs (traceability check). |
+| 6 | `6_optional_cleanup.ipynb` | Deletes all AWS resources created outside CloudFormation (Lambda functions, endpoints, SNS topics, dashboards, CloudWatch alarms). |
+| 7 | `7_shap_explainability.ipynb` | Generates SHAP global and per-prediction feature importance plots for the trained model. |
 
 > **Note:** Notebook 1 cell 2 runs `! uv pip install -e ../`. If you see `No virtual environment found`, the error message tells you how to resolve it (run `uv venv` or add `--system`).
 
 ## What This Solution Does
 
-### Pipeline (Notebook 1)
+### Training Pipeline (Notebook 1)
 1. **Preprocess** — Reads from Athena, validates, encodes categoricals, splits train/test (80/20)
 2. **Train** — XGBoost with automatic class imbalance handling (`scale_pos_weight`)
 3. **Evaluate** — Computes ROC-AUC, PR-AUC, precision, recall, F1, confusion matrix
 4. **Quality Gate** — Registers the model only if ROC-AUC ≥ 0.70
-5. **Deploy** — Serverless endpoint with a custom inference handler that logs every prediction to SQS → Lambda → Athena (zero added latency)
+5. **MLflow Registration** — Logs metrics, parameters, and model artifact to MLflow
 
-### Monitoring (Notebook 2)
+### Deployment (Notebook 2)
+- **Model Selection** — Choose approved model from SageMaker Model Registry
+- **Endpoint Creation** — Serverless endpoint with custom inference handler
+- **Athena Logging** — Every prediction logged to SQS → Lambda → Athena (zero added latency)
+- **Testing** — Verify endpoint responds correctly to test predictions
+
+### Monitoring (Notebook 3)
 - **Inference logging** — Every prediction → SQS → Lambda batches (10 msgs or 30s) → `inference_responses` Iceberg table
 - **Ground truth integration** — Simulated (dev) or fed from fraud investigation systems (prod) → `ground_truth_updates` table → MERGE into `inference_responses`
 - **Drift detection** — Evidently `DataDriftPreset` (KS test for numerics, chi-square for categoricals, PSI per feature) + `ClassificationPreset` (ROC, PR, confusion matrix). Configurable via `src/config/config.yaml`.
 - **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Logs metrics + interactive HTML reports to MLflow, writes summary to `monitoring_responses` table, sends SNS alert if drift exceeds thresholds.
 
-### Governance (Notebook 3)
+### Governance (Notebook 4)
 - QuickSight dashboard with prediction volume, fraud probability distribution, accuracy breakdown, risk tiers, latency trend, drift trends, ROC-AUC over time
 - Auto-refreshes daily at 3 AM UTC via EventBridge + Lambda after the 2 AM drift monitoring run
 
@@ -85,11 +92,12 @@ sagemaker-automated-drift-and-trend-monitoring/
 │   └── README.md                      # CloudFormation reference
 ├── notebooks/                         # Run these in order — see Step 3 above
 │   ├── 1_training_pipeline.ipynb
-│   ├── 2_inference_monitoring.ipynb
-│   ├── 3_governance_dashboard.ipynb
-│   ├── 4_optional_version_validation.ipynb
-│   ├── 5_optional_cleanup.ipynb
-│   └── 6_shap_explainability.ipynb
+│   ├── 2_deployment.ipynb
+│   ├── 3_inference_monitoring.ipynb
+│   ├── 4_governance_dashboard.ipynb
+│   ├── 5_optional_version_validation.ipynb
+│   ├── 6_optional_cleanup.ipynb
+│   └── 7_shap_explainability.ipynb
 ├── src/
 │   ├── train_pipeline/                # Pipeline definition + preprocessing/training/evaluation steps
 │   ├── drift_monitoring/              # Drift detection Lambdas, ground truth utilities, Evidently wrappers
