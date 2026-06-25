@@ -1178,10 +1178,10 @@ Resources:
         Fn::Base64:
           Fn::Sub: |
             #!/bin/bash
-            # Minimal Space bootstrap: pull the repo and write .env.
-            # The training notebook (1_training_pipeline.ipynb) owns Athena
-            # database/table creation, Kaggle data download/upload, and the
-            # training_data seed — see data/download_kaggle_dataset.py.
+            # CloudFormation owns infrastructure setup: clone repo, write .env,
+            # create the Athena database and all 6 Iceberg tables (empty).
+            # The training notebook (1_training_pipeline.ipynb) populates the
+            # training_data table — see data/download_kaggle_dataset.py.
             set -x
             sleep 10
             cd /home/sagemaker-user || exit 1
@@ -1206,7 +1206,184 @@ Resources:
             chown sagemaker-user:sagemaker-user .env
             chmod 600 .env
 
-            echo "Setup complete. Open notebooks/1_training_pipeline.ipynb to load data into Athena."
+            # Create Athena database + all 6 Iceberg tables (empty).
+            # `IF NOT EXISTS` makes this safe to re-run on every Space launch.
+            python3 << 'CREATEEOF'
+            import boto3, time
+
+            DATABASE = "fraud_detection"
+            BUCKET = "${ProjectName}-data-${AWS::AccountId}"
+            PREFIX = "fraud-detection"
+            OUTPUT_S3 = f"s3://{BUCKET}/athena-results/"
+
+            athena = boto3.client("athena")
+
+            def run_query(sql):
+                qid = athena.start_query_execution(
+                    QueryString=sql,
+                    QueryExecutionContext={"Database": DATABASE},
+                    ResultConfiguration={"OutputLocation": OUTPUT_S3},
+                )["QueryExecutionId"]
+                for _ in range(90):
+                    st = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+                    if st["State"] == "SUCCEEDED":
+                        return True
+                    if st["State"] in ("FAILED", "CANCELLED"):
+                        print(f"  Query {st['State']}: {st.get('StateChangeReason', '')}")
+                        return False
+                    time.sleep(2)
+                print("  Query timed out")
+                return False
+
+            run_query(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
+
+            TF = ("transaction_timestamp transaction_hour transaction_day_of_week transaction_amount "
+                  "transaction_type_code customer_age customer_gender customer_tenure_months "
+                  "account_age_days distance_from_home_km distance_from_last_transaction_km "
+                  "time_since_last_transaction_min online_transaction international_transaction "
+                  "high_risk_country merchant_category_code merchant_reputation_score chip_transaction "
+                  "pin_used card_present cvv_match address_verification_match num_transactions_24h "
+                  "num_transactions_7days avg_transaction_amount_30days max_transaction_amount_30days "
+                  "velocity_score recurring_transaction previous_fraud_incidents credit_limit "
+                  "available_credit_ratio").split()
+            FEAT = ", ".join(c + (" STRING" if c == "customer_gender" else " DOUBLE") for c in TF)
+
+            # Table inventory (4 active + 2 reserved for future work):
+            #
+            #   ACTIVE
+            #   - training_data        Model training features + label.
+            #                          Populated by notebooks/1_training_pipeline.ipynb
+            #                          (data/download_kaggle_dataset.py → S3 → Athena seed).
+            #                          Read by the preprocessing pipeline step.
+            #   - inference_responses  Every endpoint prediction logged async via
+            #                          SQS → Lambda. The `ground_truth` column starts
+            #                          NULL and is filled by the MERGE from
+            #                          ground_truth_updates. Read by monitoring +
+            #                          governance dashboards.
+            #   - ground_truth_updates Lightweight patches (inference_id + actual_fraud
+            #                          + confirmation metadata) produced by the fraud
+            #                          investigation system (simulated in dev by
+            #                          simulate_ground_truth_from_athena.py). Consumed
+            #                          by update_ground_truth.py MERGE.
+            #   - monitoring_responses Output of each drift-monitoring run (PSI, KS,
+            #                          ROC-AUC, drift flags). Written by the drift
+            #                          Lambda via SQS; read by the QuickSight
+            #                          governance dashboard.
+            #
+            #   RESERVED (created so the schema is ready when needed; no SQL today)
+            #   - ground_truth         Full-feature labeled rows for a future batch
+            #                          retraining workflow. Distinct from
+            #                          ground_truth_updates: that table only patches
+            #                          one column in inference_responses; this one
+            #                          would hold complete feature vectors needed to
+            #                          retrain the model.
+            #   - drifted_data         Storage slot for drift-test datasets generated
+            #                          by drift_monitoring/generate_drift_dataset.py.
+            #                          The generator currently writes local CSVs only;
+            #                          Athena-loaded drift testing would consume from
+            #                          here.
+            TABLES = {
+                "training_data": f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.training_data (
+                transaction_id STRING,
+                {FEAT},
+                fraud_prediction BOOLEAN, fraud_probability DOUBLE, is_fraud BOOLEAN,
+                data_version STRING, created_at TIMESTAMP, updated_at TIMESTAMP
+            )
+            LOCATION 's3://{BUCKET}/{PREFIX}/training_data/'
+            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+            """,
+
+                # RESERVED: future batch retraining (full feature rows + confirmed
+                # labels). Not currently queried — see comment above.
+                "ground_truth": f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.ground_truth (
+                transaction_id STRING, prediction_timestamp TIMESTAMP, window_id INT,
+                {FEAT},
+                ground_truth_fraud BOOLEAN, observed_fraud BOOLEAN, fraud_probability DOUBLE,
+                data_source STRING, ingestion_timestamp TIMESTAMP, batch_id STRING
+            )
+            PARTITIONED BY (day(prediction_timestamp))
+            LOCATION 's3://{BUCKET}/{PREFIX}/ground_truth/'
+            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+            """,
+
+                "inference_responses": f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.inference_responses (
+                inference_id STRING, request_timestamp TIMESTAMP, endpoint_name STRING,
+                model_version STRING, mlflow_run_id STRING,
+                input_features STRING,
+                prediction INT, probability_fraud DOUBLE, probability_non_fraud DOUBLE, confidence_score DOUBLE,
+                ground_truth INT, ground_truth_timestamp TIMESTAMP, ground_truth_source STRING, days_to_ground_truth DOUBLE,
+                inference_latency_ms DOUBLE, model_load_time_ms DOUBLE, preprocessing_time_ms DOUBLE,
+                transaction_id STRING, transaction_amount DOUBLE, customer_id STRING,
+                is_high_confidence BOOLEAN, is_low_confidence BOOLEAN, prediction_bucket STRING,
+                request_id STRING, response_time TIMESTAMP, error_message STRING, inference_mode STRING
+            )
+            PARTITIONED BY (day(request_timestamp), endpoint_name)
+            LOCATION 's3://{BUCKET}/{PREFIX}/inference_responses/'
+            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+            """,
+
+                # RESERVED: storage for drift-test datasets generated by
+                # drift_monitoring/generate_drift_dataset.py. Generator writes
+                # local CSVs only today — see comment above.
+                "drifted_data": f"""
+            CREATE EXTERNAL TABLE IF NOT EXISTS {DATABASE}.drifted_data (
+                transaction_id STRING,
+                {FEAT},
+                is_fraud BOOLEAN
+            )
+            STORED AS PARQUET
+            LOCATION 's3://{BUCKET}/{PREFIX}/drifted_data/'
+            TBLPROPERTIES ('parquet.compression'='SNAPPY')
+            """,
+
+                "ground_truth_updates": f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.ground_truth_updates (
+                transaction_id STRING, inference_id STRING,
+                actual_fraud BOOLEAN, confirmation_timestamp TIMESTAMP, confirmation_source STRING,
+                transaction_timestamp TIMESTAMP, prediction_timestamp TIMESTAMP,
+                days_since_transaction DOUBLE, days_since_prediction DOUBLE,
+                investigation_notes STRING, investigation_priority STRING,
+                false_positive BOOLEAN, false_negative BOOLEAN,
+                window_id INT,
+                batch_id STRING, created_at TIMESTAMP, updated_at TIMESTAMP
+            )
+            PARTITIONED BY (day(confirmation_timestamp))
+            LOCATION 's3://{BUCKET}/{PREFIX}/ground_truth_updates/'
+            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+            """,
+
+                "monitoring_responses": f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.monitoring_responses (
+                monitoring_run_id STRING, monitoring_timestamp TIMESTAMP,
+                endpoint_name STRING, model_version STRING,
+                data_drift_detected BOOLEAN, drifted_columns_count INT, drifted_columns_share DOUBLE,
+                features_analyzed INT, data_sample_size INT, model_drift_detected BOOLEAN,
+                baseline_roc_auc DOUBLE, current_roc_auc DOUBLE,
+                roc_auc_degradation DOUBLE, roc_auc_degradation_pct DOUBLE,
+                accuracy DOUBLE, precision DOUBLE, recall DOUBLE, f1_score DOUBLE,
+                model_sample_size INT, per_feature_drift_scores STRING,
+                evidently_report_s3_path STRING, mlflow_run_id STRING,
+                alert_sent BOOLEAN, detection_engine STRING, created_at TIMESTAMP
+            )
+            PARTITIONED BY (day(monitoring_timestamp))
+            LOCATION 's3://{BUCKET}/{PREFIX}/monitoring_responses/'
+            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+            """,
+            }
+
+            success_count = 0
+            for name, ddl in TABLES.items():
+                if run_query(ddl):
+                    success_count += 1
+            print(f"Created {success_count}/{len(TABLES)} Athena tables (empty).")
+            if success_count < len(TABLES):
+                raise SystemExit(1)
+            CREATEEOF
+
+            echo "Setup complete. Open notebooks/1_training_pipeline.ipynb to load Kaggle data into training_data."
             exit 0
       Tags:
         - Key: Name
