@@ -100,7 +100,8 @@ from src.config.config import (
     ATHENA_DATABASE, ATHENA_OUTPUT_S3, SERVERLESS_MEMORY_SIZE,
     SERVERLESS_MAX_CONCURRENCY, INFERENCE_LOG_BATCH_SIZE,
     INFERENCE_LOG_FLUSH_INTERVAL, HIGH_CONFIDENCE_THRESHOLD,
-    LOW_CONFIDENCE_LOWER, LOW_CONFIDENCE_UPPER, AWS_DEFAULT_REGION, SQS_QUEUE_URL
+    LOW_CONFIDENCE_LOWER, LOW_CONFIDENCE_UPPER, AWS_DEFAULT_REGION, SQS_QUEUE_URL,
+    XGBOOST_PARAMS,
 )
 
 # Setup logging
@@ -223,17 +224,30 @@ class FraudDetectionPipeline:
                 name="TrainingInstanceType",
                 default_value=self.config['training_instance_type']
             ),
+            # XGBoost hyperparameters — single source of truth is
+            # src/config/config.yaml → training.xgboost_params (loaded into
+            # XGBOOST_PARAMS). To tune, edit YAML; defaults below pick up the
+            # change automatically. Values are also exposed as pipeline
+            # parameters so they can still be overridden per-execution.
             'max_depth': ParameterInteger(
                 name="MaxDepth",
-                default_value=8  # Increased from 6 for better feature interactions
+                default_value=int(XGBOOST_PARAMS["max_depth"])
             ),
             'learning_rate': ParameterFloat(
                 name="LearningRate",
-                default_value=0.05  # Lower learning rate for better generalization
+                default_value=float(XGBOOST_PARAMS["learning_rate"])
             ),
             'num_boost_round': ParameterInteger(
                 name="NumBoostRound",
-                default_value=200  # Increased from 100 for better convergence
+                default_value=int(XGBOOST_PARAMS["num_boost_round"])
+            ),
+            'min_child_weight': ParameterInteger(
+                name="MinChildWeight",
+                default_value=int(XGBOOST_PARAMS["min_child_weight"])
+            ),
+            'early_stopping_rounds': ParameterInteger(
+                name="EarlyStoppingRounds",
+                default_value=int(XGBOOST_PARAMS["early_stopping_rounds"])
             ),
 
             # Evaluation parameters
@@ -439,6 +453,8 @@ class FraudDetectionPipeline:
                 'max-depth': Join(on="", values=[params['max_depth']]),
                 'learning-rate': Join(on="", values=[params['learning_rate']]),
                 'num-boost-round': Join(on="", values=[params['num_boost_round']]),
+                'min-child-weight': Join(on="", values=[params['min_child_weight']]),
+                'early-stopping-rounds': Join(on="", values=[params['early_stopping_rounds']]),
                 'target-column': 'is_fraud',
             },
             environment={
