@@ -20,7 +20,7 @@ The notebook creates everything programmatically — no manual QuickSight UI ste
 
 ```bash
 # Open in Jupyter
-notebooks/3_governance_dashboard.ipynb
+notebooks/4_governance_dashboard.ipynb
 ```
 
 Run all cells sequentially. The notebook will:
@@ -106,4 +106,4 @@ SELECT COUNT(*) FROM fraud_detection.inference_responses
 
 - `setup_quicksight_governance.py` — CLI script for data source/dataset creation
 - `README.md` — This file
-- `../../notebooks/3_governance_dashboard.ipynb` — Full automated setup notebook
+- `../../notebooks/4_governance_dashboard.ipynb` — Full automated setup notebook
