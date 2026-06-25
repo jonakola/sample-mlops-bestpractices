@@ -142,17 +142,27 @@ def lambda_handler(event, context):
     return {'statusCode': 200, 'processed': len(event['Records'])}
 
 def write_to_athena(data):
-    """Write monitoring result to Athena Iceberg table."""
-    # Build INSERT query
+    """Write monitoring result to Athena Iceberg table.
+
+    Column list MUST match the CFN `monitoring_responses` DDL exactly —
+    INSERT VALUES with no column list is positional, so adding or
+    reordering columns in CFN requires the same change here.
+    """
     columns = [
-        'timestamp', 'run_id', 'detection_engine',
-        'data_drift_detected', 'data_drift_score',
-        'drifted_columns_count', 'drifted_columns_share',
-        'model_drift_detected', 'baseline_roc_auc', 'current_roc_auc',
-        'degradation', 'degradation_pct',
-        'accuracy', 'precision_score', 'recall', 'f1_score',
-        'sample_size', 'alert_sent', 'details'
+        'monitoring_run_id', 'monitoring_timestamp',
+        'endpoint_name', 'model_version', 'model_package_arn',
+        'evaluation_snapshot_id',
+        'data_drift_detected', 'drifted_columns_count', 'drifted_columns_share',
+        'features_analyzed', 'data_sample_size', 'model_drift_detected',
+        'baseline_roc_auc', 'current_roc_auc',
+        'roc_auc_degradation', 'roc_auc_degradation_pct',
+        'accuracy', 'precision', 'recall', 'f1_score',
+        'model_sample_size', 'per_feature_drift_scores',
+        'evidently_report_s3_path', 'mlflow_run_id',
+        'alert_sent', 'detection_engine', 'created_at',
     ]
+
+    timestamp_cols = {'monitoring_timestamp', 'created_at'}
 
     values = []
     for col in columns:
@@ -163,14 +173,19 @@ def write_to_athena(data):
             values.append('TRUE' if val else 'FALSE')
         elif isinstance(val, (int, float)):
             values.append(str(val))
+        elif col in timestamp_cols:
+            # Iceberg TIMESTAMP columns need a TIMESTAMP literal, not a quoted string.
+            val_str = str(val).replace("'", "''")
+            values.append(f"TIMESTAMP '{val_str}'")
         else:
-            # Escape single quotes in strings
             val_str = str(val).replace("'", "''")
             values.append(f"'{val_str}'")
 
+    col_list = ', '.join(columns)
+    val_list = ', '.join(values)
     query = f"""
-    INSERT INTO {ATHENA_DATABASE}.{ATHENA_TABLE}
-    VALUES ({', '.join(values)})
+    INSERT INTO {ATHENA_DATABASE}.{ATHENA_TABLE} ({col_list})
+    VALUES ({val_list})
     """
 
     # Execute query

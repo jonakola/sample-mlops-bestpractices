@@ -43,10 +43,13 @@ athena = boto3.client('athena')
 s3 = boto3.client('s3')
 sns = boto3.client('sns')
 sqs = boto3.client('sqs')
+sagemaker_client = boto3.client('sagemaker')
 
 # Configuration from environment variables
 ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'fraud_detection')
 ATHENA_OUTPUT_S3 = os.getenv('ATHENA_OUTPUT_S3', 's3://fraud-detection-data-lake/athena-query-results/')
+ATHENA_EVALUATION_TABLE = os.getenv('ATHENA_EVALUATION_TABLE', 'evaluation_data')
+MODEL_PACKAGE_GROUP = os.getenv('MODEL_PACKAGE_GROUP', 'xgboost-fraud-detector')
 SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN')
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
 MONITORING_SQS_QUEUE_URL = os.getenv('MONITORING_SQS_QUEUE_URL', '')
@@ -111,6 +114,130 @@ def execute_athena_query(sql, wait=True):
     lines = obj['Body'].read().decode('utf-8').splitlines()
     reader = csv.DictReader(lines)
     return list(reader)
+
+
+# =========================================================================
+# Baseline lookup — resolves the ModelPackage actually serving the
+# endpoint, then loads its frozen baseline.json. The chain is
+#
+#     endpoint → endpoint config → variant.ModelName → describe_model
+#         → Containers[].ModelPackageName → describe_model_package
+#         → ModelStatistics.S3Uri → baseline.json
+#
+# This answers "what's running NOW", not "what we built last." The two
+# diverge during canaries, rollbacks, or pending approvals — answering
+# the wrong question is the #1 cause of false drift alerts.
+# =========================================================================
+
+ENDPOINT_NAME = os.getenv('ENDPOINT_NAME', '')
+_BASELINE_CACHE = {}
+
+
+def _resolve_model_package_arn_from_endpoint(endpoint_name: str) -> str | None:
+    """Walk the SageMaker objects to find the ModelPackage backing an endpoint.
+
+    Returns the ARN, or None if any link in the chain is missing (e.g., the
+    endpoint serves a Model that was built directly from artifacts rather
+    than from a registered package).
+    """
+    try:
+        ep = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
+        cfg = sagemaker_client.describe_endpoint_config(
+            EndpointConfigName=ep['EndpointConfigName']
+        )
+        variants = cfg.get('ProductionVariants', [])
+        if not variants:
+            print(f"⚠️ Endpoint {endpoint_name} has no ProductionVariants")
+            return None
+        model_name = variants[0]['ModelName']
+        model = sagemaker_client.describe_model(ModelName=model_name)
+        for container in model.get('Containers', []) or [model.get('PrimaryContainer', {})]:
+            arn = container.get('ModelPackageName')
+            if arn:
+                return arn
+        print(f"⚠️ Model {model_name} was not built from a registered ModelPackage")
+        return None
+    except Exception as e:
+        print(f"⚠️ Could not resolve ModelPackage from endpoint {endpoint_name}: {e}")
+        return None
+
+
+def _latest_approved_model_package_arn() -> str | None:
+    """Fallback for first-ever monitor runs (no endpoint yet)."""
+    try:
+        resp = sagemaker_client.list_model_packages(
+            ModelPackageGroupName=MODEL_PACKAGE_GROUP,
+            ModelApprovalStatus='Approved',
+            SortBy='CreationTime',
+            SortOrder='Descending',
+            MaxResults=1,
+        )
+        packages = resp.get('ModelPackageSummaryList', [])
+        return packages[0]['ModelPackageArn'] if packages else None
+    except Exception as e:
+        print(f"⚠️ list_model_packages fallback failed: {e}")
+        return None
+
+
+def load_baseline_from_registry() -> dict | None:
+    """Return the baseline.json registered with the model serving the endpoint.
+
+    Resolution order:
+      1. Endpoint walk (the deployed model — correct answer)
+      2. Latest Approved ModelPackage in MODEL_PACKAGE_GROUP (only valid
+         on first-ever monitor runs before any endpoint exists)
+
+    Cached per warm Lambda container.
+
+    Returns the parsed baseline.json with ``model_package_arn`` added,
+    or ``None`` if no baseline can be resolved (the caller then falls
+    back to env-based defaults — see check_data_drift / check_model_drift).
+    """
+    if 'value' in _BASELINE_CACHE:
+        return _BASELINE_CACHE['value']
+
+    arn = None
+    if ENDPOINT_NAME:
+        arn = _resolve_model_package_arn_from_endpoint(ENDPOINT_NAME)
+    if not arn:
+        if ENDPOINT_NAME:
+            print(f"  Falling back to latest-Approved lookup in group {MODEL_PACKAGE_GROUP}")
+        arn = _latest_approved_model_package_arn()
+    if not arn:
+        print(f"⚠️ No ModelPackage available (endpoint={ENDPOINT_NAME or '<unset>'}, "
+              f"group={MODEL_PACKAGE_GROUP})")
+        _BASELINE_CACHE['value'] = None
+        return None
+
+    try:
+        pkg = sagemaker_client.describe_model_package(ModelPackageName=arn)
+        s3_uri = (
+            pkg.get('ModelMetrics', {})
+               .get('ModelStatistics', {})
+               .get('S3Uri')
+        )
+        if not s3_uri:
+            print(f"⚠️ ModelPackage {arn} has no ModelStatistics URI — skipping baseline")
+            _BASELINE_CACHE['value'] = None
+            return None
+
+        bucket, key = s3_uri.replace('s3://', '').split('/', 1)
+        body = s3.get_object(Bucket=bucket, Key=key)['Body'].read()
+        baseline = json.loads(body)
+        baseline['model_package_arn'] = arn
+        print(
+            f"✓ Loaded baseline from {s3_uri}\n"
+            f"  ModelPackage:        {arn}\n"
+            f"  Baseline ROC-AUC:    {baseline.get('metrics', {}).get('roc_auc', '?')}\n"
+            f"  Evaluation table:    {baseline.get('evaluation_table', '?')}"
+            f"  (snapshot {baseline.get('evaluation_snapshot_id') or 'live'})"
+        )
+        _BASELINE_CACHE['value'] = baseline
+        return baseline
+    except Exception as e:
+        print(f"⚠️ Could not load baseline.json for {arn}: {e}")
+        _BASELINE_CACHE['value'] = None
+        return None
 
 
 # =========================================================================
@@ -250,17 +377,57 @@ def check_data_drift():
 
     current_df = pd.DataFrame(current_rows)
 
-    # Get baseline data (sample from training data)
+    # Sample baseline data from the frozen evaluation slice. We pin the
+    # exact Iceberg snapshot the model was scored on (carried in
+    # baseline.json) so re-seeding evaluation_data later cannot
+    # retroactively change "what this model considers normal". If no
+    # snapshot is available we fall back to the live table (still
+    # better than the training table since evaluation_data is frozen
+    # between pipeline runs, but loses per-version reproducibility).
+    baseline = load_baseline_from_registry()
+    baseline_table = (baseline or {}).get('evaluation_table') or ATHENA_EVALUATION_TABLE
+    eval_snapshot = (baseline or {}).get('evaluation_snapshot_id') or ''
+
+    if eval_snapshot:
+        from_clause = (
+            f"{ATHENA_DATABASE}.{baseline_table} "
+            f"FOR VERSION AS OF {eval_snapshot}"
+        )
+        snapshot_log = f"snapshot {eval_snapshot}"
+    else:
+        from_clause = f"{ATHENA_DATABASE}.{baseline_table}"
+        snapshot_log = "live table (no snapshot pinned)"
+
+    # LIMIT 5000 — NOT a coverage gap, deliberate cost/perf cap.
+    #
+    # We're characterizing a *distribution* for Evidently's KS / PSI tests,
+    # not enumerating rows. Both tests are stable well below 5K samples
+    # for the 30 input features here — additional rows stop moving the
+    # KS p-value or PSI meaningfully past ~2K. Evidently's own docs cap
+    # the recommended reference size at ~10K.
+    #
+    # On a ~56K-row eval slice this is ~9% sampling, which still gives
+    # ~8 fraud-class rows on average (fraud ≈ 0.17%). That's fine here
+    # because drift detection is UNSUPERVISED — we compare feature
+    # distributions, not label-conditioned ones. Baseline-side classification
+    # metrics live in baseline.json (computed on the FULL eval slice at
+    # train time), so we never need to recompute them from this sample.
+    #
+    # If we ever add supervised drift checks, switch to a stratified pull:
+    # all fraud rows UNION ALL 5000 random non-fraud rows.
+    #
+    # ORDER BY RANDOM() is fine at this scale; for tables >10M rows
+    # consider TABLESAMPLE BERNOULLI to avoid a full-table sort.
     baseline_sql = f"""
     SELECT {', '.join(TRAINING_FEATURES)}
-    FROM {ATHENA_DATABASE}.training_data
+    FROM {from_clause}
     WHERE is_fraud IS NOT NULL
     ORDER BY RANDOM()
     LIMIT 5000
     """
 
     baseline_data = execute_athena_query(baseline_sql)
-    print(f"✓ Loaded {len(baseline_data)} baseline samples")
+    print(f"✓ Loaded {len(baseline_data)} baseline samples from {baseline_table} ({snapshot_log})")
 
     baseline_df = pd.DataFrame(baseline_data)
     # Ensure numeric types
@@ -380,12 +547,23 @@ def check_model_drift():
     print(f"  Current Precision: {current_precision:.4f}")
     print(f"  Current Recall: {current_recall:.4f}")
 
-    # Compare to baseline
-    baseline_roc_auc = float(os.getenv('BASELINE_ROC_AUC', '0.92'))
+    # Compare to baseline. Source of truth is baseline.json registered on
+    # the latest Approved ModelPackage — that anchors the baseline to the
+    # exact slice (evaluation_data) the model was scored on at training.
+    # Falls back to BASELINE_ROC_AUC env var only when the registry lookup
+    # fails (e.g., first ever monitor run before any model is approved).
+    baseline = load_baseline_from_registry()
+    if baseline and 'metrics' in baseline and 'roc_auc' in baseline['metrics']:
+        baseline_roc_auc = float(baseline['metrics']['roc_auc'])
+        baseline_source = baseline.get('model_package_arn', 'registered baseline.json')
+    else:
+        baseline_roc_auc = float(os.getenv('BASELINE_ROC_AUC', '0.92'))
+        baseline_source = 'env:BASELINE_ROC_AUC (no registered baseline.json found)'
+
     degradation = baseline_roc_auc - current_roc_auc
     degradation_pct = (degradation / baseline_roc_auc) * 100
 
-    print(f"  Baseline ROC-AUC: {baseline_roc_auc:.4f}")
+    print(f"  Baseline ROC-AUC: {baseline_roc_auc:.4f}  ← {baseline_source}")
     print(f"  Degradation: {degradation:.4f} ({degradation_pct:.1f}%)")
 
     # Build a synthetic baseline DataFrame with the same schema so Evidently
@@ -673,6 +851,22 @@ def log_to_mlflow(data_drift_result, model_drift_result):
             # Capture the run ID
             run_id = run.info.run_id
 
+            # Tag the run with the immutable references from baseline.json.
+            # These let the MLflow UI group/filter drift runs by code version
+            # (tags.code_commit_sha) and by deployed model (tags.model_package_arn)
+            # — answering "which drift checks ran against model X?" with a
+            # single MLflow filter.
+            baseline = load_baseline_from_registry() or {}
+            mlflow.set_tags({
+                'run_type': 'drift_check',
+                'detection_engine': 'evidently',
+                'endpoint_name': ENDPOINT_NAME or 'unknown',
+                'model_package_arn': baseline.get('model_package_arn') or 'unresolved',
+                'code_commit_sha': baseline.get('code_commit_sha') or 'unknown',
+                'evaluation_snapshot_id': baseline.get('evaluation_snapshot_id') or 'live',
+                'feature_schema_version': str(baseline.get('feature_schema_version') or 0),
+            })
+
             # Log configuration parameters
             mlflow.log_param("detection_engine", "evidently")
             mlflow.log_param("model_drift_threshold", MODEL_DRIFT_THRESHOLD)
@@ -799,11 +993,21 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     data_detected = data_drift_result.get('detected', False) if data_drift_result else False
     model_detected = model_drift_result.get('detected', False) if model_drift_result else False
 
+    # Stamp the resolved ModelPackage ARN + Iceberg snapshot ID. These are
+    # the immutable references that let you query monitoring_responses per
+    # model version — joining on a human-readable label like model_version
+    # silently mixes results across rollouts.
+    baseline = load_baseline_from_registry()
+    model_package_arn = (baseline or {}).get('model_package_arn')
+    evaluation_snapshot_id = (baseline or {}).get('evaluation_snapshot_id')
+
     record = {
         'monitoring_run_id': run_id,
         'monitoring_timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
-        'endpoint_name': os.getenv('ENDPOINT_NAME', 'fraud-detector-endpoint'),
+        'endpoint_name': ENDPOINT_NAME or os.getenv('ENDPOINT_NAME', 'fraud-detector-endpoint'),
         'model_version': os.getenv('MODEL_VERSION', 'latest'),
+        'model_package_arn': model_package_arn,
+        'evaluation_snapshot_id': evaluation_snapshot_id,
         'data_drift_detected': data_detected,
         'drifted_columns_count': data_drift_result.get('drifted_features_count', 0) if data_drift_result else None,
         'drifted_columns_share': data_drift_result.get('drifted_columns_share', 0) if data_drift_result else None,

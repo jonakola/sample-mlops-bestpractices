@@ -477,18 +477,95 @@ def check_quality_gates(
     return results
 
 
+def _current_snapshot_id(
+    athena_client, database: str, table: str, output_s3: str
+) -> str:
+    """Return the most recent Iceberg snapshot ID for ``database.table``.
+
+    Iceberg exposes every table's snapshot history via the ``$snapshots``
+    metadata table. The most recent snapshot is the one preprocessing
+    just read — pinning it in baseline.json freezes the drift-monitor
+    reference, so re-seeding the table cannot retroactively change what
+    "the data this model was scored on" means.
+
+    Returns "" if the query fails so eval can still finish (with a less
+    rigorous baseline).
+    """
+    sql = (
+        f'SELECT CAST(snapshot_id AS VARCHAR) AS sid '
+        f'FROM "{database}"."{table}$snapshots" '
+        f"ORDER BY committed_at DESC LIMIT 1"
+    )
+    try:
+        qid = athena_client.start_query_execution(
+            QueryString=sql,
+            QueryExecutionContext={"Database": database},
+            ResultConfiguration={"OutputLocation": output_s3},
+        )["QueryExecutionId"]
+        import time as _time
+        for _ in range(60):
+            st = athena_client.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+            if st["State"] == "SUCCEEDED":
+                break
+            if st["State"] in ("FAILED", "CANCELLED"):
+                logger.warning(f"snapshot query for {table} {st['State']}: {st.get('StateChangeReason', '')}")
+                return ""
+            _time.sleep(1)
+        else:
+            logger.warning(f"snapshot query for {table} timed out")
+            return ""
+        rows = athena_client.get_query_results(QueryExecutionId=qid)["ResultSet"]["Rows"]
+        if len(rows) >= 2:
+            return rows[1]["Data"][0].get("VarCharValue", "")
+        return ""
+    except Exception as e:
+        logger.warning(f"could not read $snapshots for {table}: {e}")
+        return ""
+
+
 def save_evaluation_report(
     metrics: Dict[str, Any],
     quality_gates: Dict[str, Any],
-    output_dir: str
+    output_dir: str,
+    *,
+    evaluation_table: str,
+    training_table: str,
+    model_package_group: str,
+    code_commit_sha: str,
+    feature_schema_version: int,
+    feature_schema: list,
+    athena_database: str,
+    athena_output_s3: str,
 ) -> None:
     """
-    Save evaluation report to output directory.
+    Save evaluation outputs to output directory:
+      - evaluation_report.json — full report (metrics + quality gates)
+      - evaluation.json        — property file consumed by ConditionStep
+      - baseline.json          — frozen drift-monitor baseline. Contains the
+        same metrics on the evaluation_data slice that registered this model,
+        plus the immutable references (Iceberg snapshot IDs, code commit SHA,
+        feature schema version) needed to reproduce the experiment exactly.
+        The drift Lambda uses these to read the *frozen* reference rows via
+        Iceberg time travel — re-seeding the table cannot corrupt historical
+        baselines.
 
     Args:
         metrics: Evaluation metrics
         quality_gates: Quality gate results
         output_dir: Output directory path
+        evaluation_table: Athena table the metrics were computed on.
+        training_table: Athena table the model was trained on (captured for
+            full lineage; not strictly required by the drift monitor).
+        model_package_group: Model Registry group this baseline applies to.
+        code_commit_sha: Git commit SHA of the pipeline code that produced
+            this baseline (passed in from the pipeline parameter — captured
+            on the orchestrator host, not inside the eval container).
+        feature_schema_version: Bumped whenever the feature list changes
+            (schema breaks force retraining).
+        feature_schema: Ordered list of feature names + dtypes the model was
+            scored on. Stored so the monitor can detect schema drift.
+        athena_database: Athena database to query for $snapshots.
+        athena_output_s3: S3 output location for the snapshot queries.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -524,6 +601,65 @@ def save_evaluation_report(
     logger.info(f"Saving property file to {property_path}")
     with open(property_path, 'w') as f:
         json.dump(property_data, f, indent=2)
+
+    # Pin Iceberg snapshot IDs so the drift Lambda can time-travel the
+    # reference slice via FOR VERSION AS OF — see load_baseline_from_registry
+    # in src/drift_monitoring/lambda_drift_monitor.py. We query $snapshots
+    # AFTER preprocessing/training/eval have read the tables; with no
+    # concurrent writers in a pipeline run, the latest snapshot is the one
+    # this model was actually scored on.
+    import boto3
+    athena_client = boto3.client(
+        "athena",
+        region_name=os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION"),
+    )
+    train_snapshot = _current_snapshot_id(
+        athena_client, athena_database, training_table, athena_output_s3
+    )
+    eval_snapshot = _current_snapshot_id(
+        athena_client, athena_database, evaluation_table, athena_output_s3
+    )
+    if not train_snapshot or not eval_snapshot:
+        logger.warning(
+            "Could not capture one or both Iceberg snapshot IDs "
+            "(train='%s', eval='%s'). Drift monitor will fall back to the "
+            "live table.",
+            train_snapshot, eval_snapshot,
+        )
+
+    # Save drift-monitor baseline. The drift Lambda reads this artifact via
+    # the registered ModelPackage's ModelStatistics URI — see
+    # _create_register_model_step in pipeline.py. Schema_version is bumped
+    # when fields change; older Lambdas should fall back gracefully on
+    # unknown versions.
+    baseline_path = output_path / "baseline.json"
+    baseline_data = {
+        'schema_version': 2,
+        'created_at': pd.Timestamp.now().isoformat(),
+        'model_package_group': model_package_group,
+        'code_commit_sha': code_commit_sha,
+        'evaluation_table': evaluation_table,
+        'training_table': training_table,
+        'evaluation_snapshot_id': eval_snapshot,
+        'training_snapshot_id': train_snapshot,
+        'feature_schema_version': int(feature_schema_version),
+        'feature_schema': feature_schema,
+        'metrics': {
+            'roc_auc': float(metrics['roc_auc']),
+            'pr_auc': float(metrics['pr_auc']),
+            'precision': float(metrics['precision']),
+            'recall': float(metrics['recall']),
+            'f1_score': float(metrics['f1_score']),
+            'accuracy': float(metrics['accuracy']),
+        },
+        'sample_size': int(metrics.get('test_samples', 0)),
+        'positive_samples': int(metrics.get('positive_samples', 0)),
+        'negative_samples': int(metrics.get('negative_samples', 0)),
+        'threshold': float(metrics.get('threshold', 0.5)),
+    }
+    logger.info(f"Saving drift baseline to {baseline_path}")
+    with open(baseline_path, 'w') as f:
+        json.dump(baseline_data, f, indent=2)
 
     logger.info("✓ Evaluation report saved successfully")
 
@@ -579,7 +715,11 @@ def log_figure_to_mlflow(fig, artifact_name: str) -> None:
 def log_to_mlflow(
     metrics: Dict[str, Any],
     quality_gates: Dict[str, Any],
-    figures: Dict[str, Any] = None
+    figures: Dict[str, Any] = None,
+    *,
+    code_commit_sha: str = "unknown",
+    model_package_group: str = "",
+    feature_schema_version: int = 0,
 ) -> None:
     """
     Log evaluation results to MLflow.
@@ -591,6 +731,13 @@ def log_to_mlflow(
         metrics: Evaluation metrics
         quality_gates: Quality gate results
         figures: Dictionary of matplotlib figure objects to log
+        code_commit_sha: Git SHA of the pipeline code that produced this run.
+            Logged as an MLflow tag so the UI can group/filter runs by code
+            version. Comes from the CodeCommitSha pipeline parameter.
+        model_package_group: Model Registry group this run will register
+            into. Logged as a tag for the same grouping purpose.
+        feature_schema_version: Bumped when the feature list changes —
+            useful for spotting incompatible model families in the UI.
     """
     logger.info("="*80)
     logger.info("EVALUATION STEP - MLflow Logging")
@@ -645,12 +792,17 @@ def log_to_mlflow(
             # Log quality gate results
             mlflow.log_param('quality_gates_passed', quality_gates['passed'])
 
-            # Log tags
+            # Log tags. code_commit_sha is the MLflow-side anchor that pairs
+            # with baseline.json's same field — letting MLflow's UI group
+            # runs by code version (Filter: tags.code_commit_sha = "...").
             mlflow.set_tags({
                 'pipeline_step': 'evaluation',
-                'quality_gates_status': 'passed' if quality_gates['passed'] else 'failed'
+                'quality_gates_status': 'passed' if quality_gates['passed'] else 'failed',
+                'code_commit_sha': code_commit_sha,
+                'model_package_group': model_package_group,
+                'feature_schema_version': str(feature_schema_version),
             })
-            logger.info("✓ Tags logged")
+            logger.info("✓ Tags logged (code_commit_sha=%s)", code_commit_sha[:12])
 
             # Log visualizations ensuring proper binary PNG format for MLflow UI
             if figures:
@@ -696,6 +848,29 @@ def main():
     parser.add_argument('--min-pr-auc', type=float, default=0.50,
                        help='Minimum PR-AUC for quality gate')
 
+    # Drift-baseline anchoring (written into baseline.json).
+    # These are pure pass-through — the eval container is the wrong place to
+    # discover them; pipeline.py resolves the values from config + a pipeline
+    # parameter (commit SHA) and forwards them here.
+    parser.add_argument('--evaluation-table', type=str, default='evaluation_data',
+                       help='Athena table the metrics were computed on')
+    parser.add_argument('--training-table', type=str, default='training_data',
+                       help='Athena table the model was trained on '
+                            '(captured for lineage; not required by drift monitor)')
+    parser.add_argument('--model-package-group', type=str, default='xgboost-fraud-detector',
+                       help='Model Registry group this baseline applies to')
+    parser.add_argument('--code-commit-sha', type=str, default='unknown',
+                       help='Git commit SHA of the pipeline code that produced this baseline')
+    parser.add_argument('--feature-schema-version', type=int, default=1,
+                       help='Bump when feature list changes (forces retrain to '
+                            'pass schema check in monitor)')
+    parser.add_argument('--athena-database', type=str,
+                       default=os.environ.get('ATHENA_DATABASE', 'fraud_detection'),
+                       help='Athena database for $snapshots metadata queries')
+    parser.add_argument('--athena-output-s3', type=str,
+                       default=os.environ.get('ATHENA_OUTPUT_S3', ''),
+                       help='S3 location for Athena query results')
+
     # Output arguments
     parser.add_argument('--output-dir', type=str, default='/opt/ml/processing/evaluation',
                        help='Directory to save evaluation report')
@@ -730,12 +905,40 @@ def main():
             min_pr_auc=args.min_pr_auc
         )
 
-        # Step 6: Save evaluation report
-        save_evaluation_report(metrics, quality_gates, args.output_dir)
+        # Load the feature schema preprocessing wrote alongside test.csv.
+        # If absent, fall back to "unknown" so eval still completes.
+        feature_schema = []
+        metadata_path = Path(args.test_data_dir) / "feature_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, "r") as _mf:
+                _fm = json.load(_mf)
+            feature_schema = [
+                {"name": n, "dtype": "double"} for n in _fm.get("feature_names", [])
+            ]
+        else:
+            logger.warning("feature_metadata.json not found — baseline.feature_schema will be empty")
+
+        # Step 6: Save evaluation report (+ baseline.json for the drift monitor)
+        save_evaluation_report(
+            metrics, quality_gates, args.output_dir,
+            evaluation_table=args.evaluation_table,
+            training_table=args.training_table,
+            model_package_group=args.model_package_group,
+            code_commit_sha=args.code_commit_sha,
+            feature_schema_version=args.feature_schema_version,
+            feature_schema=feature_schema,
+            athena_database=args.athena_database,
+            athena_output_s3=args.athena_output_s3,
+        )
 
         # Step 7: Log to MLflow (if available and configured)
         if MLFLOW_AVAILABLE and os.getenv('MLFLOW_TRACKING_URI'):
-            log_to_mlflow(metrics, quality_gates, figures)
+            log_to_mlflow(
+                metrics, quality_gates, figures,
+                code_commit_sha=args.code_commit_sha,
+                model_package_group=args.model_package_group,
+                feature_schema_version=args.feature_schema_version,
+            )
 
         logger.info("=" * 80)
         logger.info("✓ Evaluation completed successfully")

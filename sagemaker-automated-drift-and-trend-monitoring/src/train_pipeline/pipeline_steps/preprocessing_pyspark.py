@@ -572,23 +572,22 @@ def main():
     """Main preprocessing function using PySpark."""
     parser = argparse.ArgumentParser(description="PySpark-based preprocessing for SageMaker")
 
-    # Data source arguments
-    parser.add_argument('--athena-table', type=str, default='training_data',
-                       help='Athena table name')
+    # Data source arguments — train and eval come from separate Athena tables
+    # so the evaluation slice is stable across pipeline runs and can be reused
+    # as the drift-monitor baseline. Both tables are populated by the
+    # SeedAthenaTrainingData step with a deterministic 80/20 hash split.
+    parser.add_argument('--train-table', type=str, default='training_data',
+                       help='Athena table for the train channel (80%% split)')
+    parser.add_argument('--eval-table', type=str, default='evaluation_data',
+                       help='Athena table for the validation/test channel (20%% split)')
     parser.add_argument('--athena-filter', type=str, default=None,
-                       help='SQL WHERE clause for filtering')
+                       help='SQL WHERE clause applied to BOTH train and eval tables')
     parser.add_argument('--limit', type=int, default=None,
-                       help='Row limit for testing')
+                       help='Row limit for testing (applied to BOTH tables)')
 
     # Target column
     parser.add_argument('--target-column', type=str, default='is_fraud',
                        help='Target column name')
-
-    # Split parameters
-    parser.add_argument('--test-size', type=float, default=0.2,
-                       help='Test set proportion (default: 0.2)')
-    parser.add_argument('--random-state', type=int, default=42,
-                       help='Random seed (default: 42)')
 
     # Output paths (SageMaker ProcessingStep provides these)
     parser.add_argument('--train-output-dir', type=str,
@@ -606,9 +605,9 @@ def main():
     logger.info("=" * 80)
     logger.info("PySpark Data Preprocessing for SageMaker Pipeline")
     logger.info("=" * 80)
-    logger.info(f"Athena table: {args.athena_table}")
+    logger.info(f"Train table: {args.train_table}")
+    logger.info(f"Eval table:  {args.eval_table}")
     logger.info(f"Target column: {args.target_column}")
-    logger.info(f"Test size: {args.test_size}")
     logger.info(f"Train output: {args.train_output_dir}")
     logger.info(f"Test output: {args.test_output_dir}")
     logger.info(f"Stats output: {args.stats_output_dir}")
@@ -621,36 +620,38 @@ def main():
         # Get database from environment
         database = os.getenv('ATHENA_DATABASE', 'fraud_detection')
 
-        # Step 2: Read data from Athena using Spark SQL
-        df = read_from_athena(
-            spark,
-            database=database,
-            table=args.athena_table,
-            filters=args.athena_filter,
-            limit=args.limit
+        # Step 2: Read both tables from Athena. We no longer split in Spark —
+        # the split is owned by the SeedAthenaTrainingData step (deterministic
+        # MOD(xxhash64(transaction_id), 10)), so evaluation_data is stable
+        # across model versions and usable as the drift-monitor baseline.
+        train_df = read_from_athena(
+            spark, database=database, table=args.train_table,
+            filters=args.athena_filter, limit=args.limit,
+        )
+        test_df = read_from_athena(
+            spark, database=database, table=args.eval_table,
+            filters=args.athena_filter, limit=args.limit,
         )
 
-        # Step 3: Convert boolean columns to numeric
+        # Step 3: Convert boolean columns to numeric (must run on both DFs).
         logger.info("Converting boolean columns to numeric...")
-        df = convert_boolean_columns(df)
+        train_df = convert_boolean_columns(train_df)
+        test_df = convert_boolean_columns(test_df)
 
-        # Cache DataFrame for multiple operations
-        df.cache()
+        train_df.cache()
+        test_df.cache()
 
-        # Step 4: Validate data quality
-        stats = validate_data_quality(df, args.target_column)
-
+        # Step 4: Validate data quality on the train side (gates the pipeline).
+        # Capture eval distribution too so the stats report covers both sides.
+        stats = validate_data_quality(train_df, args.target_column)
         if not stats['validation_passed']:
-            logger.error("Data validation failed, aborting preprocessing")
+            logger.error("Data validation failed on train_df, aborting preprocessing")
             sys.exit(1)
 
-        # Step 5: Stratified split into train/test
-        train_df, test_df = split_train_test(
-            df,
-            target_column=args.target_column,
-            test_size=args.test_size,
-            random_seed=args.random_state
-        )
+        eval_stats = validate_data_quality(test_df, args.target_column)
+        if not eval_stats['validation_passed']:
+            logger.error("Data validation failed on eval_df, aborting preprocessing")
+            sys.exit(1)
 
         # Add split statistics
         stats['train_samples'] = train_df.count()

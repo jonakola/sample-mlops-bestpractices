@@ -60,11 +60,12 @@ Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/
 ## What This Solution Does
 
 ### Training Pipeline (Notebook 1)
-1. **Preprocess** — Reads from Athena, validates, encodes categoricals, splits train/test (80/20)
-2. **Train** — XGBoost with automatic class imbalance handling (`scale_pos_weight`)
-3. **Evaluate** — Computes ROC-AUC, PR-AUC, precision, recall, F1, confusion matrix
-4. **Quality Gate** — Registers the model only if ROC-AUC ≥ 0.70
-5. **MLflow Registration** — Logs metrics, parameters, and model artifact to MLflow
+1. **Seed Athena** — Idempotently loads the predictions CSV into `training_data` (80%) + `evaluation_data` (20%), deterministic hash split on `transaction_id`
+2. **Preprocess** — Reads `training_data` (train channel) and `evaluation_data` (test channel) from Athena; encodes categoricals; emits XGBoost-format CSVs
+3. **Train** — XGBoost with automatic class imbalance handling (`scale_pos_weight`)
+4. **Evaluate** — Computes ROC-AUC, PR-AUC, precision, recall, F1, confusion matrix; writes `baseline.json` with metrics + Iceberg snapshot IDs + code commit SHA
+5. **Quality Gate** — Registers the model only if ROC-AUC ≥ 0.70
+6. **MLflow Registration** — Logs metrics, parameters, and model artifact to MLflow. The Model Registry record's `ModelStatistics` URI points at `baseline.json` (used by the drift monitor)
 
 ### Deployment (Notebook 2)
 - **Model Selection** — Choose approved model from SageMaker Model Registry
@@ -113,6 +114,99 @@ sagemaker-automated-drift-and-trend-monitoring/
 │   └── guides/                        # Architecture diagrams (PNG + Excalidraw sources)
 └── main.py                            # CLI entry point (alternative to notebook workflow)
 ```
+
+## MLOps Lineage & Reproducibility
+
+> The principle: **anything that participates in a model's lineage must be addressable by an immutable reference. Names are pointers. Pointers are fine for humans, fatal for joins.**
+
+Three immutable references anchor every model in this system:
+
+| Reference | Where it comes from | What it pins |
+|---|---|---|
+| **Model package ARN** | `sagemaker:Register` step | The model artifact + its metrics |
+| **Iceberg snapshot ID** | `INSERT` commit on `evaluation_data` | The exact rows the model was scored on |
+| **Code commit SHA** | Captured by `pipeline.py` at definition time (overridable via the `CodeCommitSha` pipeline parameter in CI) | The preprocessing & training logic |
+
+These travel together inside `baseline.json`, which is registered as `ModelPackage.ModelMetrics.ModelStatistics` on every model. The drift Lambda dereferences them on every run.
+
+### `baseline.json` schema (v2)
+
+```json
+{
+  "schema_version": 2,
+  "model_package_group": "xgboost-fraud-detector",
+  "code_commit_sha": "a1b2c3...",
+  "evaluation_table": "evaluation_data",
+  "training_table":   "training_data",
+  "evaluation_snapshot_id": "1827...",
+  "training_snapshot_id":   "1825...",
+  "feature_schema_version": 1,
+  "feature_schema": [{"name": "transaction_amount", "dtype": "double"}, ...],
+  "metrics": { "roc_auc": 0.94, "pr_auc": 0.78, ... },
+  "sample_size": 56960
+}
+```
+
+### How the drift Lambda resolves "what's in production"
+
+```
+ENDPOINT_NAME
+   → describe_endpoint            (live config)
+   → describe_endpoint_config     (production variant)
+   → variant.ModelName            (model object)
+   → describe_model               (containers)
+   → ModelPackageName             (← the immutable reference)
+   → describe_model_package
+   → ModelMetrics.ModelStatistics.S3Uri
+   → baseline.json
+```
+
+Never `ListModelPackages(SortOrder=Descending, MaxResults=1)` — that conflates "what we built last" with "what's running now," which diverges during rollouts, rollbacks, or pending approvals.
+
+### How baseline data is sampled
+
+```sql
+SELECT ...
+FROM fraud_detection.evaluation_data
+  FOR VERSION AS OF <evaluation_snapshot_id>      -- Iceberg time travel
+WHERE is_fraud IS NOT NULL
+LIMIT 5000
+```
+
+Re-seeding `evaluation_data` later cannot retroactively corrupt the reference. The Lambda falls back to the live table only when no snapshot ID is pinned (first runs, schema-v1 baselines).
+
+### The seven-questions test
+
+A production MLOps system should answer all of these in one API call or one query. Score this codebase as of today:
+
+| # | Question | How it's answered | Status |
+|---|---|---|---|
+| 1 | What model is in production right now? | `describe_endpoint` → production variant → `ModelPackageName` | ✅ |
+| 2 | What baseline does it have? | `baseline.json` registered on the resolved ModelPackage | ✅ |
+| 3 | What data was it scored on? | Iceberg snapshot ID pinned in `baseline.json`, queryable via `FOR VERSION AS OF` | ✅ |
+| 4 | What code built it? | `code_commit_sha` in `baseline.json` | ✅ |
+| 5 | Is it drifting right now? | Scheduled drift Lambda → MLflow + SNS + `monitoring_responses` | ✅ |
+| 6 | When did drift start? | `monitoring_responses` time series, filterable by `model_package_arn` | ✅ |
+| 7 | How did the previous model compare on the same window? | `monitoring_responses` carries `model_package_arn` per record — query by ARN | ✅ (manual query) |
+
+### Operational rules
+
+- **Never overwrite an artifact registered to a ModelPackage.** Pipeline outputs are namespaced per-execution; resist tidying them up.
+- **Schema changes are model-version changes.** Bump `FeatureSchemaVersion` (pipeline parameter) and force a retrain. Don't migrate old baselines forward.
+- **One drift record per `(endpoint, variant, model_package_arn)` per run.** Multi-model production is the rule, not the exception.
+- **Separate the three signals:** *data drift* (input distribution), *model drift* (performance degradation), *coverage gap* (no ground truth yet). Conflating them produces unhelpful alerts.
+- **Run the pipeline from CI with `CodeCommitSha` set explicitly.** Local-machine SHAs are unreliable in shared environments.
+
+### Schema iteration while building
+
+The CFN lifecycle script uses `CREATE TABLE IF NOT EXISTS`. **Existing tables are not migrated when the template changes** — they're silently skipped. Until you have data you can't lose, drop the database between schema changes:
+
+```sql
+-- in Athena
+DROP DATABASE fraud_detection CASCADE;
+```
+
+Then re-launch the JupyterLab Space (the lifecycle script re-runs and recreates everything fresh).
 
 ## Why This Architecture
 
@@ -163,10 +257,11 @@ See [Understanding Drift Scores](docs/screenshots/quicksight/README.md) for a vi
 
 | Table | Type | Purpose |
 |-------|------|---------|
-| `training_data` | Iceberg | Training features (284K rows, 30 features) — drift baseline |
+| `training_data` | Iceberg | Training features (~80% of Kaggle rows, 30 features). Populated by the `SeedAthenaTrainingData` pipeline step. |
+| `evaluation_data` | Iceberg | Held-out evaluation slice (~20%, same hash split). Read by preprocessing for the test channel and by the drift monitor as the **frozen baseline** (time-travelled via Iceberg snapshot ID). |
 | `inference_responses` | Iceberg | All endpoint predictions, partitioned by day. `ground_truth` column populated via MERGE from `ground_truth_updates`. |
 | `ground_truth_updates` | Iceberg | Lightweight patches: `inference_id` + `actual_fraud` + confirmation metadata |
-| `monitoring_responses` | Iceberg | Output of each drift monitoring run (metrics, drift flags, sample sizes, MLflow run ID) |
+| `monitoring_responses` | Iceberg | Output of each drift monitoring run. Includes `model_package_arn` and `evaluation_snapshot_id` so the table can be queried per-version. |
 | `drifted_data` | External (Parquet) | Synthetic drifted samples for testing |
 
 ### Ground Truth Flow
@@ -245,7 +340,7 @@ The custom handler sends predictions to SQS; Lambda batches and writes to Athena
 
 ### Drift Lambda timing out or missing data
 
-The drift Lambda compares the last 7 days of inference data against the training baseline. If inference volume is low, override the lookback window:
+The drift Lambda compares the last 7 days of inference data against the frozen `evaluation_data` baseline (resolved from the deployed model's registered `baseline.json` via Iceberg snapshot). If inference volume is low, override the lookback window:
 ```python
 lambda_client.update_function_configuration(
     FunctionName='fraud-detection-monitoring-drift-monitor',

@@ -178,6 +178,12 @@ class QuickSightDashboardManager:
                         {'Name': 'monitoring_timestamp', 'Type': 'DATETIME'},
                         {'Name': 'endpoint_name', 'Type': 'STRING'},
                         {'Name': 'model_version', 'Type': 'STRING'},
+                        # Immutable references — these are the JOIN KEYS for
+                        # per-version drift analysis. Filter visuals by
+                        # model_package_arn (or its short label) to avoid
+                        # mixing rollouts together.
+                        {'Name': 'model_package_arn', 'Type': 'STRING'},
+                        {'Name': 'evaluation_snapshot_id', 'Type': 'STRING'},
                         {'Name': 'data_drift_detected', 'Type': 'BIT'},
                         {'Name': 'drifted_columns_count', 'Type': 'INTEGER'},
                         {'Name': 'drifted_columns_share', 'Type': 'DECIMAL'},
@@ -224,6 +230,24 @@ class QuickSightDashboardManager:
                                     'ColumnName': 'performance_status',
                                     'ColumnId': 'performance_status',
                                     'Expression': "ifelse({current_roc_auc} >= 0.95, 'GOOD', ifelse({current_roc_auc} >= 0.90, 'WARNING', 'CRITICAL'))"
+                                },
+                                # Short chart-friendly label derived from the
+                                # ModelPackage ARN. ARN tail looks like
+                                #   .../model-package/xgboost-fraud-detector/7
+                                # so we keep "xgboost-fraud-detector:7". Use as
+                                # the X-axis or color dimension to slice
+                                # per-version trends.
+                                {
+                                    'ColumnName': 'model_version_label',
+                                    'ColumnId': 'model_version_label',
+                                    'Expression': (
+                                        "ifelse(isNull({model_package_arn}) OR {model_package_arn}='', "
+                                        "'unknown', "
+                                        "concat("
+                                        "  split({model_package_arn}, '/', 2), ':', "
+                                        "  split({model_package_arn}, '/', 3)"
+                                        "))"
+                                    ),
                                 }
                             ]
                         }
@@ -364,6 +388,15 @@ class QuickSightDashboardManager:
                     logger.info("     10. Model Performance Metrics - Multi-line")
                     logger.info("     11. Drift Alerts Timeline - Bar chart")
                     logger.info("     12. Latest Drift Share KPI")
+                    logger.info("    Sheet 3 — Per-Version Drift:")
+                    logger.info("     13. ROC-AUC Trend by Model Version - Multi-line")
+                    logger.info("         (X: monitoring_timestamp, Y: current_roc_auc,")
+                    logger.info("          Color: model_version_label)")
+                    logger.info("     14. Drift Share by Model Version - Box plot or bar")
+                    logger.info("         (X: model_version_label, Y: drifted_columns_share)")
+                    logger.info("     15. Sheet-level dropdown filter: model_version_label")
+                    logger.info("         (lets a reviewer scope ALL visuals to one model")
+                    logger.info("          package without mixing rollouts together)")
 
                     # Return dataset ARN as placeholder
                     analysis_arn = dataset_arn

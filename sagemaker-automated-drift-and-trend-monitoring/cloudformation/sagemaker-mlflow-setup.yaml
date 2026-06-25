@@ -39,6 +39,19 @@ Parameters:
     Default: 'v21'
     Description: 'Version suffix for lifecycle config and space names (change to trigger replacement)'
 
+  DropDatabase:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, the lifecycle script DROPs the fraud_detection database
+      CASCADE and clears the 7 table S3 prefixes (training_data/,
+      evaluation_data/, inference_responses/, ground_truth/,
+      ground_truth_updates/, monitoring_responses/, drifted_data/) on every
+      Space launch before recreating tables from the current DDL. Defaults
+      to false. Set via `./deploy-stack.sh --drop-database` for the next
+      deploy, then DON'T pass the flag on subsequent deploys.
+
   UseExistingBucket:
     Type: String
     Default: 'false'
@@ -1206,8 +1219,12 @@ Resources:
             chown sagemaker-user:sagemaker-user .env
             chmod 600 .env
 
-            # Create Athena database + all 6 Iceberg tables (empty).
+            # Create Athena database + all 7 Iceberg tables (empty).
             # `IF NOT EXISTS` makes this safe to re-run on every Space launch.
+            # When DropDatabase=true, the database is DROPped CASCADE and the
+            # 7 table S3 prefixes are cleared first so the new DDL takes effect.
+            # The flag is on every Space launch while it's set — flip it back
+            # to false on the next deploy when you don't want to wipe data.
             python3 << 'CREATEEOF'
             import boto3, time
 
@@ -1215,8 +1232,18 @@ Resources:
             BUCKET = "${ProjectName}-data-${AWS::AccountId}"
             PREFIX = "fraud-detection"
             OUTPUT_S3 = f"s3://{BUCKET}/athena-results/"
+            DROP_DATABASE = "${DropDatabase}".lower() == "true"
+
+            # Tables whose S3 prefixes are cleared when DropDatabase=true.
+            # Must match the table names in the TABLES dict below.
+            RESETTABLE_TABLES = [
+                "training_data", "evaluation_data", "inference_responses",
+                "ground_truth", "ground_truth_updates", "monitoring_responses",
+                "drifted_data",
+            ]
 
             athena = boto3.client("athena")
+            s3 = boto3.client("s3")
 
             def run_query(sql):
                 qid = athena.start_query_execution(
@@ -1235,6 +1262,31 @@ Resources:
                 print("  Query timed out")
                 return False
 
+            def clear_s3_prefix(prefix):
+                """Delete every object under s3://{BUCKET}/{prefix}/. Returns count."""
+                paginator = s3.get_paginator("list_objects_v2")
+                deleted = 0
+                for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+                    contents = page.get("Contents", [])
+                    if not contents:
+                        continue
+                    s3.delete_objects(
+                        Bucket=BUCKET,
+                        Delete={"Objects": [{"Key": o["Key"]} for o in contents]},
+                    )
+                    deleted += len(contents)
+                return deleted
+
+            if DROP_DATABASE:
+                print(f"DropDatabase=true — dropping database {DATABASE} and clearing 7 table prefixes")
+                run_query(f"DROP DATABASE IF EXISTS {DATABASE} CASCADE")
+                total_deleted = 0
+                for tbl in RESETTABLE_TABLES:
+                    n = clear_s3_prefix(f"{PREFIX}/{tbl}/")
+                    total_deleted += n
+                    print(f"  Cleared s3://{BUCKET}/{PREFIX}/{tbl}/  ({n} objects)")
+                print(f"  Cleared {total_deleted} objects across {len(RESETTABLE_TABLES)} table prefixes")
+
             run_query(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
 
             TF = ("transaction_timestamp transaction_hour transaction_day_of_week transaction_amount "
@@ -1248,13 +1300,21 @@ Resources:
                   "available_credit_ratio").split()
             FEAT = ", ".join(c + (" STRING" if c == "customer_gender" else " DOUBLE") for c in TF)
 
-            # Table inventory (4 active + 2 reserved for future work):
+            # Table inventory (5 active + 2 reserved for future work):
             #
             #   ACTIVE
-            #   - training_data        Model training features + label.
-            #                          Populated by notebooks/1_training_pipeline.ipynb
-            #                          (src/setup/download_kaggle_dataset.py → S3 → Athena seed).
-            #                          Read by the preprocessing pipeline step.
+            #   - training_data        Model training features + label (80% split).
+            #                          Populated by the SeedAthenaTrainingData
+            #                          pipeline step from the predictions CSV in S3.
+            #                          Read by the preprocessing pipeline step
+            #                          (the `train` channel for ModelTrainer).
+            #   - evaluation_data      Held-out evaluation features + label (20% split).
+            #                          Same row schema as training_data and same
+            #                          deterministic hash split, so it is stable
+            #                          across model versions. Read by preprocessing
+            #                          for the `test` channel, by the evaluation
+            #                          step's quality gates, and by the drift
+            #                          Lambda as the data-drift baseline.
             #   - inference_responses  Every endpoint prediction logged async via
             #                          SQS → Lambda. The `ground_truth` column starts
             #                          NULL and is filled by the MERGE from
@@ -1291,6 +1351,17 @@ Resources:
                 data_version STRING, created_at TIMESTAMP, updated_at TIMESTAMP
             )
             LOCATION 's3://{BUCKET}/{PREFIX}/training_data/'
+            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+            """,
+
+                "evaluation_data": f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.evaluation_data (
+                transaction_id STRING,
+                {FEAT},
+                fraud_prediction BOOLEAN, fraud_probability DOUBLE, is_fraud BOOLEAN,
+                data_version STRING, created_at TIMESTAMP, updated_at TIMESTAMP
+            )
+            LOCATION 's3://{BUCKET}/{PREFIX}/evaluation_data/'
             TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
             """,
 
@@ -1355,10 +1426,19 @@ Resources:
             TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
             """,
 
+                # model_package_arn is the join key for "is this drift
+                # record about the currently-deployed model, or about a
+                # previous version we rolled back from?" It's the
+                # immutable reference that pairs with the human-readable
+                # model_version label.
+                # evaluation_snapshot_id pins the Iceberg snapshot the
+                # drift Lambda sampled the baseline from (per-version
+                # reproducibility).
                 "monitoring_responses": f"""
             CREATE TABLE IF NOT EXISTS {DATABASE}.monitoring_responses (
                 monitoring_run_id STRING, monitoring_timestamp TIMESTAMP,
-                endpoint_name STRING, model_version STRING,
+                endpoint_name STRING, model_version STRING, model_package_arn STRING,
+                evaluation_snapshot_id STRING,
                 data_drift_detected BOOLEAN, drifted_columns_count INT, drifted_columns_share DOUBLE,
                 features_analyzed INT, data_sample_size INT, model_drift_detected BOOLEAN,
                 baseline_roc_auc DOUBLE, current_roc_auc DOUBLE,

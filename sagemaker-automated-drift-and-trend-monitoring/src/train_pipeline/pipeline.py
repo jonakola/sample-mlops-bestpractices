@@ -2,14 +2,15 @@
 SageMaker Pipeline definition for fraud detection.
 
 This pipeline implements a complete ML workflow:
-1. ProcessingStep - Data validation and preprocessing
-2. TrainingStep - XGBoost model training with MLflow tracking
-3. EvaluationStep - Model evaluation with quality gates
-4. ConditionStep - Quality gate check (ROC-AUC >= threshold)
-5. RegisterModelStep - Register model in SageMaker Model Registry
-6. CreateModelStep - Create SageMaker model for deployment
-7. LambdaStep - Deploy to serverless endpoint
-8. LambdaStep - Test inference and log to MLflow
+1. ProcessingStep - Seed Athena training_data from predictions CSV (idempotent)
+2. ProcessingStep - Data validation and preprocessing
+3. TrainingStep - XGBoost model training with MLflow tracking
+4. EvaluationStep - Model evaluation with quality gates
+5. ConditionStep - Quality gate check (ROC-AUC >= threshold)
+6. RegisterModelStep - Register model in SageMaker Model Registry
+7. CreateModelStep - Create SageMaker model for deployment
+8. LambdaStep - Deploy to serverless endpoint
+9. LambdaStep - Test inference and log to MLflow
 
 The pipeline supports:
 - Parameterization for flexibility
@@ -22,9 +23,32 @@ The pipeline supports:
 import json
 import logging
 import os
+import subprocess
 from typing import Dict, Any, Optional, List
 
 import boto3
+
+
+def _resolve_code_commit_sha() -> str:
+    """Capture the pipeline-code commit SHA on the orchestrator host.
+
+    Runs once at pipeline-definition time (not in any container). CI/CD
+    callers should override this via the CodeCommitSha pipeline parameter
+    so the build server's SHA wins over a developer's local checkout. We
+    fall back to 'unknown' if git isn't available — eval still completes,
+    baseline.json just loses one lineage anchor.
+    """
+    sha = os.environ.get("CODE_COMMIT_SHA", "").strip()
+    if sha:
+        return sha
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
 
 # SageMaker v3 imports — Session and role helpers
 from sagemaker.core.helper.session_helper import Session, get_execution_role
@@ -97,8 +121,8 @@ else:
 from src.config.config import (
     SAGEMAKER_EXEC_ROLE, LAMBDA_EXEC_ROLE, DATA_S3_BUCKET, MLFLOW_MODEL_NAME,
     S3_MODEL_ARTIFACTS, S3_TRAINING_DATA_EXPORT, ATHENA_TRAINING_TABLE,
-    ATHENA_DATABASE, ATHENA_OUTPUT_S3, SERVERLESS_MEMORY_SIZE,
-    SERVERLESS_MAX_CONCURRENCY, INFERENCE_LOG_BATCH_SIZE,
+    ATHENA_EVALUATION_TABLE, ATHENA_DATABASE, ATHENA_OUTPUT_S3,
+    SERVERLESS_MEMORY_SIZE, SERVERLESS_MAX_CONCURRENCY, INFERENCE_LOG_BATCH_SIZE,
     INFERENCE_LOG_FLUSH_INTERVAL, HIGH_CONFIDENCE_THRESHOLD,
     LOW_CONFIDENCE_LOWER, LOW_CONFIDENCE_UPPER, AWS_DEFAULT_REGION, SQS_QUEUE_URL,
     XGBOOST_PARAMS,
@@ -210,6 +234,10 @@ class FraudDetectionPipeline:
                 name="AthenaTable",
                 default_value=ATHENA_TRAINING_TABLE
             ),
+            'athena_evaluation_table': ParameterString(
+                name="AthenaEvaluationTable",
+                default_value=ATHENA_EVALUATION_TABLE
+            ),
             'athena_filter': ParameterString(
                 name="AthenaFilter",
                 default_value=""
@@ -293,14 +321,83 @@ class FraudDetectionPipeline:
                 name="ModelPackageGroup",
                 default_value=MLFLOW_MODEL_NAME
             ),
+
+            # Lineage anchors written into baseline.json. CI/CD callers
+            # override CodeCommitSha; FeatureSchemaVersion is bumped only
+            # when the feature list itself changes (forces retrain so the
+            # drift monitor doesn't compare incompatible schemas).
+            'code_commit_sha': ParameterString(
+                name="CodeCommitSha",
+                default_value=_resolve_code_commit_sha(),
+            ),
+            'feature_schema_version': ParameterInteger(
+                name="FeatureSchemaVersion",
+                default_value=1,
+            ),
         }
 
         logger.info(f"Defined {len(params)} parameters")
         return params
 
+    def _create_seed_athena_step(self) -> ProcessingStep:
+        """
+        Create the seed step that idempotently loads the predictions CSV
+        into the Athena ``training_data`` table.
+
+        The CloudFormation lifecycle creates the empty Iceberg table; this
+        step fills it. Runs as the first step of the pipeline so preprocessing
+        can depend on the table being populated. Idempotent — if the
+        integrity check already passes, the script is a few-second no-op.
+
+        Returns:
+            ProcessingStep
+        """
+        logger.info("Creating Athena seed step...")
+
+        # Use the SKLearn container image — it's small, has boto3, and starts
+        # quickly. We don't import sklearn; we only need a Python runtime.
+        sklearn_image = retrieve_image_uri(
+            framework="sklearn",
+            region=self.region,
+            version="1.2-1",
+        )
+
+        processor = ScriptProcessor(
+            image_uri=sklearn_image,
+            role=self.role,
+            instance_type=self.config['processing_instance_type'],
+            instance_count=1,
+            base_job_name="fraud-seed-athena",
+            sagemaker_session=self.session,
+            command=["python3"],
+            env={
+                # seed_athena_tables.py reads all config from env vars so it
+                # has no dependency on src.config inside the container.
+                'AWS_DEFAULT_REGION': AWS_DEFAULT_REGION,
+                'ATHENA_DATABASE': ATHENA_DATABASE,
+                'ATHENA_OUTPUT_S3': ATHENA_OUTPUT_S3,
+                'ATHENA_TRAINING_TABLE': ATHENA_TRAINING_TABLE,
+                'ATHENA_EVALUATION_TABLE': ATHENA_EVALUATION_TABLE,
+                'DATA_S3_BUCKET': DATA_S3_BUCKET,
+                'DATA_S3_PREFIX': os.environ.get('DATA_S3_PREFIX', 'fraud-detection/'),
+            },
+        )
+
+        step = ProcessingStep(
+            name="SeedAthenaTrainingData",
+            step_args=processor.run(
+                code=str(Path(__file__).parent / "pipeline_steps" / "seed_athena_tables.py"),
+                wait=False,
+            ),
+        )
+
+        logger.info("✓ Athena seed step created")
+        return step
+
     def _create_preprocessing_step(
         self,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        seed_step: ProcessingStep,
     ) -> ProcessingStep:
         """
         Create PySpark-based preprocessing step for distributed processing.
@@ -345,16 +442,20 @@ class FraudDetectionPipeline:
         # produce the CSVs (only the JSON metadata reached S3), causing the
         # downstream training step to fail with "train.csv not found".
         job_arguments = [
-            "--athena-table", params['athena_table'],
+            "--train-table", params['athena_table'],
+            "--eval-table", params['athena_evaluation_table'],
             "--target-column", params['target_column'],
             "--train-output-dir", f"s3://{self.bucket}/fraud-detection/preprocessing/train",
             "--test-output-dir", f"s3://{self.bucket}/fraud-detection/preprocessing/test",
             "--stats-output-dir", f"s3://{self.bucket}/fraud-detection/preprocessing/stats",
         ]
 
-        # Processing step with PySpark script — v3 uses step_args from processor.run()
+        # Processing step with PySpark script — v3 uses step_args from processor.run().
+        # depends_on=[seed_step] forces ordering since preprocessing reads from
+        # Athena directly (no S3 data flow from the seed step).
         step = ProcessingStep(
             name="PreprocessData",
+            depends_on=[seed_step],
             step_args=processor.run(
                 submit_app=str(Path(__file__).parent / "pipeline_steps" / "preprocessing_pyspark.py"),
                 arguments=job_arguments,
@@ -524,6 +625,9 @@ class FraudDetectionPipeline:
                 'MLFLOW_TRACKING_URI': MLFLOW_TRACKING_URI if MLFLOW_TRACKING_URI else '',
                 'MLFLOW_EXPERIMENT_NAME': 'credit-card-fraud-detection-evaluation',
                 'MLFLOW_MODEL_NAME': MLFLOW_MODEL_NAME,
+                'AWS_DEFAULT_REGION': AWS_DEFAULT_REGION,
+                'ATHENA_DATABASE': ATHENA_DATABASE,
+                'ATHENA_OUTPUT_S3': ATHENA_OUTPUT_S3,
             }
         )
 
@@ -542,6 +646,14 @@ class FraudDetectionPipeline:
                     "--target-column", params['target_column'],
                     "--min-roc-auc", Join(on="", values=[params['min_roc_auc']]),
                     "--min-pr-auc", Join(on="", values=[params['min_pr_auc']]),
+                    "--evaluation-table", params['athena_evaluation_table'],
+                    "--training-table", params['athena_table'],
+                    "--model-package-group", params['model_package_group'],
+                    "--code-commit-sha", params['code_commit_sha'],
+                    "--feature-schema-version",
+                    Join(on="", values=[params['feature_schema_version']]),
+                    "--athena-database", ATHENA_DATABASE,
+                    "--athena-output-s3", ATHENA_OUTPUT_S3,
                 ],
                 inputs=[
                     ProcessingInput(
@@ -603,13 +715,19 @@ class FraudDetectionPipeline:
         """
         logger.info("Creating register model step...")
 
+        # Register baseline.json (not evaluation.json) as the ModelPackage's
+        # model_statistics. baseline.json contains the same metrics plus the
+        # anchor fields the drift monitor needs (evaluation_table,
+        # model_package_group), so the monitor can recover its reference by
+        # looking up the registered ModelPackage instead of relying on a
+        # hardcoded env var.
         model_metrics = ModelMetrics(
             model_statistics=MetricsSource(
                 s3_uri=Join(
                     on="/",
                     values=[
                         evaluation_step.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
-                        "evaluation.json"
+                        "baseline.json"
                     ]
                 ),
                 content_type="application/json"
@@ -933,10 +1051,13 @@ class FraudDetectionPipeline:
         # Step 1: Define parameters
         params = self._define_parameters()
 
-        # Step 2: Create preprocessing step
-        preprocessing_step = self._create_preprocessing_step(params)
+        # Step 2: Seed Athena training_data from the predictions CSV (idempotent)
+        seed_step = self._create_seed_athena_step()
 
-        # Step 3: Create training step
+        # Step 3: Create preprocessing step (depends on seed_step)
+        preprocessing_step = self._create_preprocessing_step(params, seed_step)
+
+        # Step 4: Create training step
         training_step = self._create_training_step(params, preprocessing_step)
 
         # Step 4: Create evaluation step (returns step and property file)
@@ -976,6 +1097,7 @@ class FraudDetectionPipeline:
 
         # Build pipeline steps
         pipeline_steps = [
+            seed_step,
             preprocessing_step,
             training_step,
             evaluation_step,
@@ -995,9 +1117,9 @@ class FraudDetectionPipeline:
         logger.info(f"  Total steps: {len(pipeline_steps)}")
         logger.info(f"  Parameters: {len(params)}")
         if include_deployment:
-            logger.info("  Flow: Preprocess → Train → Evaluate → Quality Gate → Register → Deploy → Test")
+            logger.info("  Flow: Seed → Preprocess → Train → Evaluate → Quality Gate → Register → Deploy → Test")
         else:
-            logger.info("  Flow: Preprocess → Train → Evaluate → Quality Gate → Register")
+            logger.info("  Flow: Seed → Preprocess → Train → Evaluate → Quality Gate → Register")
         logger.info("=" * 80)
 
         return pipeline
