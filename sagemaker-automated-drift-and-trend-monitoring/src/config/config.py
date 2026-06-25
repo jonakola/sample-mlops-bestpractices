@@ -124,6 +124,9 @@ ATHENA_GROUND_TRUTH_UPDATES_TABLE: str = _get(
 ATHENA_DRIFTED_DATA_TABLE: str = _get(
     "athena", "drifted_data_table", "ATHENA_DRIFTED_DATA_TABLE", "drifted_data"
 )
+ATHENA_MONITORING_RESPONSES_TABLE: str = os.environ.get(
+    "ATHENA_MONITORING_RESPONSES_TABLE", "monitoring_responses"
+)
 
 # ===================================================================
 # S3 paths
@@ -292,6 +295,30 @@ S3_CSV_DRIFTED_DATA: str = _get(
 # ===================================================================
 RANDOM_STATE: int = int(_get("training", "random_state", "RANDOM_STATE", "42"))
 
+# Target column name in the Kaggle dataset post-rename. Not in config.yaml
+# because it's a fixed property of data/download_kaggle_dataset.py — exposed
+# here so notebooks/2_inference_monitoring.ipynb can reference it.
+TARGET_COLUMN: str = os.environ.get("TARGET_COLUMN", "is_fraud")
+
+# The 30 feature columns (PCA components V1-V28 + transaction_amount-style
+# names from data/download_kaggle_dataset.py KAGGLE_COLUMN_MAP). Listed here
+# so monitoring code can parse the inference_responses.input_features JSON
+# without rediscovering the schema on every call. Order matches the staging
+# table created during the Athena seed.
+TRAINING_FEATURES: list[str] = [
+    "transaction_hour", "transaction_day_of_week", "transaction_amount",
+    "transaction_type_code", "customer_age", "customer_gender",
+    "customer_tenure_months", "account_age_days", "distance_from_home_km",
+    "distance_from_last_transaction_km", "time_since_last_transaction_min",
+    "online_transaction", "international_transaction", "high_risk_country",
+    "merchant_category_code", "merchant_reputation_score", "chip_transaction",
+    "pin_used", "card_present", "cvv_match", "address_verification_match",
+    "num_transactions_24h", "num_transactions_7days",
+    "avg_transaction_amount_30days", "max_transaction_amount_30days",
+    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
+    "credit_limit", "available_credit_ratio",
+]
+
 _training_cfg = _yaml_cfg.get("training", {}) if isinstance(
     _yaml_cfg.get("training"), dict
 ) else {}
@@ -325,6 +352,41 @@ MIN_ROC_AUC_THRESHOLD: float = float(
 )
 
 # ===================================================================
+# Monitoring lookback windows (used by notebook 2 + monitor_model_performance.py)
+# ===================================================================
+# Override via env vars when the Lambda runs — see also DATA_DRIFT_LOOKBACK_DAYS /
+# MODEL_DRIFT_LOOKBACK_DAYS read directly by lambda_drift_monitor.py.
+MONITORING_DATA_DRIFT_LOOKBACK_DAYS: int = int(
+    os.environ.get("MONITORING_DATA_DRIFT_LOOKBACK_DAYS", "7")
+)
+MONITORING_MODEL_DRIFT_LOOKBACK_DAYS: int = int(
+    os.environ.get("MONITORING_MODEL_DRIFT_LOOKBACK_DAYS", "30")
+)
+
+# ===================================================================
+# Ground-truth simulation (dev/test only — see notebook 2 Section 4)
+# ===================================================================
+# These knobs let notebook 2 inject controlled drift into the ground-truth
+# simulator so the monitoring pipeline can be exercised end-to-end. In
+# production, ground truth comes from fraud-investigation feeds; these
+# constants are unused.
+GROUND_TRUTH_SIM_ACCURACY: float = float(
+    os.environ.get("GROUND_TRUTH_SIM_ACCURACY", "0.85")
+)
+GROUND_TRUTH_SIM_FEATURE_DRIFT_MAG: float = float(
+    os.environ.get("GROUND_TRUTH_SIM_FEATURE_DRIFT_MAG", "0.0")
+)
+GROUND_TRUTH_SIM_FEATURE_DRIFT_COUNT: int = int(
+    os.environ.get("GROUND_TRUTH_SIM_FEATURE_DRIFT_COUNT", "0")
+)
+GROUND_TRUTH_SIM_FEATURE_DRIFT_IMPACT: float = float(
+    os.environ.get("GROUND_TRUTH_SIM_FEATURE_DRIFT_IMPACT", "0.0")
+)
+GROUND_TRUTH_SIM_MODEL_DRIFT_MAG: float = float(
+    os.environ.get("GROUND_TRUTH_SIM_MODEL_DRIFT_MAG", "0.0")
+)
+
+# ===================================================================
 # Drift dataset generation
 # ===================================================================
 _drift_gen_cfg = _yaml_cfg.get("drift_generation", {}) if isinstance(
@@ -337,5 +399,21 @@ DRIFT_GEN_NUM_SAMPLES: int = int(_drift_gen_cfg.get("num_samples", "5000"))
 DRIFT_GEN_NUM_SAMPLES_PER_RUN: int = int(_drift_gen_cfg.get("num_samples_per_run", "2000"))
 DRIFT_GEN_RANDOM_STATE: int = int(_drift_gen_cfg.get("random_state", "123"))
 
-# QuickSight resource IDs and display names live in
-# src/governance/setup_quicksight_governance.py (no YAML duplication).
+# ===================================================================
+# QuickSight (used by notebooks/3_governance_dashboard.ipynb)
+# ===================================================================
+# These IDs and display names are constants of the deployed dashboard, not
+# tunables — they live here as plain literals (no YAML mirror).
+QUICKSIGHT_DATASOURCE_ID: str = "fraud-governance-athena-datasource"
+QUICKSIGHT_DATASOURCE_NAME: str = "Fraud Governance - Athena"
+QUICKSIGHT_INFERENCE_DATASET_ID: str = "fraud-governance-inference-dataset"
+QUICKSIGHT_INFERENCE_DATASET_NAME: str = "Fraud Governance - Inference Monitoring"
+QUICKSIGHT_DRIFT_DATASET_ID: str = "fraud-governance-drift-dataset"
+QUICKSIGHT_DRIFT_DATASET_NAME: str = "Fraud Governance - Drift Monitoring"
+QUICKSIGHT_FEATURE_DRIFT_DATASET_ID: str = "fraud-governance-feature-drift-dataset"
+QUICKSIGHT_FEATURE_DRIFT_DATASET_NAME: str = "Fraud Governance - Feature Drift Analysis"
+QUICKSIGHT_ANALYSIS_ID: str = "fraud-governance-analysis"
+QUICKSIGHT_ANALYSIS_NAME: str = "Fraud Detection Governance Analysis"
+QUICKSIGHT_DASHBOARD_ID: str = "fraud-governance-dashboard"
+QUICKSIGHT_DASHBOARD_NAME: str = "Fraud Detection Governance"
+QUICKSIGHT_SERVICE_ROLE_NAME: str = "aws-quicksight-service-role-v0"
