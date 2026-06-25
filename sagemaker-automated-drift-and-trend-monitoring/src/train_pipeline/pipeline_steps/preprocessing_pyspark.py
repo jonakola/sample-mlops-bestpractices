@@ -328,33 +328,46 @@ def convert_boolean_columns(df: DataFrame) -> DataFrame:
 
 def split_train_test(
     df: DataFrame,
+    target_column: str = 'is_fraud',
     test_size: float = 0.2,
     random_seed: int = 42
 ) -> Tuple[DataFrame, DataFrame]:
     """
-    Split data into train and test sets using PySpark randomSplit.
-
-    Note: PySpark's randomSplit does not support stratified splitting natively.
-    For severely imbalanced datasets, consider alternative approaches.
+    Stratified train/test split — splits each class independently and unions
+    the results, so the positive/negative ratio matches between train and test.
+    Critical for severely imbalanced datasets (e.g. fraud at 0.17%): an
+    un-stratified randomSplit can leave train and test with materially
+    different positive-class subpopulations, causing the model to memorize
+    train positives but fail to generalize to test positives (train AUC → 1.0,
+    test AUC → 0.5).
 
     Args:
         df: Input DataFrame
+        target_column: Target column name to stratify on
         test_size: Proportion of data for test set
         random_seed: Random seed for reproducibility
 
     Returns:
         Tuple of (train_df, test_df)
     """
-    logger.info(f"Splitting data: {1-test_size:.0%} train, {test_size:.0%} test")
+    logger.info(f"Stratified split on '{target_column}': {1-test_size:.0%} train, {test_size:.0%} test")
 
-    # Use randomSplit (not stratified)
-    train_df, test_df = df.randomSplit([1-test_size, test_size], seed=random_seed)
+    pos = df.filter(F.col(target_column) == 1)
+    neg = df.filter(F.col(target_column) == 0)
+
+    pos_train, pos_test = pos.randomSplit([1 - test_size, test_size], seed=random_seed)
+    neg_train, neg_test = neg.randomSplit([1 - test_size, test_size], seed=random_seed)
+
+    train_df = pos_train.union(neg_train)
+    test_df = pos_test.union(neg_test)
 
     train_count = train_df.count()
     test_count = test_df.count()
+    train_pos = pos_train.count()
+    test_pos = pos_test.count()
 
-    logger.info(f"✓ Train set: {train_count:,} rows")
-    logger.info(f"✓ Test set: {test_count:,} rows")
+    logger.info(f"✓ Train set: {train_count:,} rows ({train_pos:,} positive)")
+    logger.info(f"✓ Test set: {test_count:,} rows ({test_pos:,} positive)")
 
     return train_df, test_df
 
@@ -631,9 +644,10 @@ def main():
             logger.error("Data validation failed, aborting preprocessing")
             sys.exit(1)
 
-        # Step 5: Split into train/test
+        # Step 5: Stratified split into train/test
         train_df, test_df = split_train_test(
             df,
+            target_column=args.target_column,
             test_size=args.test_size,
             random_seed=args.random_state
         )

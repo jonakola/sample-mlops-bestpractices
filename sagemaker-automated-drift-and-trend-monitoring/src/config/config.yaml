@@ -1,18 +1,17 @@
 # =============================================================================
 # Central Configuration for Drift Monitoring Pipeline
 # =============================================================================
-# This is the single source of truth for all shared variables across pipeline
-# stages. Edit this file to configure the project. Environment variables in
-# .env will override values defined here.
+# Single source of truth for shared variables across pipeline stages. Each
+# value here maps to a constant in src/config/config.py. Environment variables
+# in .env take precedence over values defined here.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # Project
 # ---------------------------------------------------------------------------
 # Used to derive the account-agnostic data bucket when DATA_S3_BUCKET / s3.bucket
-# are not set: ${project.name}-data-${AWS::AccountId}. This must match the
-# ProjectName parameter used by the CloudFormation stack so the same bucket
-# resolves in any account/deployment without relying on a local .env file.
+# are not set: ${project.name}-data-${AWS::AccountId}. Must match the
+# ProjectName parameter used by the CloudFormation stack.
 project:
   name: fraud-detection-monitoring
 
@@ -27,8 +26,6 @@ aws:
 # ---------------------------------------------------------------------------
 sagemaker:
   exec_role: ""                  # ARN of the SageMaker execution role
-  training_instance: ml.m5.xlarge
-  training_volume_size: 30       # GB
   serverless_memory_size: 2048   # MB (1024-6144)
   serverless_max_concurrency: 5  # Max concurrent invocations (1-200)
   batch_transform_instance: ml.m5.xlarge
@@ -39,7 +36,6 @@ sagemaker:
 # ---------------------------------------------------------------------------
 mlflow:
   tracking_uri: ""               # SageMaker MLflow tracking server ARN
-  tracking_browser_url: ""       # Browser URL for the MLflow UI
   experiment_name: credit-card-fraud-detection-training
   inference_experiment_name: credit-card-fraud-detection-inference
   batch_experiment_name: credit-card-fraud-detection-batch
@@ -52,21 +48,23 @@ mlflow:
 athena:
   database: fraud_detection
   workgroup: primary
-  output_s3: ""                  # S3 path for Athena query results
+  output_s3: ""                  # S3 path for Athena query results (derived from data bucket if empty)
+  query_timeout: 300             # Seconds
   training_table: training_data
   inference_table: inference_responses
   ground_truth_table: ground_truth
   ground_truth_updates_table: ground_truth_updates
   drifted_data_table: drifted_data
-  monitoring_responses_table: monitoring_responses  # Iceberg table for drift monitoring results
-  query_timeout: 300             # Seconds
+  # monitoring_responses_table is hardcoded in lambda_monitoring_writer.py and
+  # deploy_monitoring_writer.py (override via MONITORING_TABLE_NAME env var).
 
 # ---------------------------------------------------------------------------
 # S3 storage
 # ---------------------------------------------------------------------------
 s3:
-  bucket: ""                     # S3 bucket for data lake storage
+  bucket: ""                     # Data lake bucket (derived from project.name if empty)
   prefix: "fraud-detection/"
+  # Per-resource paths (populated automatically from bucket + prefix if left empty)
   training_data: ""              # s3://bucket/prefix/training_data/
   ground_truth: ""               # s3://bucket/prefix/ground_truth/
   inference_responses: ""        # s3://bucket/prefix/inference_responses/
@@ -84,17 +82,20 @@ sqs:
   # Inference logging queue
   inference_queue_name: fraud-inference-logs
   inference_queue_url: ""        # Full SQS queue URL (set after creation)
-
   # Monitoring results queue
   monitoring_queue_name: fraud-monitoring-results
-  monitoring_queue_url: ""       # Full SQS queue URL (set after creation)
+  monitoring_queue_url: ""
 
 # ---------------------------------------------------------------------------
-# Inference logging (SQS → Lambda → Athena)
+# Inference logging
 # ---------------------------------------------------------------------------
+# The CloudFormation stack provisions the actual SQS→Lambda batch parameters
+# (batch_size=10, flush_window=30s) in sagemaker-mlflow-setup.yaml. The values
+# below configure the legacy direct-Athena writer in inference_handler.py if
+# enable_athena_logging is "true" but SQS_QUEUE_URL is unset.
 inference_logging:
   enable_athena_logging: "true"
-  batch_size: "100"
+  batch_size: "50"               # Buffered direct-Athena writer flush size
   flush_interval: "300"          # Seconds between flush cycles
 
 # ---------------------------------------------------------------------------
@@ -109,516 +110,142 @@ inference:
 # Lambda configuration
 # ---------------------------------------------------------------------------
 lambda:
-  # Drift monitoring Lambda (container-based, runs daily)
-  drift_monitor_name: fraud-detection-drift-monitor
-  drift_monitor_role: ""         # ARN of the drift monitor Lambda execution role
-
-  # Monitoring writer Lambda (writes results from SQS to Athena)
-  monitoring_writer_name: fraud-monitoring-results-writer
-  monitoring_writer_role: ""     # ARN of the monitoring writer Lambda role
-
-  # Inference logger Lambda (writes inference logs from SQS to Athena)
-  logger_name: fraud-inference-log-consumer
   exec_role: ""                  # ARN of the Lambda execution role
+  logger_name: fraud-inference-log-consumer
+  # monitoring_writer_name: set via MONITORING_WRITER_LAMBDA_NAME env var in
+  # src/drift_monitoring/deploy_monitoring_writer.py
+  # drift monitor (fraud-detection-drift-monitor): provisioned by CloudFormation
 
 # ---------------------------------------------------------------------------
 # Data file paths
 # ---------------------------------------------------------------------------
-# Local paths are relative to project root (used only by upload_data_to_s3.py).
-# All pipeline/Athena code should read from S3 paths below.
+# Local paths are relative to project root (used only by upload_data_to_s3.py
+# and download_kaggle_dataset.py). Pipeline/Athena code uses the S3 paths below.
 data:
   csv_training_data: "data/creditcard_predictions_final.csv"
   csv_ground_truth: "data/creditcard_ground_truth.csv"
   csv_drifted_data: "data/creditcard_drifted.csv"
   # S3 locations (populated automatically from bucket + prefix if left empty)
-  s3_training_data: ""           # s3://bucket/prefix/data/creditcard_predictions_final.csv
-  s3_ground_truth: ""            # s3://bucket/prefix/data/creditcard_ground_truth.csv
-  s3_drifted_data: ""            # s3://bucket/prefix/data/creditcard_drifted.csv
+  s3_training_data: ""
+  s3_ground_truth: ""
+  s3_drifted_data: ""
 
 # ---------------------------------------------------------------------------
-# Training features and target
+# Training
 # ---------------------------------------------------------------------------
+# Target column, test split, and feature list are defined in
+# data/download_kaggle_dataset.py (the column-rename map) and the preprocessing
+# step. Only XGBoost hyperparameters live here because they need to be
+# tunable without re-deriving the dataset.
 training:
-  target_column: is_fraud
-  test_size: 0.2
   random_state: 42
+  # XGBoost hyperparameters tuned for severe class imbalance (~580:1 in the
+  # Kaggle credit-card fraud dataset). Shallow trees + larger min_child_weight
+  # + early stopping prevent the model from memorizing the small positive class
+  # (≈394 training rows) and driving test AUC to ~0.5.
   xgboost_params:
-    n_estimators: 200
-    max_depth: 8
+    max_depth: 4
     learning_rate: 0.05
+    num_boost_round: 200            # ceiling; early stopping typically halts sooner
+    min_child_weight: 10
+    early_stopping_rounds: 20
     subsample: 0.8
     colsample_bytree: 0.8
-    min_child_weight: 5
     gamma: 0.1
     reg_alpha: 0.1
     reg_lambda: 1.0
-    use_label_encoder: false
-    eval_metric: "logloss"
-  features:
-    - transaction_hour
-    - transaction_day_of_week
-    - transaction_amount
-    - customer_age
-    - customer_gender
-    - distance_from_home_km
-    - merchant_category_code
-    - chip_transaction
-    - num_transactions_24h
-    - credit_limit
-    - available_credit_ratio
-    - avg_transaction_amount_7d
-    - avg_transaction_amount_30d
-    - transaction_amount_zscore
-    - is_weekend
-    - is_night
-    - merchant_risk_score
-    - customer_tenure_days
-    - num_cards
-    - card_present
-    - recurring_merchant
-    - distance_from_last_transaction_km
-    - time_since_last_transaction_min
-    - foreign_transaction
-    - high_risk_country
-    - velocity_1h
-    - velocity_24h
-    - amount_to_limit_ratio
-    - digital_wallet
-    - authentication_method
+    eval_metric: "auc"
 
 # ---------------------------------------------------------------------------
-# Drift detection thresholds
+# Drift detection thresholds (used by monitor_model_performance.py)
 # ---------------------------------------------------------------------------
+# Note: the daily drift Lambda (fraud-detection-drift-monitor) does NOT read
+# these — it reads DATA_DRIFT_THRESHOLD / KS_PVALUE_THRESHOLD / MODEL_DRIFT_THRESHOLD
+# / DATA_DRIFT_LOOKBACK_DAYS / MODEL_DRIFT_LOOKBACK_DAYS from its Lambda
+# environment variables (set at deploy time). To tune the Lambda, update its
+# environment configuration, not this file.
 drift_thresholds:
-  # PSI (Population Stability Index) boundaries
-  psi_no_drift: 0.1
-  psi_moderate_drift: 0.2
-  psi_significant_drift: 0.25
-  # Kolmogorov-Smirnov test significance level
-  ks_significance: 0.05
-  # Model performance degradation threshold (fraction, e.g. 0.05 = 5%)
-  performance_degradation_pct: 0.05
-  # Minimum acceptable ROC-AUC before alerting
+  # Minimum acceptable ROC-AUC before alerting (monitor_model_performance.py)
   min_roc_auc: 0.85
 
 # ---------------------------------------------------------------------------
-# Evidently statistical test settings
+# Drift dataset generation (for testing the monitoring pipeline)
 # ---------------------------------------------------------------------------
-evidently:
-  drift_method: psi
-  drift_threshold: 0.1
-  stattest_threshold: 0.05
-  num_stattest: ks              # Statistical test for numerical features
-  cat_stattest: chisquare       # Statistical test for categorical features
-  baseline_samples: 5000
-  baseline_s3_prefix: "fraud-detection/baselines/"
-
-# ---------------------------------------------------------------------------
-# SNS alerting
-# ---------------------------------------------------------------------------
-sns:
-  topic_name: fraud-detection-drift-alerts
-  topic_arn: ""                  # Full SNS topic ARN (set after creation)
-
-# ---------------------------------------------------------------------------
-# EventBridge scheduling
-# ---------------------------------------------------------------------------
-eventbridge:
-  rule_name: fraud-detection-drift-check
-  schedule_expression: "cron(0 2 * * ? *)"  # Daily at 2 AM UTC
-  description: "Daily drift monitoring check"
-
-# ---------------------------------------------------------------------------
-# CloudWatch monitoring
-# ---------------------------------------------------------------------------
-cloudwatch:
-  # Dashboard configuration
-  dashboard_name: FraudDetection-DriftMonitoring
-  namespace: FraudDetection/DriftMonitoring
-
-  # Log groups
-  drift_lambda_log_group: /aws/lambda/fraud-detection-drift-monitor
-  monitoring_writer_log_group: /aws/lambda/fraud-monitoring-results-writer
-
-  # Alarm thresholds
-  data_drift_threshold: 0.2      # PSI threshold for data drift alarm
-  model_drift_threshold: 0.10    # Degradation % for model drift alarm
-  alarm_evaluation_periods: 1
-
-# ---------------------------------------------------------------------------
-# Monitoring runtime configuration
-# ---------------------------------------------------------------------------
-monitoring:
-  lookback_days: 30
-  min_samples_for_drift: 100
-  data_drift_lookback_days: 1    # Days of inference data to compare for data drift
-  model_drift_lookback_days: 1   # Days of inference data to compare for model drift
-
-# ---------------------------------------------------------------------------
-# Drift Generation Configuration
-# ---------------------------------------------------------------------------
-# These parameters control how drifted datasets are generated for testing.
-# Used by: generate_drift_dataset.py and generate_variable_drift_dataset.py
+# Used by src/drift_monitoring/generate_drift_dataset.py and
+# generate_variable_drift_dataset.py to fabricate drifted test datasets.
 #
-# FEATURE DRIFT PARAMETERS:
-# - type: "multiplicative" (value *= factor) or "additive" (value += shift)
-# - factor: Multiplier for multiplicative drift (1.0 = no change, 2.0 = double)
-# - shift: Amount to add for additive drift
-# - noise: Random variation around factor/shift
-#
+# Drift types:
+#   multiplicative: new_value = original × (factor ± noise × factor)
+#   additive:       new_value = original + (shift ± noise)
 drift_generation:
-  # Default drift dataset (generate_drift_dataset.py)
-  # Applies consistent drift to 5 key features
+  num_samples: 5000              # default_drift sample count
+  num_samples_per_run: 2000      # variable_patterns sample count per run
+  random_state: 123
+
+  # Default drift dataset: consistent drift across 5 key features
   default_drift:
     transaction_amount:
       type: "multiplicative"
-      factor: 1.1      # 10% increase (reduced from 1.4)
-      noise: 0.05      # ±5% random variation (reduced from 0.1)
-
+      factor: 1.1
+      noise: 0.05
     transaction_timestamp:
       type: "additive"
-      shift: 10000     # Shift time forward (reduced from 50000)
-      noise: 1000      # ±1000 random variation (reduced from 5000)
-
+      shift: 10000
+      noise: 1000
     distance_from_home_km:
       type: "multiplicative"
-      factor: 1.2      # 20% increase (reduced from 2.0)
-      noise: 0.1       # ±10% random variation (reduced from 0.3)
-
+      factor: 1.2
+      noise: 0.1
     velocity_score:
       type: "multiplicative"
-      factor: 1.15     # 15% increase (reduced from 1.5)
-      noise: 0.1       # ±10% random variation (reduced from 0.2)
-
+      factor: 1.15
+      noise: 0.1
     num_transactions_24h:
       type: "additive"
-      shift: 1         # Add 1 more transaction on average (reduced from 3)
-      noise: 0.5       # ±0.5 transaction variation (reduced from 1)
+      shift: 1
+      noise: 0.5
 
-  # Variable drift patterns (generate_variable_drift_dataset.py)
-  # Simulates 6 different time periods with unique drift characteristics
+  # Variable drift patterns: 6 datasets with distinct drift characteristics,
+  # representing different real-world drift scenarios over time.
   variable_patterns:
-    # Run 1: Baseline - Minimal drift (normal operations)
-    run1:
-      transaction_amount:
-        factor: 1.05
-        noise: 0.05
-      distance_from_home_km:
-        factor: 1.1
-        noise: 0.1
+    run1:  # Baseline: minimal drift
+      transaction_amount: { factor: 1.05, noise: 0.05 }
+      distance_from_home_km: { factor: 1.1, noise: 0.1 }
+    run2:  # Distance spike (travel/remote transactions)
+      transaction_amount: { factor: 1.1, noise: 0.1 }
+      distance_from_home_km: { factor: 3.5, noise: 0.5 }
+      velocity_score: { factor: 1.3, noise: 0.2 }
+      num_transactions_24h: { shift: 2, noise: 1 }
+    run3:  # Credit-limit anomaly (system / data-quality issue)
+      transaction_amount: { factor: 1.15, noise: 0.1 }
+      credit_limit: { factor: 8.0, noise: 2.0 }
+      distance_from_home_km: { factor: 2.0, noise: 0.3 }
+      merchant_category_code: { shift: 500, noise: 200 }
+    run4:  # High velocity period
+      transaction_amount: { factor: 1.4, noise: 0.2 }
+      velocity_score: { factor: 2.5, noise: 0.4 }
+      num_transactions_24h: { shift: 5, noise: 2 }
+      distance_from_home_km: { factor: 1.5, noise: 0.2 }
+      max_transaction_amount_30days: { factor: 1.6, noise: 0.3 }
+    run5:  # Recovery: returning to normal with residual drift
+      transaction_amount: { factor: 1.2, noise: 0.15 }
+      distance_from_home_km: { factor: 1.3, noise: 0.2 }
+      velocity_score: { factor: 1.2, noise: 0.15 }
+    run6:  # Account-age anomaly (new user cohort)
+      transaction_amount: { factor: 1.1, noise: 0.1 }
+      account_age_days: { factor: 0.3, noise: 0.1 }
+      distance_from_home_km: { factor: 1.4, noise: 0.2 }
+      customer_tenure_months: { factor: 0.4, noise: 0.15 }
 
-    # Run 2: Distance spike - Remote/travel transactions increase
-    run2:
-      transaction_amount:
-        factor: 1.1
-        noise: 0.1
-      distance_from_home_km:
-        factor: 3.5      # MAJOR SPIKE
-        noise: 0.5
-      velocity_score:
-        factor: 1.3
-        noise: 0.2
-      num_transactions_24h:
-        shift: 2
-        noise: 1
-
-    # Run 3: Credit limit anomaly - System changes or data quality issue
-    run3:
-      transaction_amount:
-        factor: 1.15
-        noise: 0.1
-      credit_limit:
-        factor: 8.0      # EXTREME SPIKE (creates PSI ~74)
-        noise: 2.0
-      distance_from_home_km:
-        factor: 2.0
-        noise: 0.3
-      merchant_category_code:
-        shift: 500
-        noise: 200
-
-    # Run 4: High velocity period - Increased transaction frequency
-    run4:
-      transaction_amount:
-        factor: 1.4
-        noise: 0.2
-      velocity_score:
-        factor: 2.5      # MAJOR SPIKE
-        noise: 0.4
-      num_transactions_24h:
-        shift: 5         # MAJOR SPIKE
-        noise: 2
-      distance_from_home_km:
-        factor: 1.5
-        noise: 0.2
-      max_transaction_amount_30days:
-        factor: 1.6
-        noise: 0.3
-
-    # Run 5: Recovery - Returning to normal with residual drift
-    run5:
-      transaction_amount:
-        factor: 1.2
-        noise: 0.15
-      distance_from_home_km:
-        factor: 1.3
-        noise: 0.2
-      velocity_score:
-        factor: 1.2
-        noise: 0.15
-
-    # Run 6: Account age anomaly - New user cohort or system change
-    run6:
-      transaction_amount:
-        factor: 1.1
-        noise: 0.1
-      account_age_days:
-        factor: 0.3      # Younger accounts
-        noise: 0.1
-      distance_from_home_km:
-        factor: 1.4
-        noise: 0.2
-      customer_tenure_months:
-        factor: 0.4
-        noise: 0.15
-
-  # Number of samples per dataset
-  num_samples: 5000
-  num_samples_per_run: 2000  # For variable drift runs
-  random_state: 123          # For reproducibility
+# QuickSight resource IDs and display names are defined directly in
+# src/governance/setup_quicksight_governance.py (no YAML duplication).
 
 # ---------------------------------------------------------------------------
-# Ground Truth Simulation (Development/Testing)
-# ---------------------------------------------------------------------------
-# These parameters control simulated drift for testing the monitoring system.
-# They affect the ground truth generation that validates predictions after delays.
-#
-# DRIFT SIMULATION SCENARIOS:
-# ---------------------------
-# 1. NO DRIFT (baseline):
-#    feature_drift_magnitude: 0.0, feature_drift_count: 0, model_drift_magnitude: 0.0
-#    → Model maintains 90% accuracy, no distribution changes detected
-#
-# 2. MILD FEATURE DRIFT:
-#    feature_drift_magnitude: 0.1, feature_drift_count: 2-4, feature_drift_impact: 0.05
-#    → 2-4 features drift slightly, accuracy drops ~5% → 85%
-#    → Monitoring detects moderate drift (PSI 0.1-0.25)
-#
-# 3. SEVERE FEATURE DRIFT:
-#    feature_drift_magnitude: 0.5, feature_drift_count: 8-10, feature_drift_impact: 0.15
-#    → Many features drift significantly, accuracy drops ~15% → 75%
-#    → Monitoring detects high drift (PSI > 0.25), triggers alerts
-#
-# 4. MODEL DEGRADATION (without feature drift):
-#    feature_drift_magnitude: 0.0, feature_drift_count: 0, model_drift_magnitude: 0.2
-#    → Features unchanged, but model accuracy drops 20% → 70%
-#    → Monitoring shows performance degradation but minimal feature drift
-#
-# 5. COMBINED DRIFT (realistic):
-#    feature_drift_magnitude: 0.2, feature_drift_count: 5, feature_drift_impact: 0.08
-#    model_drift_magnitude: 0.05
-#    → Both feature distributions and model degrade
-#    → Total accuracy drop: ~13% → 77%
-#
-# NOTE: For time-varying drift patterns (spikes, temporal changes), use:
-#       python src/drift_monitoring/generate_variable_drift_dataset.py
-#
-ground_truth_simulation:
-  # -------------------------------------------------------------------------
-  # Model Accuracy (Baseline)
-  # -------------------------------------------------------------------------
-  # Starting accuracy before any drift is applied
-  # Range: 0.0-1.0 (0.90 = 90% accurate predictions)
-  # Default: 0.90 (90% baseline accuracy)
-  #
-  # Modify to: 0.95 for higher baseline, 0.85 for lower baseline
-  default_accuracy: 0.95
-
-  # -------------------------------------------------------------------------
-  # Confirmation Timing (Days)
-  # -------------------------------------------------------------------------
-  # How many days after prediction does ground truth become available?
-  # Simulates real-world delay in fraud confirmation (chargebacks, investigations)
-  #
-  # Fraud cases: Confirmed quickly (urgent investigations)
-  fraud_confirmation_days_min: 1
-  fraud_confirmation_days_max: 7
-  #
-  # Non-fraud cases: Confirmed slowly (no urgency, passive monitoring)
-  non_fraud_confirmation_days_min: 1
-  non_fraud_confirmation_days_max: 30
-
-  # -------------------------------------------------------------------------
-  # Feature Drift Parameters
-  # -------------------------------------------------------------------------
-  # Controls how input feature distributions change over time, causing model
-  # performance degradation as the data diverges from training distribution.
-  #
-  # FEATURE DRIFT MAGNITUDE
-  # Range: 0.0-1.0 (0.0 = no drift, 1.0 = extreme drift)
-  # Default: 0.1 (10% drift - mild)
-  #
-  # How to modify:
-  # - 0.0: No feature drift (baseline test)
-  # - 0.1: Mild drift (5-10% distribution shift) - realistic
-  # - 0.3: Moderate drift (20-30% shift) - noticeable
-  # - 0.5: High drift (40-50% shift) - severe issue
-  # - 0.8+: Extreme drift (70%+ shift) - critical alert
-  #
-  # Example: Set to 0.3 to simulate post-COVID shopping behavior changes
-  feature_drift_magnitude: 0.0
-
-  # FEATURE DRIFT COUNT
-  # Range: 0-N (where N = total number of features)
-  # Default: 4 features
-  #
-  # How many features experience drift simultaneously?
-  # - 0: No features drift (baseline)
-  # - 1-3: Isolated feature issues (data quality, single source change)
-  # - 4-8: Multiple related features (business logic change, seasonal shift)
-  # - 10+: Widespread drift (major system change, new data pipeline)
-  #
-  # Example: Set to 1 with high magnitude (0.5) to simulate single feature anomaly
-  #          Set to 10 with low magnitude (0.1) to simulate gradual ecosystem drift
-  feature_drift_count: 0
-
-  # FEATURE DRIFT IMPACT
-  # Range: 0.0-1.0 (0.0 = no impact, 1.0 = complete failure)
-  # Default: 0.05 (5% accuracy reduction)
-  #
-  # How much does feature drift reduce model accuracy?
-  # - 0.0: Features drift but model is robust (well-generalized)
-  # - 0.05: Mild impact (5% accuracy drop) - model somewhat robust
-  # - 0.10: Moderate impact (10% drop) - model sensitive to drift
-  # - 0.20: High impact (20% drop) - model overfitted to training data
-  # - 0.50+: Severe impact (50%+ drop) - model completely unreliable
-  #
-  # Calculation: final_accuracy = default_accuracy - (feature_drift_impact × drift_factor)
-  #
-  # Example: feature_drift_magnitude=0.5, feature_drift_impact=0.10
-  #          → accuracy drops from 90% to ~85% (5% degradation)
-  feature_drift_impact: 0.0
-
-  # -------------------------------------------------------------------------
-  # Model Drift Parameters
-  # -------------------------------------------------------------------------
-  # Controls direct model performance degradation independent of feature drift.
-  # Simulates: concept drift, label shift, or model staleness.
-  #
-  # MODEL DRIFT MAGNITUDE
-  # Range: 0.0-1.0 (0.0 = no drift, 1.0 = complete failure)
-  # Default: 0.05 (5% direct accuracy reduction)
-  #
-  # How to modify:
-  # - 0.0: No model drift (model remains valid)
-  # - 0.05: Mild degradation (gradual staleness) - realistic
-  # - 0.10: Moderate degradation (concept drift emerging)
-  # - 0.20: Severe degradation (model outdated)
-  # - 0.50+: Critical failure (model unusable)
-  #
-  # Use case: Fraud patterns evolve but transaction features stay same
-  # Example: Set to 0.15 to simulate fraudsters adapting to detection
-  model_drift_magnitude: 0.0
-
-  # -------------------------------------------------------------------------
-  # Random Seed (Reproducibility)
-  # -------------------------------------------------------------------------
-  # Fixed seed ensures consistent simulation results across runs.
-  # Change this value to generate different random drift patterns.
-  #
-  # Default: 42 (Douglas Adams reference)
-  # Modify to: Any integer for different random patterns
-  random_seed: 10   ## MODIFY THIS TO GET MAX VARIANCE
-
-# ============================================================================
-# DRIFT TESTING EXAMPLES
-# ============================================================================
-#
-# SCENARIO 1: Test Baseline (No Drift)
-# ----------------------------------------------------------------------------
-# feature_drift_magnitude: 0.0
-# feature_drift_count: 0
-# model_drift_magnitude: 0.0
-# → Expected: 90% accuracy maintained, PSI < 0.1, no alerts
-#
-# SCENARIO 2: Gradual Feature Drift (Realistic)
-# ----------------------------------------------------------------------------
-# feature_drift_magnitude: 0.15
-# feature_drift_count: 5
-# feature_drift_impact: 0.08
-# model_drift_magnitude: 0.03
-# → Expected: ~82% accuracy, PSI 0.1-0.2, moderate drift detected
-#
-# SCENARIO 3: Sudden System Change (High Impact)
-# ----------------------------------------------------------------------------
-# feature_drift_magnitude: 0.4
-# feature_drift_count: 10
-# feature_drift_impact: 0.15
-# model_drift_magnitude: 0.10
-# → Expected: ~70% accuracy, PSI > 0.25, critical alerts
-#
-# SCENARIO 4: Single Feature Anomaly (Data Quality Issue)
-# ----------------------------------------------------------------------------
-# feature_drift_magnitude: 0.8
-# feature_drift_count: 1
-# feature_drift_impact: 0.10
-# → Expected: One feature shows extreme drift (credit_limit scenario)
-#
-# SCENARIO 5: Model Staleness (No Feature Drift)
-# ----------------------------------------------------------------------------
-# feature_drift_magnitude: 0.0
-# feature_drift_count: 0
-# model_drift_magnitude: 0.20
-# → Expected: 70% accuracy, but feature distributions unchanged
-#             Performance monitoring catches this, not drift detection
-#
-# ============================================================================
-# ADVANCED: Time-Varying Drift Patterns
-# ============================================================================
-# For temporal drift patterns (spikes, seasonal changes, gradual trends):
-#
-#   python src/drift_monitoring/generate_variable_drift_dataset.py
-#
-# This generates 6 datasets with different drift characteristics:
-# - Run 1: Baseline (minimal drift)
-# - Run 2: distance_from_home_km spike (+250%)
-# - Run 3: credit_limit anomaly (+700%)
-# - Run 4: velocity spike (+150%)
-# - Run 5: Recovery (gradual return to normal)
-# - Run 6: account_age shift (new user cohort)
-#
-# See: docs/guides/claude/VARIABLE_DRIFT_PATTERNS.md
-# ============================================================================
-
-# ---------------------------------------------------------------------------
-# QuickSight governance dashboard
-# ---------------------------------------------------------------------------
-quicksight:
-  # Resource IDs (must be unique within AWS account)
-  datasource_id: fraud-governance-athena-datasource
-  inference_dataset_id: fraud-governance-inference-dataset
-  drift_dataset_id: fraud-governance-drift-dataset
-  feature_drift_dataset_id: fraud-governance-feature-drift-dataset
-  analysis_id: fraud-governance-analysis
-  dashboard_id: fraud-governance-dashboard
-
-  # Display names
-  datasource_name: Fraud Governance - Athena
-  inference_dataset_name: Fraud Governance - Inference Monitoring
-  drift_dataset_name: Fraud Governance - Drift Monitoring
-  feature_drift_dataset_name: Fraud Governance - Feature Drift Analysis
-  analysis_name: Fraud Detection Governance Analysis
-  dashboard_name: Fraud Detection Governance
-
-  # QuickSight service role (for Lake Formation permissions)
-  service_role_name: aws-quicksight-service-role-v0
-
-# ---------------------------------------------------------------------------
-# SHAP Explainability Configuration
+# SHAP explainability
 # ---------------------------------------------------------------------------
 shap:
-  background_samples: 500           # Number of samples for SHAP baseline
-  max_display_features: 20          # Maximum features to display in plots
-  check_additivity: false           # Validate SHAP math (slower, for debugging)
-  random_state: 42                  # Seed for reproducible sampling
-  output_dir: "shap_output/"        # Directory for saving plots
+  background_samples: 500
+  max_display_features: 20
+  check_additivity: false
+  random_state: 42
+  output_dir: "shap_output/"

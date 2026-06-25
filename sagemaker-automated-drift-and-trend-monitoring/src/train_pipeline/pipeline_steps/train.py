@@ -212,7 +212,9 @@ def train_model(
     dtrain = xgb.DMatrix(X_train, label=y_train)
     dtest = xgb.DMatrix(X_test, label=y_test)
 
-    # Train model
+    # Train with early stopping — for severely imbalanced data the model
+    # otherwise drives train-auc to 1.0 while test-auc degrades. Early stopping
+    # halts training the moment the validation metric plateaus.
     evals = [(dtrain, 'train'), (dtest, 'test')]
     evals_result = {}
 
@@ -222,6 +224,7 @@ def train_model(
         num_boost_round=params.get('num_boost_round', 100),
         evals=evals,
         evals_result=evals_result,
+        early_stopping_rounds=params.get('early_stopping_rounds', 20),
         verbose_eval=10
     )
 
@@ -750,19 +753,23 @@ def main():
     parser.add_argument('--target-column', type=str, default='is_fraud',
                        help='Target column name')
 
-    # Model hyperparameters
-    parser.add_argument('--max-depth', type=int, default=6,
+    # Model hyperparameters — tuned for severe class imbalance (~580:1).
+    # Shallower trees + larger min_child_weight prevent the small positive
+    # class (≈394 rows) from being memorized.
+    parser.add_argument('--max-depth', type=int, default=4,
                        help='Maximum tree depth')
-    parser.add_argument('--learning-rate', type=float, default=0.1,
+    parser.add_argument('--learning-rate', type=float, default=0.05,
                        help='Learning rate')
-    parser.add_argument('--num-boost-round', type=int, default=100,
-                       help='Number of boosting rounds')
-    parser.add_argument('--min-child-weight', type=int, default=1,
-                       help='Minimum child weight')
+    parser.add_argument('--num-boost-round', type=int, default=200,
+                       help='Maximum boosting rounds (early stopping may halt sooner)')
+    parser.add_argument('--min-child-weight', type=int, default=10,
+                       help='Minimum sum of instance weights in a child')
     parser.add_argument('--subsample', type=float, default=0.8,
                        help='Subsample ratio')
     parser.add_argument('--colsample-bytree', type=float, default=0.8,
                        help='Column sample ratio')
+    parser.add_argument('--early-stopping-rounds', type=int, default=20,
+                       help='Stop training if validation auc has not improved for N rounds')
 
     # Output arguments
     parser.add_argument('--model-dir', type=str, default='/opt/ml/model',
@@ -800,6 +807,7 @@ def main():
             'colsample_bytree': args.colsample_bytree,
             'scale_pos_weight': scale_pos_weight,
             'num_boost_round': args.num_boost_round,
+            'early_stopping_rounds': args.early_stopping_rounds,
         }
 
         # Step 4: Train model
