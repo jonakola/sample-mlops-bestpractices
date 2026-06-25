@@ -1178,6 +1178,10 @@ Resources:
         Fn::Base64:
           Fn::Sub: |
             #!/bin/bash
+            # CloudFormation owns infrastructure setup: clone repo, write .env,
+            # create the Athena database and all 6 Iceberg tables (empty).
+            # The training notebook (1_training_pipeline.ipynb) populates the
+            # training_data table — see data/download_kaggle_dataset.py.
             set -x
             sleep 10
             cd /home/sagemaker-user || exit 1
@@ -1185,38 +1189,11 @@ Resources:
               git clone ${GitHubRepo} || exit 1
             else
               # Existing clone — pull latest so stack updates pick up new code.
-              # --ff-only keeps user's uncommitted edits safe; conflicts skip the pull.
+              # --ff-only keeps the user's uncommitted edits safe.
               (cd sample-mlops-bestpractices && git fetch origin && git pull --ff-only) \
                 || echo "git pull --ff-only failed; keeping current local state."
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
-
-            D="${ProjectName}-data-${AWS::AccountId}"
-            P="fraud-detection/data"
-            if ! aws s3 ls "s3://$D/$P/predictions/data.csv" 2>/dev/null; then
-              pip install python-dotenv pyyaml
-              if aws s3 ls "s3://$D/$P/creditcard_predictions_final.csv" 2>/dev/null; then
-                aws s3 cp "s3://$D/$P/creditcard_predictions_final.csv" data/p.csv
-              else
-                pip install kagglehub
-                python data/download_kaggle_dataset.py
-                cp data/creditcard_predictions_final.csv data/p.csv
-                aws s3 cp data/p.csv "s3://$D/$P/creditcard_predictions_final.csv"
-              fi
-              if aws s3 ls "s3://$D/$P/creditcard_ground_truth.csv" 2>/dev/null; then
-                aws s3 cp "s3://$D/$P/creditcard_ground_truth.csv" data/g.csv
-                aws s3 cp "s3://$D/$P/creditcard_drifted.csv" data/d.csv
-              else
-                python data/generate_datasets.py
-                mv data/generated_creditcard_drifted.csv data/d.csv
-                mv data/generated_creditcard_ground_truth.csv data/g.csv
-                aws s3 cp data/g.csv "s3://$D/$P/creditcard_ground_truth.csv"
-                aws s3 cp data/d.csv "s3://$D/$P/creditcard_drifted.csv"
-              fi
-              aws s3 cp data/p.csv "s3://$D/$P/predictions/data.csv"
-              aws s3 cp data/g.csv "s3://$D/$P/ground_truth/data.csv"
-              aws s3 cp data/d.csv "s3://$D/$P/drifted/data.csv"
-            fi
 
             cat > .env << 'EOF'
             AWS_DEFAULT_REGION=${AWS::Region}
@@ -1226,10 +1203,11 @@ Resources:
             DATA_S3_BUCKET=${ProjectName}-data-${AWS::AccountId}
             PROJECT_NAME=${ProjectName}
             EOF
-
             chown sagemaker-user:sagemaker-user .env
             chmod 600 .env
 
+            # Create Athena database + all 6 Iceberg tables (empty).
+            # `IF NOT EXISTS` makes this safe to re-run on every Space launch.
             python3 << 'CREATEEOF'
             import boto3, time
 
@@ -1259,17 +1237,6 @@ Resources:
 
             run_query(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
 
-            ALL_TABLES = ("training_data", "ground_truth", "inference_responses",
-                          "drifted_data", "ground_truth_updates", "monitoring_responses")
-            for t in ALL_TABLES:
-                run_query(f"DROP TABLE IF EXISTS {DATABASE}.{t}")
-            glue = boto3.client("glue")
-            for t in ALL_TABLES:
-                try:
-                    glue.delete_table(DatabaseName=DATABASE, Name=t)
-                except glue.exceptions.EntityNotFoundException:
-                    pass
-
             TF = ("transaction_timestamp transaction_hour transaction_day_of_week transaction_amount "
                   "transaction_type_code customer_age customer_gender customer_tenure_months "
                   "account_age_days distance_from_home_km distance_from_last_transaction_km "
@@ -1281,6 +1248,40 @@ Resources:
                   "available_credit_ratio").split()
             FEAT = ", ".join(c + (" STRING" if c == "customer_gender" else " DOUBLE") for c in TF)
 
+            # Table inventory (4 active + 2 reserved for future work):
+            #
+            #   ACTIVE
+            #   - training_data        Model training features + label.
+            #                          Populated by notebooks/1_training_pipeline.ipynb
+            #                          (data/download_kaggle_dataset.py → S3 → Athena seed).
+            #                          Read by the preprocessing pipeline step.
+            #   - inference_responses  Every endpoint prediction logged async via
+            #                          SQS → Lambda. The `ground_truth` column starts
+            #                          NULL and is filled by the MERGE from
+            #                          ground_truth_updates. Read by monitoring +
+            #                          governance dashboards.
+            #   - ground_truth_updates Lightweight patches (inference_id + actual_fraud
+            #                          + confirmation metadata) produced by the fraud
+            #                          investigation system (simulated in dev by
+            #                          simulate_ground_truth_from_athena.py). Consumed
+            #                          by update_ground_truth.py MERGE.
+            #   - monitoring_responses Output of each drift-monitoring run (PSI, KS,
+            #                          ROC-AUC, drift flags). Written by the drift
+            #                          Lambda via SQS; read by the QuickSight
+            #                          governance dashboard.
+            #
+            #   RESERVED (created so the schema is ready when needed; no SQL today)
+            #   - ground_truth         Full-feature labeled rows for a future batch
+            #                          retraining workflow. Distinct from
+            #                          ground_truth_updates: that table only patches
+            #                          one column in inference_responses; this one
+            #                          would hold complete feature vectors needed to
+            #                          retrain the model.
+            #   - drifted_data         Storage slot for drift-test datasets generated
+            #                          by drift_monitoring/generate_drift_dataset.py.
+            #                          The generator currently writes local CSVs only;
+            #                          Athena-loaded drift testing would consume from
+            #                          here.
             TABLES = {
                 "training_data": f"""
             CREATE TABLE IF NOT EXISTS {DATABASE}.training_data (
@@ -1293,6 +1294,8 @@ Resources:
             TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
             """,
 
+                # RESERVED: future batch retraining (full feature rows + confirmed
+                # labels). Not currently queried — see comment above.
                 "ground_truth": f"""
             CREATE TABLE IF NOT EXISTS {DATABASE}.ground_truth (
                 transaction_id STRING, prediction_timestamp TIMESTAMP, window_id INT,
@@ -1322,6 +1325,9 @@ Resources:
             TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
             """,
 
+                # RESERVED: storage for drift-test datasets generated by
+                # drift_monitoring/generate_drift_dataset.py. Generator writes
+                # local CSVs only today — see comment above.
                 "drifted_data": f"""
             CREATE EXTERNAL TABLE IF NOT EXISTS {DATABASE}.drifted_data (
                 transaction_id STRING,
@@ -1369,58 +1375,15 @@ Resources:
             }
 
             success_count = 0
-            for table_name, ddl in TABLES.items():
+            for name, ddl in TABLES.items():
                 if run_query(ddl):
                     success_count += 1
-
-            print(f"Created {success_count}/{len(TABLES)} tables")
+            print(f"Created {success_count}/{len(TABLES)} Athena tables (empty).")
             if success_count < len(TABLES):
                 raise SystemExit(1)
-
-            DATA_LOC = f"s3://{BUCKET}/{PREFIX}/data"
-            CF = ("transaction_hour transaction_day_of_week customer_age account_age_days "
-                  "merchant_category_code distance_from_home_km distance_from_last_transaction_km "
-                  "online_transaction chip_transaction pin_used recurring_transaction "
-                  "international_transaction high_risk_country num_transactions_24h "
-                  "num_transactions_7days avg_transaction_amount_30days max_transaction_amount_30days "
-                  "card_present address_verification_match cvv_match velocity_score "
-                  "merchant_reputation_score time_since_last_transaction_min transaction_type_code "
-                  "customer_tenure_months credit_limit available_credit_ratio previous_fraud_incidents").split()
-            FEAT_SEL = ", ".join(c if c == "customer_gender" else f"CAST({c} AS DOUBLE) AS {c}" for c in TF)
-            FEAT_SEL_GT = ", ".join(
-                "CAST(NULL AS VARCHAR) AS customer_gender" if c == "customer_gender"
-                else f"CAST({c} AS DOUBLE) AS {c}" for c in TF)
-            def b(c): return f"CAST(lower({c}) AS BOOLEAN)"
-            PRED = ["transaction_id", "transaction_timestamp"] + CF + ["transaction_amount", "fraud_prediction", "fraud_probability", "customer_gender", "is_fraud"]
-            GT = ["transaction_id", "prediction_timestamp", "window_id", "transaction_timestamp"] + CF + ["transaction_amount", "ground_truth_fraud", "observed_fraud", "fraud_probability"]
-
-            def seed(tmp, cols, subdir, insert_sql):
-                run_query(f"DROP TABLE IF EXISTS {DATABASE}.{tmp}")
-                run_query(f"CREATE EXTERNAL TABLE {DATABASE}.{tmp} ("
-                          + ", ".join(f"{c} STRING" for c in cols) + ") "
-                          "ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde' "
-                          f"LOCATION '{DATA_LOC}/{subdir}/' "
-                          "TBLPROPERTIES ('skip.header.line.count'='1')")
-                run_query(insert_sql)
-                run_query(f"DROP TABLE IF EXISTS {DATABASE}.{tmp}")
-
-            seed("tmp_pred", PRED, "predictions", f"""
-            INSERT INTO {DATABASE}.training_data SELECT transaction_id, {FEAT_SEL},
-              {b('fraud_prediction')}, CAST(fraud_probability AS DOUBLE),
-              {b('is_fraud')}, 'v1', current_timestamp, current_timestamp
-            FROM {DATABASE}.tmp_pred""")
-            seed("tmp_drift", PRED, "drifted", f"""
-            INSERT INTO {DATABASE}.drifted_data SELECT transaction_id, {FEAT_SEL},
-              {b('is_fraud')} FROM {DATABASE}.tmp_drift""")
-            seed("tmp_gt", GT, "ground_truth", f"""
-            INSERT INTO {DATABASE}.ground_truth SELECT transaction_id,
-              CAST(prediction_timestamp AS TIMESTAMP), CAST(window_id AS INT), {FEAT_SEL_GT},
-              {b('ground_truth_fraud')}, {b('observed_fraud')},
-              CAST(fraud_probability AS DOUBLE), 'csv_seed', current_timestamp, 'batch_v1'
-            FROM {DATABASE}.tmp_gt""")
             CREATEEOF
 
-            echo "Setup complete! .env created with MLflow/S3/SageMaker config."
+            echo "Setup complete. Open notebooks/1_training_pipeline.ipynb to load Kaggle data into training_data."
             exit 0
       Tags:
         - Key: Name
