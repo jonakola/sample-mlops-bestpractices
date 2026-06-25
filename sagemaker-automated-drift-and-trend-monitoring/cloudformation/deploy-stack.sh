@@ -59,7 +59,14 @@ if [ "$ACTION" = "update" ]; then
     --query 'Stacks[0].Parameters[].ParameterKey' --output text)"
   PARAM_ARGS=""
   for k in $PARAM_KEYS; do
-    PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,UsePreviousValue=true"
+    # Auto-increment LifecycleConfigVersion with timestamp to force replacement
+    if [ "$k" = "LifecycleConfigVersion" ]; then
+      NEW_VERSION="v$(date +%s)"
+      PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,ParameterValue=$NEW_VERSION"
+      echo "Auto-incrementing LifecycleConfigVersion to: $NEW_VERSION"
+    else
+      PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,UsePreviousValue=true"
+    fi
   done
 
   set +e
