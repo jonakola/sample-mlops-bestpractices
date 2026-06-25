@@ -1181,7 +1181,7 @@ Resources:
             # CloudFormation owns infrastructure setup: clone repo, write .env,
             # create the Athena database and all 6 Iceberg tables (empty).
             # The training notebook (1_training_pipeline.ipynb) populates the
-            # training_data table — see data/download_kaggle_dataset.py.
+            # training_data table — see src/setup/download_kaggle_dataset.py.
             set -x
             sleep 10
             cd /home/sagemaker-user || exit 1
@@ -1253,7 +1253,7 @@ Resources:
             #   ACTIVE
             #   - training_data        Model training features + label.
             #                          Populated by notebooks/1_training_pipeline.ipynb
-            #                          (data/download_kaggle_dataset.py → S3 → Athena seed).
+            #                          (src/setup/download_kaggle_dataset.py → S3 → Athena seed).
             #                          Read by the preprocessing pipeline step.
             #   - inference_responses  Every endpoint prediction logged async via
             #                          SQS → Lambda. The `ground_truth` column starts

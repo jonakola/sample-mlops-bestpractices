@@ -199,7 +199,7 @@ The lifecycle script downloads training data, uploads to S3, and creates Athena 
 cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
 source .env
 pip install -e .
-python data/download_kaggle_dataset.py
+python -m src.setup.download_kaggle_dataset
 python -m src.setup.upload_data_to_s3
 python -m src.setup.setup_athena_tables
 ```
