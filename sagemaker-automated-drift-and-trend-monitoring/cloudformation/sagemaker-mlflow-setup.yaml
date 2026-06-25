@@ -34,6 +34,11 @@ Parameters:
     Default: 'https://github.com/aws-samples/sample-mlops-bestpractices.git'
     Description: GitHub repository URL to clone
 
+  LifecycleConfigVersion:
+    Type: String
+    Default: 'v21'
+    Description: 'Version suffix for lifecycle config and space names (change to trigger replacement)'
+
   UseExistingBucket:
     Type: String
     Default: 'false'
@@ -648,7 +653,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt AppCleanupFunction.Arn
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-space-v20'
+      SpaceName: !Sub '${ProjectName}-space-${LifecycleConfigVersion}'
       UserProfileName: !Ref UserProfileName
 
   # ====================================================================
@@ -1167,7 +1172,7 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-v20'
+      StudioLifecycleConfigName: !Sub '${ProjectName}-setup-script-${LifecycleConfigVersion}'
       StudioLifecycleConfigAppType: JupyterLab
       StudioLifecycleConfigContent:
         Fn::Base64:
@@ -1434,7 +1439,7 @@ Resources:
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
-      SpaceName: !Sub '${ProjectName}-space-v20'
+      SpaceName: !Sub '${ProjectName}-space-${LifecycleConfigVersion}'
       OwnershipSettings:
         OwnerUserProfileName: !Ref UserProfileName
       SpaceSettings:
@@ -1612,7 +1617,7 @@ Outputs:
 
   JupyterSpaceName:
     Description: JupyterLab Space Name
-    Value: !Sub '${ProjectName}-space-v20'
+    Value: !Sub '${ProjectName}-space-${LifecycleConfigVersion}'
     Export:
       Name: !Sub '${AWS::StackName}-JupyterSpaceName'
 
@@ -1664,12 +1669,15 @@ Outputs:
     Value: !Sub |
       Stack created successfully!
 
-      1. Navigate to SageMaker Console: https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/domains
-      2. Click on Domain: ${ProjectName}-domain
-      3. Select User Profile: ${UserProfileName}
-      4. Go to Spaces and open: ${ProjectName}-space-v20
-      5. Click "Run Space" to start JupyterLab
-      6. Once JupyterLab loads, check CLOUDFORMATION_SETUP_COMPLETE.md for next steps
+      1. Get the Space Name from CloudFormation outputs:
+         aws cloudformation describe-stacks --stack-name ${AWS::StackName} --query 'Stacks[0].Outputs[?OutputKey==`JupyterSpaceName`].OutputValue' --output text --region ${AWS::Region}
+
+      2. Navigate to SageMaker Console: https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/domains
+      3. Click on Domain: ${ProjectName}-domain
+      4. Select User Profile: ${UserProfileName}
+      5. Go to Spaces and open the space from step 1
+      6. Click "Run Space" to start JupyterLab
+      7. Once JupyterLab loads, check CLOUDFORMATION_SETUP_COMPLETE.md for next steps
 
       Get MLflow UI URL:
       aws sagemaker describe-mlflow-tracking-server --tracking-server-name ${ProjectName}-mlflow --query TrackingServerUrl --output text --region ${AWS::Region}
