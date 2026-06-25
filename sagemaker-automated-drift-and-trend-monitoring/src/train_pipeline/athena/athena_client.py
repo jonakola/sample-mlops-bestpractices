@@ -1,34 +1,21 @@
 """
-⚠️ DEPRECATED: This file uses awswrangler (pandas-based).
+Athena client wrapper (awswrangler / pandas).
 
-**Replacement:** Use `athena_client_pyspark.py` for distributed processing.
+Use this client for small-to-medium queries (monitoring, ground-truth simulation,
+version validation, ad-hoc analytics — typically <1M rows). For distributed
+bulk reads/exports at scale, use `athena_client_pyspark.AthenaClientPySpark`
+(currently used by batch_transform.py).
 
-Athena client wrapper for fraud detection pipeline.
+Both clients coexist by design — pick the right tool for the workload size.
 
-Provides simplified interface for:
+Provides:
 - Reading tables as pandas DataFrames
 - Writing DataFrames to Iceberg tables
 - Executing SQL queries
 - Table information and metadata
-
-**Migration:**
-- For large datasets (>1M rows): Use AthenaClientPySpark
-- For small queries (<10K rows): Can continue using this (monitoring use case)
-- For new development: Always use PySpark version
-
-**Deprecated:** February 2026 - PySpark migration
 """
 
 import logging
-import warnings
-
-# Show deprecation warning on import
-warnings.warn(
-    "AthenaClient (awswrangler-based) is deprecated. "
-    "Use AthenaClientPySpark from athena_client_pyspark.py for distributed processing.",
-    DeprecationWarning,
-    stacklevel=2
-)
 from typing import Optional, Dict, Any, List
 import numpy as np
 import pandas as pd

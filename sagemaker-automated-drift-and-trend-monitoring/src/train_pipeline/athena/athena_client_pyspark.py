@@ -1,14 +1,14 @@
 """
 PySpark-based Athena client for fraud detection pipeline.
 
-Drop-in replacement for athena_client.py with PySpark backend.
-Provides distributed data processing for scalable operations.
+Use this client for distributed reads/exports at scale — currently
+batch_transform.py uses it for bulk endpoint scoring. For small queries
+(<1M rows: monitoring, ground truth simulation, validation, ad-hoc analytics)
+use the pandas-based `athena_client.AthenaClient` instead. Both clients
+coexist by design; pick by workload size.
 
-Key Differences from awswrangler version:
-- Returns Spark DataFrames instead of pandas DataFrames
-- Operations are lazy (use .collect() or actions to execute)
-- Supports distributed processing for large datasets
-- Uses AWS Glue Data Catalog as Hive metastore
+Returns Spark DataFrames (lazy — call .collect() or .toPandas() to execute).
+Uses AWS Glue Data Catalog as the Hive metastore.
 
 Usage:
     >>> from src.train_pipeline.athena.athena_client_pyspark import AthenaClientPySpark

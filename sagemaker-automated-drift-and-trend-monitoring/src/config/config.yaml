@@ -55,8 +55,8 @@ athena:
   ground_truth_table: ground_truth
   ground_truth_updates_table: ground_truth_updates
   drifted_data_table: drifted_data
-  # monitoring_responses_table is hardcoded in lambda_monitoring_writer.py and
-  # deploy_monitoring_writer.py (override via MONITORING_TABLE_NAME env var).
+  # monitoring_responses_table is hardcoded in deploy_monitoring_writer.py
+  # (inline Lambda code, override via MONITORING_TABLE_NAME env var).
 
 # ---------------------------------------------------------------------------
 # S3 storage
