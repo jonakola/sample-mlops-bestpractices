@@ -9,15 +9,15 @@
 # Usage:
 #   ./cloudformation/deploy-stack.sh                       # default: fraud-detection-monitoring in us-west-2
 #   ./cloudformation/deploy-stack.sh my-other-stack        # override stack name positionally
-#   ./cloudformation/deploy-stack.sh --drop-database       # DROP fraud_detection + clear table S3 prefixes
-#                                                          # on every Space launch until you re-deploy
-#                                                          # WITHOUT the flag.
+#   ./cloudformation/deploy-stack.sh --drop-database       # one-shot wipe of the fraud_detection database
+#                                                          # + all 7 table S3 prefixes BEFORE the CFN deploy
+#                                                          # runs. Tables get recreated empty by the
+#                                                          # lifecycle script on next Space launch.
 #   AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh  # override region via env var
 #   TEMPLATE=path/to/other.yaml ./cloudformation/deploy-stack.sh
 #
-# --drop-database is destructive on every Space launch while it's set.
-# After running with the flag once, re-deploy WITHOUT it to flip the
-# template parameter back to false.
+# --drop-database is destructive but ONE-SHOT: it fires once at deploy time and
+# does NOT persist as stack state. Subsequent Space restarts won't wipe data.
 #
 set -euo pipefail
 
@@ -47,15 +47,66 @@ ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 S3_BUCKET="${S3_BUCKET:-cfn-deploy-${ACCOUNT_ID}-${REGION}}"
 TEMPLATE_KEY="$(basename "$TEMPLATE").$(date +%s)"
 
+# These must match the CFN ProjectName param default and the lifecycle script's
+# DATABASE/PREFIX constants. Keep in sync.
+PROJECT_NAME="${PROJECT_NAME:-fraud-detection-monitoring}"
+DATA_BUCKET="${PROJECT_NAME}-data-${ACCOUNT_ID}"
+ATHENA_DATABASE="fraud_detection"
+S3_TABLE_PREFIX="fraud-detection"
+RESETTABLE_TABLES=(
+  training_data evaluation_data inference_responses
+  ground_truth ground_truth_updates monitoring_responses drifted_data
+)
+
 echo "=== Deploy CloudFormation Stack ==="
 echo "Stack:    $STACK_NAME"
 echo "Region:   $REGION"
 echo "Template: $TEMPLATE"
 echo "S3 stage: s3://$S3_BUCKET/$TEMPLATE_KEY"
 if [ "$DROP_DATABASE" = "true" ]; then
-  echo "Drop database: ENABLED — database + table S3 prefixes will be wiped on every Space launch until re-deployed without the flag"
+  echo "Drop database: ENABLED — one-shot wipe will run BEFORE the CFN deploy"
 fi
 echo ""
+
+# ----------------------------------------------------------------------------
+# Pre-deploy: one-shot DROP DATABASE + clear table S3 prefixes if requested.
+# Runs ONLY when --drop-database was passed on the command line; nothing in
+# the CFN template carries this flag forward, so subsequent Space restarts
+# never wipe data.
+# ----------------------------------------------------------------------------
+if [ "$DROP_DATABASE" = "true" ]; then
+  echo "=== Pre-deploy: DROP DATABASE $ATHENA_DATABASE CASCADE ==="
+  if aws s3api head-bucket --bucket "$DATA_BUCKET" --region "$REGION" >/dev/null 2>&1; then
+    OUTPUT_LOC="s3://${DATA_BUCKET}/athena-results/"
+    echo "Dropping Athena database (CASCADE drops all tables in catalog)..."
+    QID=$(aws athena start-query-execution \
+      --query-string "DROP DATABASE IF EXISTS ${ATHENA_DATABASE} CASCADE" \
+      --result-configuration "OutputLocation=${OUTPUT_LOC}" \
+      --region "$REGION" \
+      --query 'QueryExecutionId' --output text)
+    for _ in $(seq 1 60); do
+      STATE=$(aws athena get-query-execution --query-execution-id "$QID" --region "$REGION" --query 'QueryExecution.Status.State' --output text)
+      case "$STATE" in
+        SUCCEEDED) echo "  ✓ Database dropped"; break ;;
+        FAILED|CANCELLED)
+          REASON=$(aws athena get-query-execution --query-execution-id "$QID" --region "$REGION" --query 'QueryExecution.Status.StateChangeReason' --output text)
+          echo "  ⚠ DROP DATABASE $STATE: $REASON"; break ;;
+        *) sleep 2 ;;
+      esac
+    done
+
+    echo "Clearing 7 table S3 prefixes under s3://${DATA_BUCKET}/${S3_TABLE_PREFIX}/ ..."
+    for TBL in "${RESETTABLE_TABLES[@]}"; do
+      PREFIX="${S3_TABLE_PREFIX}/${TBL}/"
+      COUNT=$(aws s3 rm "s3://${DATA_BUCKET}/${PREFIX}" --recursive --region "$REGION" --only-show-errors 2>&1 | wc -l | tr -d ' ')
+      echo "  ✓ Cleared ${PREFIX}"
+    done
+    echo ""
+  else
+    echo "Data bucket ${DATA_BUCKET} not found — skipping drop (first deploy?)"
+    echo ""
+  fi
+fi
 
 if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
   ACTION="update"
@@ -86,7 +137,6 @@ if [ "$ACTION" = "update" ]; then
   PARAM_KEYS="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
     --query 'Stacks[0].Parameters[].ParameterKey' --output text)"
   PARAM_ARGS=""
-  HAS_DROP_DATABASE=false
   for k in $PARAM_KEYS; do
     # Auto-increment LifecycleConfigVersion with timestamp to force replacement
     if [ "$k" = "LifecycleConfigVersion" ]; then
@@ -94,19 +144,13 @@ if [ "$ACTION" = "update" ]; then
       PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,ParameterValue=$NEW_VERSION"
       echo "Auto-incrementing LifecycleConfigVersion to: $NEW_VERSION"
     elif [ "$k" = "DropDatabase" ]; then
-      # Always override DropDatabase with the flag value so the param flips
-      # back to "false" on a normal deploy after a one-time reset.
-      PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,ParameterValue=$DROP_DATABASE"
-      HAS_DROP_DATABASE=true
+      # Legacy parameter from earlier versions of the template — silently
+      # drop it. The drop logic now lives in this script's pre-deploy step.
+      :
     else
       PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,UsePreviousValue=true"
     fi
   done
-  # First deploy that introduces DropDatabase: the param didn't exist on the
-  # previous stack, so the for-loop above won't have set it. Add explicitly.
-  if [ "$HAS_DROP_DATABASE" = "false" ]; then
-    PARAM_ARGS="$PARAM_ARGS ParameterKey=DropDatabase,ParameterValue=$DROP_DATABASE"
-  fi
 
   set +e
   OUT="$(aws cloudformation update-stack \
@@ -134,8 +178,7 @@ else
     --region "$REGION" \
     --template-url "$TEMPLATE_URL" \
     --capabilities CAPABILITY_NAMED_IAM \
-    --on-failure ROLLBACK \
-    --parameters ParameterKey=DropDatabase,ParameterValue=$DROP_DATABASE
+    --on-failure ROLLBACK
   echo "Waiting for create to complete..."
   aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME" --region "$REGION"
 fi

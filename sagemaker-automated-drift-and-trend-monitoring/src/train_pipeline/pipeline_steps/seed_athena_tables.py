@@ -44,8 +44,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# Column order must match download_kaggle_dataset.CSV_COLUMN_ORDER and the
-# Iceberg tables created by the CloudFormation lifecycle.
+# NOTE: Column order is duplicated here because this script ships standalone
+# into the SageMaker ScriptProcessor container — src/setup is not on
+# PYTHONPATH there, so we cannot import. KEEP THESE TWO LISTS IN SYNC WITH
+# src/setup/download_kaggle_dataset.py:
+#   - CSV_COLUMN_ORDER   <-> download_kaggle_dataset.CSV_COLUMN_ORDER
+#   - ATHENA_COLUMN_ORDER must also match the Iceberg DDL in
+#     cloudformation/sagemaker-mlflow-setup.yaml.
+
+# Order of columns the staging external table declares. MUST match exactly the
+# header order in data/creditcard_predictions_final.csv that
+# download_kaggle_dataset.py writes (column names bind to CSV positions in
+# the order declared).
+CSV_COLUMN_ORDER = [
+    "transaction_id", "transaction_timestamp",
+    "transaction_hour", "transaction_day_of_week", "customer_age",
+    "account_age_days", "merchant_category_code", "distance_from_home_km",
+    "distance_from_last_transaction_km", "online_transaction",
+    "chip_transaction", "pin_used", "recurring_transaction",
+    "international_transaction", "high_risk_country", "num_transactions_24h",
+    "num_transactions_7days", "avg_transaction_amount_30days",
+    "max_transaction_amount_30days", "card_present",
+    "address_verification_match", "cvv_match", "velocity_score",
+    "merchant_reputation_score", "time_since_last_transaction_min",
+    "transaction_type_code", "customer_tenure_months", "credit_limit",
+    "available_credit_ratio", "previous_fraud_incidents",
+    "transaction_amount", "fraud_prediction", "fraud_probability",
+    "customer_gender", "is_fraud",
+]
+
+# Order of columns the INSERT projects into the Iceberg target. MUST match the
+# Iceberg DDL in cloudformation/sagemaker-mlflow-setup.yaml (excludes
+# transaction_id and the trailing fraud_prediction/fraud_probability/is_fraud,
+# which the seed script handles with explicit casts).
 ATHENA_COLUMN_ORDER = [
     "transaction_timestamp", "transaction_hour", "transaction_day_of_week",
     "transaction_amount", "transaction_type_code", "customer_age", "customer_gender",
@@ -58,21 +89,6 @@ ATHENA_COLUMN_ORDER = [
     "avg_transaction_amount_30days", "max_transaction_amount_30days",
     "velocity_score", "recurring_transaction", "previous_fraud_incidents",
     "credit_limit", "available_credit_ratio",
-]
-
-CSV_COLUMN_ORDER = [
-    "transaction_id", "transaction_timestamp", "transaction_hour",
-    "transaction_day_of_week", "transaction_amount", "transaction_type_code",
-    "customer_age", "customer_gender", "customer_tenure_months", "account_age_days",
-    "distance_from_home_km", "distance_from_last_transaction_km",
-    "time_since_last_transaction_min", "online_transaction", "international_transaction",
-    "high_risk_country", "merchant_category_code", "merchant_reputation_score",
-    "chip_transaction", "pin_used", "card_present", "cvv_match",
-    "address_verification_match", "num_transactions_24h", "num_transactions_7days",
-    "avg_transaction_amount_30days", "max_transaction_amount_30days",
-    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
-    "credit_limit", "available_credit_ratio", "fraud_prediction", "fraud_probability",
-    "is_fraud",
 ]
 
 # V14 (renamed num_transactions_24h) has a fraud-class mean around -7 on the

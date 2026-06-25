@@ -39,19 +39,6 @@ Parameters:
     Default: 'v21'
     Description: 'Version suffix for lifecycle config and space names (change to trigger replacement)'
 
-  DropDatabase:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: >-
-      When true, the lifecycle script DROPs the fraud_detection database
-      CASCADE and clears the 7 table S3 prefixes (training_data/,
-      evaluation_data/, inference_responses/, ground_truth/,
-      ground_truth_updates/, monitoring_responses/, drifted_data/) on every
-      Space launch before recreating tables from the current DDL. Defaults
-      to false. Set via `./deploy-stack.sh --drop-database` for the next
-      deploy, then DON'T pass the flag on subsequent deploys.
-
   UseExistingBucket:
     Type: String
     Default: 'false'
@@ -1219,12 +1206,10 @@ Resources:
             chown sagemaker-user:sagemaker-user .env
             chmod 600 .env
 
-            # Create Athena database + all 7 Iceberg tables (empty).
-            # `IF NOT EXISTS` makes this safe to re-run on every Space launch.
-            # When DropDatabase=true, the database is DROPped CASCADE and the
-            # 7 table S3 prefixes are cleared first so the new DDL takes effect.
-            # The flag is on every Space launch while it's set — flip it back
-            # to false on the next deploy when you don't want to wipe data.
+            # Create Athena database + all 7 Iceberg tables (empty, idempotent).
+            # For destructive resets (schema changes), use deploy-stack.sh
+            # --drop-database — that wipes the catalog and S3 prefixes ONCE,
+            # before this CFN update runs.
             python3 << 'CREATEEOF'
             import boto3, time
 
@@ -1232,18 +1217,8 @@ Resources:
             BUCKET = "${ProjectName}-data-${AWS::AccountId}"
             PREFIX = "fraud-detection"
             OUTPUT_S3 = f"s3://{BUCKET}/athena-results/"
-            DROP_DATABASE = "${DropDatabase}".lower() == "true"
-
-            # Tables whose S3 prefixes are cleared when DropDatabase=true.
-            # Must match the table names in the TABLES dict below.
-            RESETTABLE_TABLES = [
-                "training_data", "evaluation_data", "inference_responses",
-                "ground_truth", "ground_truth_updates", "monitoring_responses",
-                "drifted_data",
-            ]
 
             athena = boto3.client("athena")
-            s3 = boto3.client("s3")
 
             def run_query(sql):
                 qid = athena.start_query_execution(
@@ -1262,31 +1237,6 @@ Resources:
                 print("  Query timed out")
                 return False
 
-            def clear_s3_prefix(prefix):
-                """Delete every object under s3://{BUCKET}/{prefix}/. Returns count."""
-                paginator = s3.get_paginator("list_objects_v2")
-                deleted = 0
-                for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
-                    contents = page.get("Contents", [])
-                    if not contents:
-                        continue
-                    s3.delete_objects(
-                        Bucket=BUCKET,
-                        Delete={"Objects": [{"Key": o["Key"]} for o in contents]},
-                    )
-                    deleted += len(contents)
-                return deleted
-
-            if DROP_DATABASE:
-                print(f"DropDatabase=true — dropping database {DATABASE} and clearing 7 table prefixes")
-                run_query(f"DROP DATABASE IF EXISTS {DATABASE} CASCADE")
-                total_deleted = 0
-                for tbl in RESETTABLE_TABLES:
-                    n = clear_s3_prefix(f"{PREFIX}/{tbl}/")
-                    total_deleted += n
-                    print(f"  Cleared s3://{BUCKET}/{PREFIX}/{tbl}/  ({n} objects)")
-                print(f"  Cleared {total_deleted} objects across {len(RESETTABLE_TABLES)} table prefixes")
-
             run_query(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
 
             TF = ("transaction_timestamp transaction_hour transaction_day_of_week transaction_amount "
@@ -1300,48 +1250,7 @@ Resources:
                   "available_credit_ratio").split()
             FEAT = ", ".join(c + (" STRING" if c == "customer_gender" else " DOUBLE") for c in TF)
 
-            # Table inventory (5 active + 2 reserved for future work):
-            #
-            #   ACTIVE
-            #   - training_data        Model training features + label (80% split).
-            #                          Populated by the SeedAthenaTrainingData
-            #                          pipeline step from the predictions CSV in S3.
-            #                          Read by the preprocessing pipeline step
-            #                          (the `train` channel for ModelTrainer).
-            #   - evaluation_data      Held-out evaluation features + label (20% split).
-            #                          Same row schema as training_data and same
-            #                          deterministic hash split, so it is stable
-            #                          across model versions. Read by preprocessing
-            #                          for the `test` channel, by the evaluation
-            #                          step's quality gates, and by the drift
-            #                          Lambda as the data-drift baseline.
-            #   - inference_responses  Every endpoint prediction logged async via
-            #                          SQS → Lambda. The `ground_truth` column starts
-            #                          NULL and is filled by the MERGE from
-            #                          ground_truth_updates. Read by monitoring +
-            #                          governance dashboards.
-            #   - ground_truth_updates Lightweight patches (inference_id + actual_fraud
-            #                          + confirmation metadata) produced by the fraud
-            #                          investigation system (simulated in dev by
-            #                          simulate_ground_truth_from_athena.py). Consumed
-            #                          by update_ground_truth.py MERGE.
-            #   - monitoring_responses Output of each drift-monitoring run (PSI, KS,
-            #                          ROC-AUC, drift flags). Written by the drift
-            #                          Lambda via SQS; read by the QuickSight
-            #                          governance dashboard.
-            #
-            #   RESERVED (created so the schema is ready when needed; no SQL today)
-            #   - ground_truth         Full-feature labeled rows for a future batch
-            #                          retraining workflow. Distinct from
-            #                          ground_truth_updates: that table only patches
-            #                          one column in inference_responses; this one
-            #                          would hold complete feature vectors needed to
-            #                          retrain the model.
-            #   - drifted_data         Storage slot for drift-test datasets generated
-            #                          by drift_monitoring/generate_drift_dataset.py.
-            #                          The generator currently writes local CSVs only;
-            #                          Athena-loaded drift testing would consume from
-            #                          here.
+            # Table inventory (5 active + 2 reserved): see README "Athena Data Lake".
             TABLES = {
                 "training_data": f"""
             CREATE TABLE IF NOT EXISTS {DATABASE}.training_data (
@@ -1365,8 +1274,6 @@ Resources:
             TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
             """,
 
-                # RESERVED: future batch retraining (full feature rows + confirmed
-                # labels). Not currently queried — see comment above.
                 "ground_truth": f"""
             CREATE TABLE IF NOT EXISTS {DATABASE}.ground_truth (
                 transaction_id STRING, prediction_timestamp TIMESTAMP, window_id INT,
@@ -1396,9 +1303,6 @@ Resources:
             TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
             """,
 
-                # RESERVED: storage for drift-test datasets generated by
-                # drift_monitoring/generate_drift_dataset.py. Generator writes
-                # local CSVs only today — see comment above.
                 "drifted_data": f"""
             CREATE EXTERNAL TABLE IF NOT EXISTS {DATABASE}.drifted_data (
                 transaction_id STRING,
