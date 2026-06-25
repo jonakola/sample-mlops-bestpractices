@@ -99,8 +99,11 @@ INTEGRITY_THRESHOLD = -3.0
 # Deterministic hash-based 80/20 split on transaction_id. The same predicate
 # is used for both inserts so the partitioning is reproducible: re-running
 # the seed produces the same rows in each table.
-TRAIN_PREDICATE = "MOD(ABS(xxhash64(CAST(transaction_id AS VARBINARY))), 10) < 8"
-EVAL_PREDICATE = "MOD(ABS(xxhash64(CAST(transaction_id AS VARBINARY))), 10) >= 8"
+# xxhash64 returns VARBINARY (8 bytes); convert to BIGINT with
+# from_big_endian_64 before ABS/MOD or Athena errors with
+# "Unexpected parameters (varbinary) for function abs".
+TRAIN_PREDICATE = "MOD(ABS(from_big_endian_64(xxhash64(CAST(transaction_id AS VARBINARY)))), 10) < 8"
+EVAL_PREDICATE = "MOD(ABS(from_big_endian_64(xxhash64(CAST(transaction_id AS VARBINARY)))), 10) >= 8"
 
 
 class Config:
