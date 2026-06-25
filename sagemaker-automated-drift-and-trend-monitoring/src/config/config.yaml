@@ -134,7 +134,7 @@ data:
 # Training
 # ---------------------------------------------------------------------------
 # Target column, test split, and feature list are defined in
-# data/download_kaggle_dataset.py (the column-rename map) and the preprocessing
+# src/setup/download_kaggle_dataset.py (the column-rename map) and the preprocessing
 # step. Only XGBoost hyperparameters live here because they need to be
 # tunable without re-deriving the dataset.
 training:

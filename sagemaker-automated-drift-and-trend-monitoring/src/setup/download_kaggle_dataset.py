@@ -11,10 +11,10 @@ again.
 
 Usage:
     # Force a full refresh (download, upload, re-seed, verify)
-    python data/download_kaggle_dataset.py
+    python -m src.setup.download_kaggle_dataset
 
     # From the notebook (recommended):
-    from data.download_kaggle_dataset import ensure_training_data_ready
+    from src.setup.download_kaggle_dataset import ensure_training_data_ready
     ensure_training_data_ready()        # idempotent — skips work if data is healthy
     ensure_training_data_ready(force=True)  # always re-seed
 
@@ -35,7 +35,8 @@ import numpy as np
 import pandas as pd
 
 # Make `src.config.config` importable when this file is run as a script.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Layout: src/setup/download_kaggle_dataset.py — three parents to project root.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.config.config import (  # noqa: E402
@@ -56,8 +57,11 @@ if not logger.handlers:
 
 
 RANDOM_STATE = 42
-SCRIPT_DIR = Path(__file__).parent
-LOCAL_CSV = SCRIPT_DIR / "creditcard_predictions_final.csv"
+# Local CSV is written to the project's data/ scratch directory — the same
+# location used by the drift-dataset generators (data/creditcard_drifted.csv,
+# data/drifted_data_runN.csv) and read by notebook 2.
+_DATA_DIR = _PROJECT_ROOT / "data"
+LOCAL_CSV = _DATA_DIR / "creditcard_predictions_final.csv"
 
 GENDERS = ["Male", "Female", "Other"]
 GENDER_WEIGHTS = [0.45, 0.45, 0.10]

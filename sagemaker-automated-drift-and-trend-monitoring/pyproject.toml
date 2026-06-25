@@ -27,3 +27,12 @@ dependencies = [
     "ipykernel>=6.29.0",       # Jupyter kernel for notebook execution
     "kagglehub>=0.2.0",        # Download Kaggle datasets for training data
 ]
+
+# Explicitly point setuptools at `src/` (and all sub-packages it auto-discovers
+# inside it). Without this block, setuptools' auto-discovery refuses to pick a
+# layout when sibling directories like `notebooks/`, `scripts/`, `data/` exist
+# at the project root, and `pip install -e .` registers nothing — the
+# notebook's `import src.…` would then fail.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

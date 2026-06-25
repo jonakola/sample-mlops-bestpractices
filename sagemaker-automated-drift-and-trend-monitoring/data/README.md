@@ -10,8 +10,10 @@ pip install -e .   # installs kagglehub and other dependencies via pyproject.tom
 ```
 
 ```bash
-python data/download_kaggle_dataset.py
+python -m src.setup.download_kaggle_dataset
 ```
+
+(Or call `ensure_training_data_ready()` from `notebooks/1_training_pipeline.ipynb` Cell 4 — same effect, idempotent.)
 
 The training dataset (`creditcard_predictions_final.csv`) is downloaded from the real [Kaggle Credit Card Fraud Detection dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) and columns are renamed to match the project's business-friendly schema. This ensures the model can learn real fraud patterns and achieve strong ROC-AUC scores.
 
