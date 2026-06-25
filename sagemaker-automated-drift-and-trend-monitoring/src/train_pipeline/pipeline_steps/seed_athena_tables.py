@@ -1,177 +1,218 @@
 #!/usr/bin/env python3
 """
-Seed Athena training_data and evaluation_data tables with deterministic 80/20 split.
+Seed the Athena ``training_data`` and ``evaluation_data`` tables from the
+predictions CSV in S3.
 
-This is a one-time operation that runs as the first step in the training pipeline.
-If the tables are already populated, it skips the seeding (idempotent).
+This runs as the first step of the SageMaker training pipeline. The two
+tables are populated with a deterministic 80/20 split keyed on
+``transaction_id`` so the evaluation slice is stable across model versions
+— that stability is what makes ``evaluation_data`` a valid baseline for
+the drift monitor.
 
-Usage:
-    python -m src.train_pipeline.pipeline_steps.seed_athena_tables
+Both tables are idempotent — if both pass the integrity check, the step
+is a no-op.
 
-    # Or as part of SageMaker Pipeline processing step
+The CloudFormation lifecycle creates the empty Iceberg tables; this step
+fills them. The downstream preprocessing step reads training_data for
+the train channel and evaluation_data for the validation/test channel.
+
+Configuration is read from environment variables (set by the pipeline
+ProcessingStep) so this script has no dependency on src.config — it must
+run inside a vanilla SageMaker Processing container with only boto3.
+
+Required env vars:
+    AWS_DEFAULT_REGION
+    ATHENA_DATABASE
+    ATHENA_OUTPUT_S3        # s3://bucket/athena-results/
+    ATHENA_TRAINING_TABLE
+    ATHENA_EVALUATION_TABLE
+    DATA_S3_BUCKET
+    DATA_S3_PREFIX          # e.g. "fraud-detection/"
+
+Usage (local debug):
+    python -m src.train_pipeline.pipeline_steps.seed_athena_tables [--force]
 """
 
 import argparse
 import logging
-import sys
-from pathlib import Path
+import os
+import time
 
 import boto3
 
-# Make src.config importable
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-sys.path.insert(0, str(_PROJECT_ROOT))
-
-from src.config.config import (
-    ATHENA_DATABASE,
-    ATHENA_EVALUATION_TABLE,
-    ATHENA_OUTPUT_S3,
-    ATHENA_TRAINING_TABLE,
-    AWS_DEFAULT_REGION,
-    DATA_S3_BUCKET,
-    DATA_S3_PREFIX,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# Column order from download_kaggle_dataset.py
+# Column order must match download_kaggle_dataset.CSV_COLUMN_ORDER and the
+# Iceberg tables created by the CloudFormation lifecycle.
 ATHENA_COLUMN_ORDER = [
-    'transaction_timestamp', 'transaction_hour', 'transaction_day_of_week',
-    'transaction_amount', 'transaction_type_code', 'customer_age', 'customer_gender',
-    'customer_tenure_months', 'account_age_days', 'distance_from_home_km',
-    'distance_from_last_transaction_km', 'time_since_last_transaction_min',
-    'online_transaction', 'international_transaction', 'high_risk_country',
-    'merchant_category_code', 'merchant_reputation_score', 'chip_transaction',
-    'pin_used', 'card_present', 'cvv_match', 'address_verification_match',
-    'num_transactions_24h', 'num_transactions_7days',
-    'avg_transaction_amount_30days', 'max_transaction_amount_30days',
-    'velocity_score', 'recurring_transaction', 'previous_fraud_incidents',
-    'credit_limit', 'available_credit_ratio',
+    "transaction_timestamp", "transaction_hour", "transaction_day_of_week",
+    "transaction_amount", "transaction_type_code", "customer_age", "customer_gender",
+    "customer_tenure_months", "account_age_days", "distance_from_home_km",
+    "distance_from_last_transaction_km", "time_since_last_transaction_min",
+    "online_transaction", "international_transaction", "high_risk_country",
+    "merchant_category_code", "merchant_reputation_score", "chip_transaction",
+    "pin_used", "card_present", "cvv_match", "address_verification_match",
+    "num_transactions_24h", "num_transactions_7days",
+    "avg_transaction_amount_30days", "max_transaction_amount_30days",
+    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
+    "credit_limit", "available_credit_ratio",
 ]
 
 CSV_COLUMN_ORDER = [
-    'transaction_id', 'transaction_timestamp', 'transaction_hour',
-    'transaction_day_of_week', 'transaction_amount', 'transaction_type_code',
-    'customer_age', 'customer_gender', 'customer_tenure_months', 'account_age_days',
-    'distance_from_home_km', 'distance_from_last_transaction_km',
-    'time_since_last_transaction_min', 'online_transaction', 'international_transaction',
-    'high_risk_country', 'merchant_category_code', 'merchant_reputation_score',
-    'chip_transaction', 'pin_used', 'card_present', 'cvv_match',
-    'address_verification_match', 'num_transactions_24h', 'num_transactions_7days',
-    'avg_transaction_amount_30days', 'max_transaction_amount_30days',
-    'velocity_score', 'recurring_transaction', 'previous_fraud_incidents',
-    'credit_limit', 'available_credit_ratio', 'fraud_prediction', 'fraud_probability',
-    'is_fraud',
+    "transaction_id", "transaction_timestamp", "transaction_hour",
+    "transaction_day_of_week", "transaction_amount", "transaction_type_code",
+    "customer_age", "customer_gender", "customer_tenure_months", "account_age_days",
+    "distance_from_home_km", "distance_from_last_transaction_km",
+    "time_since_last_transaction_min", "online_transaction", "international_transaction",
+    "high_risk_country", "merchant_category_code", "merchant_reputation_score",
+    "chip_transaction", "pin_used", "card_present", "cvv_match",
+    "address_verification_match", "num_transactions_24h", "num_transactions_7days",
+    "avg_transaction_amount_30days", "max_transaction_amount_30days",
+    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
+    "credit_limit", "available_credit_ratio", "fraud_prediction", "fraud_probability",
+    "is_fraud",
 ]
 
+# V14 (renamed num_transactions_24h) has a fraud-class mean around -7 on the
+# Kaggle dataset. If the table is correctly seeded the AVG over fraud rows is
+# strongly negative. If it returns ~0 the table is corrupted — re-seed.
+INTEGRITY_THRESHOLD = -3.0
 
-def _run_athena_query(query: str, expect_results: bool = False) -> list:
-    """Execute Athena query and optionally return results."""
-    athena = boto3.client('athena', region_name=AWS_DEFAULT_REGION)
+# Deterministic hash-based 80/20 split on transaction_id. The same predicate
+# is used for both inserts so the partitioning is reproducible: re-running
+# the seed produces the same rows in each table.
+TRAIN_PREDICATE = "MOD(ABS(xxhash64(CAST(transaction_id AS VARBINARY))), 10) < 8"
+EVAL_PREDICATE = "MOD(ABS(xxhash64(CAST(transaction_id AS VARBINARY))), 10) >= 8"
 
-    response = athena.start_query_execution(
+
+class Config:
+    def __init__(self):
+        self.region = _require_env("AWS_DEFAULT_REGION")
+        self.database = _require_env("ATHENA_DATABASE")
+        self.output_s3 = _require_env("ATHENA_OUTPUT_S3")
+        self.training_table = _require_env("ATHENA_TRAINING_TABLE")
+        self.evaluation_table = _require_env("ATHENA_EVALUATION_TABLE")
+        self.bucket = _require_env("DATA_S3_BUCKET")
+        self.prefix = _require_env("DATA_S3_PREFIX")
+
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        raise RuntimeError(f"Required env var {name} is empty")
+    return val
+
+
+def _run_athena_query(cfg: Config, query: str, *, expect_results: bool = False,
+                      timeout: int = 300) -> list:
+    athena = boto3.client("athena", region_name=cfg.region)
+    qid = athena.start_query_execution(
         QueryString=query,
-        QueryExecutionContext={'Database': ATHENA_DATABASE},
-        ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_S3},
-    )
-    query_id = response['QueryExecutionId']
+        QueryExecutionContext={"Database": cfg.database},
+        ResultConfiguration={"OutputLocation": cfg.output_s3},
+    )["QueryExecutionId"]
 
-    # Wait for completion
-    import time
+    deadline = time.time() + timeout
     while True:
-        result = athena.get_query_execution(QueryExecutionId=query_id)
-        state = result['QueryExecution']['Status']['State']
-        if state in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+        status = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+        state = status["State"]
+        if state == "SUCCEEDED":
             break
-        time.sleep(1)
+        if state in ("FAILED", "CANCELLED"):
+            raise RuntimeError(
+                f"Athena query {state}: {status.get('StateChangeReason', 'unknown')}\n"
+                f"SQL: {query[:300]}"
+            )
+        if time.time() > deadline:
+            raise RuntimeError(f"Athena query timed out after {timeout}s")
+        time.sleep(2)
 
-    if state != 'SUCCEEDED':
-        reason = result['QueryExecution']['Status'].get('StateChangeReason', 'Unknown')
-        raise RuntimeError(f"Query failed: {reason}\nQuery: {query}")
+    if not expect_results:
+        return []
 
-    if expect_results:
-        results = athena.get_query_results(QueryExecutionId=query_id)
-        rows = results['ResultSet']['Rows'][1:]  # Skip header
-        cols = [c['VarCharValue'] for c in results['ResultSet']['Rows'][0]['Data']]
-        return [dict(zip(cols, [d.get('VarCharValue') for d in row['Data']])) for row in rows]
+    rows, header = [], None
+    for page in athena.get_paginator("get_query_results").paginate(QueryExecutionId=qid):
+        for r in page["ResultSet"]["Rows"]:
+            vals = [c.get("VarCharValue") for c in r["Data"]]
+            if header is None:
+                header = vals
+            else:
+                rows.append(dict(zip(header, vals)))
+    return rows
 
-    return []
 
-
-def check_tables_populated() -> dict:
-    """Check if both tables exist and are populated."""
+def _check_one_table(cfg: Config, table: str) -> dict:
+    """Returns ``{passed, fraud_count, non_fraud_count, fraud_v14_mean}`` for one table."""
     try:
-        train_count = _run_athena_query(
-            f"SELECT COUNT(*) as cnt FROM {ATHENA_DATABASE}.{ATHENA_TRAINING_TABLE}",
-            expect_results=True
-        )[0]["cnt"]
-
-        eval_count = _run_athena_query(
-            f"SELECT COUNT(*) as cnt FROM {ATHENA_DATABASE}.{ATHENA_EVALUATION_TABLE}",
-            expect_results=True
-        )[0]["cnt"]
-
-        return {
-            'tables_exist': True,
-            'training_count': int(train_count),
-            'evaluation_count': int(eval_count),
-            'populated': int(train_count) > 0 and int(eval_count) > 0
-        }
-    except Exception as e:
-        logger.warning(f"Could not query tables: {e}")
-        return {
-            'tables_exist': False,
-            'training_count': 0,
-            'evaluation_count': 0,
-            'populated': False
-        }
-
-
-def seed_tables() -> None:
-    """Load data into training_data and evaluation_data with 80/20 split."""
-    if not DATA_S3_BUCKET:
-        raise RuntimeError("DATA_S3_BUCKET is empty — cannot seed Athena.")
-
-    training_target = f"{ATHENA_DATABASE}.{ATHENA_TRAINING_TABLE}"
-    evaluation_target = f"{ATHENA_DATABASE}.{ATHENA_EVALUATION_TABLE}"
-    stage = f"{ATHENA_DATABASE}.tmp_seed_predictions"
-    predictions_loc = f"s3://{DATA_S3_BUCKET}/{DATA_S3_PREFIX}data/predictions/"
-
-    logger.info("=" * 80)
-    logger.info("SEEDING ATHENA TABLES WITH 80/20 TRAIN/EVALUATION SPLIT")
-    logger.info("=" * 80)
-    logger.info("Training table: %s", training_target)
-    logger.info("Evaluation table: %s", evaluation_target)
-    logger.info("Split method: Deterministic hash-based (MOD 10)")
-    logger.info("Data source: %s", predictions_loc)
-    logger.info("")
-
-    # Verify tables exist (CloudFormation should have created them)
-    try:
-        _run_athena_query(f"DESCRIBE {training_target}")
-        _run_athena_query(f"DESCRIBE {evaluation_target}")
-        logger.info("✓ Tables exist (created by CloudFormation)")
-    except Exception as e:
-        raise RuntimeError(
-            f"Tables do not exist. Deploy CloudFormation first:\n"
-            f"  cd cloudformation && ./deploy-stack.sh\n"
-            f"Error: {e}"
+        rows = _run_athena_query(
+            cfg,
+            f"SELECT is_fraud, COUNT(*) AS n, AVG(num_transactions_24h) AS v14_mean "
+            f"FROM {cfg.database}.{table} GROUP BY is_fraud",
+            expect_results=True,
         )
+    except Exception as e:
+        logger.info("Integrity check on %s skipped (not queryable yet): %s", table, e)
+        return {"passed": False, "fraud_count": 0, "non_fraud_count": 0,
+                "fraud_v14_mean": 0.0}
 
-    # Clear existing data
-    logger.info("Clearing existing data from tables…")
-    _run_athena_query(f"DELETE FROM {training_target}")
-    _run_athena_query(f"DELETE FROM {evaluation_target}")
-    _run_athena_query(f"DROP TABLE IF EXISTS {stage}")
+    by_class = {r["is_fraud"].lower(): r for r in rows if r.get("is_fraud")}
+    f = by_class.get("true", {})
+    n = by_class.get("false", {})
+    fraud_mean = float(f.get("v14_mean") or 0)
+    fraud_n = int(f.get("n") or 0)
+    non_fraud_n = int(n.get("n") or 0)
+    return {
+        "passed": fraud_n > 0 and non_fraud_n > 0 and fraud_mean < INTEGRITY_THRESHOLD,
+        "fraud_count": fraud_n,
+        "non_fraud_count": non_fraud_n,
+        "fraud_v14_mean": fraud_mean,
+    }
 
-    # Create staging table over CSV
-    logger.info("Creating staging table over CSV predictions…")
+
+def verify_integrity(cfg: Config) -> dict:
+    """Run integrity checks on both tables. ``passed`` is True only if BOTH pass."""
+    training = _check_one_table(cfg, cfg.training_table)
+    evaluation = _check_one_table(cfg, cfg.evaluation_table)
+    return {
+        "passed": training["passed"] and evaluation["passed"],
+        "training": training,
+        "evaluation": evaluation,
+    }
+
+
+def seed_tables(cfg: Config) -> None:
+    """Replace the contents of both tables from the predictions CSV with an 80/20 split."""
+    training_target = f"{cfg.database}.{cfg.training_table}"
+    evaluation_target = f"{cfg.database}.{cfg.evaluation_table}"
+    stage = f"{cfg.database}.tmp_seed_predictions"
+    predictions_loc = f"s3://{cfg.bucket}/{cfg.prefix}data/predictions/"
+
+    logger.info("=" * 80)
+    logger.info("SEEDING training_data (80%%) + evaluation_data (20%%) FROM %s", predictions_loc)
+    logger.info("Split: deterministic on transaction_id (xxhash64 MOD 10)")
+    logger.info("=" * 80)
+
+    # Verify both target tables exist (CloudFormation should have created them).
+    for target in (training_target, evaluation_target):
+        try:
+            _run_athena_query(cfg, f"DESCRIBE {target}")
+            logger.info("✓ Target table exists: %s", target)
+        except Exception as e:
+            raise RuntimeError(
+                f"Target table {target} does not exist. Deploy CloudFormation first:\n"
+                f"  cd cloudformation && ./deploy-stack.sh\nError: {e}"
+            )
+
+    logger.info("Clearing existing rows…")
+    _run_athena_query(cfg, f"DELETE FROM {training_target}")
+    _run_athena_query(cfg, f"DELETE FROM {evaluation_target}")
+    _run_athena_query(cfg, f"DROP TABLE IF EXISTS {stage}")
+
+    logger.info("Creating staging table over CSV…")
     _run_athena_query(
+        cfg,
         f"CREATE EXTERNAL TABLE {stage} ("
         + ", ".join(f"{c} STRING" for c in CSV_COLUMN_ORDER) + ") "
         "ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde' "
@@ -184,90 +225,76 @@ def seed_tables() -> None:
 
     select_features = ", ".join(cast(c) for c in ATHENA_COLUMN_ORDER)
 
-    # Load training data (80%)
-    logger.info("Loading training_data (80%% split)…")
-    _run_athena_query(f"""
-        INSERT INTO {training_target}
-        SELECT transaction_id, {select_features},
-               CAST(lower(fraud_prediction) AS BOOLEAN),
-               CAST(fraud_probability AS DOUBLE),
-               CAST(lower(is_fraud) AS BOOLEAN),
-               'v1', current_timestamp, current_timestamp
-        FROM {stage}
-        WHERE MOD(ABS(xxhash64(transaction_id)), 10) < 8
-    """)
+    insert_template = (
+        "INSERT INTO {target} "
+        f"SELECT transaction_id, {select_features}, "
+        "CAST(lower(fraud_prediction) AS BOOLEAN), "
+        "CAST(fraud_probability AS DOUBLE), "
+        "CAST(lower(is_fraud) AS BOOLEAN), "
+        "'v1', current_timestamp, current_timestamp "
+        f"FROM {stage} WHERE {{predicate}}"
+    )
 
-    # Load evaluation data (20%)
-    logger.info("Loading evaluation_data (20%% split)…")
-    _run_athena_query(f"""
-        INSERT INTO {evaluation_target}
-        SELECT transaction_id, {select_features},
-               CAST(lower(fraud_prediction) AS BOOLEAN),
-               CAST(fraud_probability AS DOUBLE),
-               CAST(lower(is_fraud) AS BOOLEAN),
-               'v1', current_timestamp, current_timestamp
-        FROM {stage}
-        WHERE MOD(ABS(xxhash64(transaction_id)), 10) >= 8
-    """)
+    logger.info("Loading training_data (80%% — train predicate)…")
+    _run_athena_query(
+        cfg,
+        insert_template.format(target=training_target, predicate=TRAIN_PREDICATE),
+    )
 
-    # Cleanup
-    _run_athena_query(f"DROP TABLE IF EXISTS {stage}")
+    logger.info("Loading evaluation_data (20%% — eval predicate)…")
+    _run_athena_query(
+        cfg,
+        insert_template.format(target=evaluation_target, predicate=EVAL_PREDICATE),
+    )
 
-    # Verify
-    train_count = _run_athena_query(
-        f"SELECT COUNT(*) as cnt FROM {training_target}",
-        expect_results=True
-    )[0]["cnt"]
-    eval_count = _run_athena_query(
-        f"SELECT COUNT(*) as cnt FROM {evaluation_target}",
-        expect_results=True
-    )[0]["cnt"]
-    total = int(train_count) + int(eval_count)
-
-    logger.info("")
-    logger.info("✓ Training data: %s rows (%.1f%%)", train_count, 100 * int(train_count) / total if total > 0 else 0)
-    logger.info("✓ Evaluation data: %s rows (%.1f%%)", eval_count, 100 * int(eval_count) / total if total > 0 else 0)
-    logger.info("✓ Total: %d rows", total)
-    logger.info("")
-    logger.info("⚠️  IMPORTANT: evaluation_data is now FROZEN for reproducible model comparison")
-    logger.info("=" * 80)
+    _run_athena_query(cfg, f"DROP TABLE IF EXISTS {stage}")
 
 
-def main():
-    """Main entry point - idempotent seeding."""
+def _log_check(label: str, c: dict) -> None:
+    logger.info(
+        "  %s: %d fraud / %d non-fraud, fraud_v14_mean=%.4f → %s",
+        label, c["fraud_count"], c["non_fraud_count"], c["fraud_v14_mean"],
+        "PASS" if c["passed"] else "FAIL",
+    )
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Seed Athena tables with one-time 80/20 train/evaluation split'
+        description="Seed Athena training_data + evaluation_data from predictions CSV"
     )
     parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force re-seeding even if tables are already populated'
+        "--force", action="store_true",
+        help="Re-seed even if both integrity checks already pass"
     )
     args = parser.parse_args()
 
-    logger.info("Checking if Athena tables are already populated…")
-    status = check_tables_populated()
+    cfg = Config()
 
-    if status['populated'] and not args.force:
-        logger.info("=" * 80)
-        logger.info("✓ TABLES ALREADY POPULATED - SKIPPING SEED")
-        logger.info("=" * 80)
-        logger.info("Training data: %d rows", status['training_count'])
-        logger.info("Evaluation data: %d rows", status['evaluation_count'])
-        logger.info("")
-        logger.info("To re-seed, run with --force flag:")
-        logger.info("  python -m src.train_pipeline.pipeline_steps.seed_athena_tables --force")
-        logger.info("=" * 80)
-        return
+    if not args.force:
+        check = verify_integrity(cfg)
+        if check["passed"]:
+            logger.info("✓ Both tables healthy — skipping seed:")
+            _log_check("training_data ", check["training"])
+            _log_check("evaluation_data", check["evaluation"])
+            return
+        logger.info("Integrity check failed — re-seeding:")
+        _log_check("training_data ", check["training"])
+        _log_check("evaluation_data", check["evaluation"])
 
-    if args.force and status['populated']:
-        logger.warning("⚠️  --force flag detected: Re-seeding tables (existing data will be replaced)")
+    seed_tables(cfg)
 
-    # Seed the tables
-    seed_tables()
+    final = verify_integrity(cfg)
+    if not final["passed"]:
+        _log_check("training_data ", final["training"])
+        _log_check("evaluation_data", final["evaluation"])
+        raise RuntimeError(
+            "Seed completed but integrity check still failing. "
+            "Inspect the predictions CSV in S3."
+        )
+    logger.info("✓ Seed complete:")
+    _log_check("training_data ", final["training"])
+    _log_check("evaluation_data", final["evaluation"])
 
-    logger.info("✓ Seeding complete. Tables are ready for training pipeline.")
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

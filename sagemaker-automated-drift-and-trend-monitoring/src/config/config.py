@@ -111,6 +111,9 @@ ATHENA_QUERY_TIMEOUT: int = int(
 ATHENA_TRAINING_TABLE: str = _get(
     "athena", "training_table", "ATHENA_TRAINING_TABLE", "training_data"
 )
+ATHENA_EVALUATION_TABLE: str = _get(
+    "athena", "evaluation_table", "ATHENA_EVALUATION_TABLE", "evaluation_data"
+)
 ATHENA_INFERENCE_TABLE: str = _get(
     "athena", "inference_table", "ATHENA_INFERENCE_TABLE", "inference_responses"
 )

@@ -115,6 +115,34 @@ aws iam put-role-policy \
     --policy-document "$SNS_POLICY" \
     --region $REGION 2>/dev/null || true
 
+# Read the registered baseline.json from the Model Registry. The drift
+# Lambda looks up the latest Approved ModelPackage to recover the
+# baseline ROC-AUC and evaluation table — see load_baseline_from_registry
+# in lambda_drift_monitor.py.
+REGISTRY_POLICY=$(cat <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "sagemaker:ListModelPackages",
+      "sagemaker:DescribeModelPackage",
+      "sagemaker:DescribeEndpoint",
+      "sagemaker:DescribeEndpointConfig",
+      "sagemaker:DescribeModel"
+    ],
+    "Resource": "*"
+  }]
+}
+EOF
+)
+
+aws iam put-role-policy \
+    --role-name $ROLE_NAME \
+    --policy-name ModelRegistryReadPolicy \
+    --policy-document "$REGISTRY_POLICY" \
+    --region $REGION 2>/dev/null || true
+
 echo "  ✓ Role: $ROLE_ARN"
 echo "  ✓ Waiting 10s for role propagation..."
 sleep 10
@@ -154,6 +182,8 @@ ENV_VARS=$(cat <<EOF
 {
   "ATHENA_DATABASE": "$ATHENA_DB",
   "ATHENA_OUTPUT_S3": "$ATHENA_OUTPUT",
+  "ATHENA_EVALUATION_TABLE": "evaluation_data",
+  "MODEL_PACKAGE_GROUP": "xgboost-fraud-detector",
   "SNS_TOPIC_ARN": "$TOPIC_ARN",
   "MLFLOW_TRACKING_URI": "$MLFLOW_URI",
   "BASELINE_ROC_AUC": "0.92",

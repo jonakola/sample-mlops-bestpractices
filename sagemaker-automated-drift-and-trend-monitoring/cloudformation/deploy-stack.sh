@@ -9,10 +9,35 @@
 # Usage:
 #   ./cloudformation/deploy-stack.sh                       # default: fraud-detection-monitoring in us-west-2
 #   ./cloudformation/deploy-stack.sh my-other-stack        # override stack name positionally
+#   ./cloudformation/deploy-stack.sh --drop-database       # DROP fraud_detection + clear table S3 prefixes
+#                                                          # on every Space launch until you re-deploy
+#                                                          # WITHOUT the flag.
 #   AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh  # override region via env var
 #   TEMPLATE=path/to/other.yaml ./cloudformation/deploy-stack.sh
 #
+# --drop-database is destructive on every Space launch while it's set.
+# After running with the flag once, re-deploy WITHOUT it to flip the
+# template parameter back to false.
+#
 set -euo pipefail
+
+DROP_DATABASE="false"
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --drop-database)
+      DROP_DATABASE="true"
+      ;;
+    --help|-h)
+      sed -n '1,/^set -euo pipefail$/p' "$0" | sed '$d'
+      exit 0
+      ;;
+    *)
+      POSITIONAL+=("$arg")
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
 
 STACK_NAME="${1:-${STACK_NAME:-fraud-detection-monitoring}}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
@@ -27,6 +52,9 @@ echo "Stack:    $STACK_NAME"
 echo "Region:   $REGION"
 echo "Template: $TEMPLATE"
 echo "S3 stage: s3://$S3_BUCKET/$TEMPLATE_KEY"
+if [ "$DROP_DATABASE" = "true" ]; then
+  echo "Drop database: ENABLED — database + table S3 prefixes will be wiped on every Space launch until re-deployed without the flag"
+fi
 echo ""
 
 if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
@@ -58,16 +86,27 @@ if [ "$ACTION" = "update" ]; then
   PARAM_KEYS="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
     --query 'Stacks[0].Parameters[].ParameterKey' --output text)"
   PARAM_ARGS=""
+  HAS_DROP_DATABASE=false
   for k in $PARAM_KEYS; do
     # Auto-increment LifecycleConfigVersion with timestamp to force replacement
     if [ "$k" = "LifecycleConfigVersion" ]; then
       NEW_VERSION="v$(date +%s)"
       PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,ParameterValue=$NEW_VERSION"
       echo "Auto-incrementing LifecycleConfigVersion to: $NEW_VERSION"
+    elif [ "$k" = "DropDatabase" ]; then
+      # Always override DropDatabase with the flag value so the param flips
+      # back to "false" on a normal deploy after a one-time reset.
+      PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,ParameterValue=$DROP_DATABASE"
+      HAS_DROP_DATABASE=true
     else
       PARAM_ARGS="$PARAM_ARGS ParameterKey=$k,UsePreviousValue=true"
     fi
   done
+  # First deploy that introduces DropDatabase: the param didn't exist on the
+  # previous stack, so the for-loop above won't have set it. Add explicitly.
+  if [ "$HAS_DROP_DATABASE" = "false" ]; then
+    PARAM_ARGS="$PARAM_ARGS ParameterKey=DropDatabase,ParameterValue=$DROP_DATABASE"
+  fi
 
   set +e
   OUT="$(aws cloudformation update-stack \
@@ -95,7 +134,8 @@ else
     --region "$REGION" \
     --template-url "$TEMPLATE_URL" \
     --capabilities CAPABILITY_NAMED_IAM \
-    --on-failure ROLLBACK
+    --on-failure ROLLBACK \
+    --parameters ParameterKey=DropDatabase,ParameterValue=$DROP_DATABASE
   echo "Waiting for create to complete..."
   aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME" --region "$REGION"
 fi
