@@ -58,8 +58,6 @@ class GroundTruthSimulator:
         accuracy: float = 0.85,
         fraud_confirmation_days: tuple = (1, 7),
         non_fraud_confirmation_days: tuple = (1, 30),
-        feature_drift_magnitude: float = 0.0,
-        feature_drift_count: int = 0,
         feature_drift_impact: float = 0.0,
         model_drift_magnitude: float = 0.0,
         seed: int = 42,
@@ -73,35 +71,32 @@ class GroundTruthSimulator:
             accuracy: Base model accuracy (0.0-1.0)
             fraud_confirmation_days: (min, max) days for fraud confirmation
             non_fraud_confirmation_days: (min, max) days for non-fraud confirmation
-            feature_drift_magnitude: How much features drift (0.0-1.0, semantic)
-            feature_drift_count: Number of features drifting (semantic)
             feature_drift_impact: Accuracy reduction due to feature drift (0.0-1.0)
             model_drift_magnitude: Direct model accuracy degradation (0.0-1.0)
             seed: Random seed for reproducibility
+
+        Effective accuracy = max(0.5, accuracy - feature_drift_impact - model_drift_magnitude).
         """
         self.client = athena_client
         self.endpoint_name = endpoint_name
         self.accuracy = accuracy
         self.fraud_confirmation_days = fraud_confirmation_days
         self.non_fraud_confirmation_days = non_fraud_confirmation_days
-        self.feature_drift_magnitude = feature_drift_magnitude
-        self.feature_drift_count = feature_drift_count
         self.feature_drift_impact = feature_drift_impact
         self.model_drift_magnitude = model_drift_magnitude
 
-        # Calculate effective accuracy after drift
-        self.effective_accuracy = accuracy - feature_drift_impact - model_drift_magnitude
-        self.effective_accuracy = max(0.5, self.effective_accuracy)  # Floor at 50%
+        # Effective accuracy: base minus both drift impacts, floored at 50%.
+        self.effective_accuracy = max(0.5, accuracy - feature_drift_impact - model_drift_magnitude)
 
         np.random.seed(seed)
 
-        logger.info(f"Initialized GroundTruthSimulator:")
-        logger.info(f"  Base accuracy: {accuracy:.2f}")
+        logger.info("Initialized GroundTruthSimulator:")
+        logger.info(f"  Base accuracy        : {accuracy:.2f}")
         if feature_drift_impact > 0:
-            logger.info(f"  Feature drift: {feature_drift_magnitude:.2f} magnitude, {feature_drift_count} features, impact={feature_drift_impact:.2f}")
+            logger.info(f"  Feature drift impact : -{feature_drift_impact:.2f}")
         if model_drift_magnitude > 0:
-            logger.info(f"  Model drift: {model_drift_magnitude:.2f} degradation")
-        logger.info(f"  Effective accuracy: {self.effective_accuracy:.2f}")
+            logger.info(f"  Model drift magnitude: -{model_drift_magnitude:.2f}")
+        logger.info(f"  Effective accuracy   : {self.effective_accuracy:.2f}")
 
     def load_predictions_without_ground_truth(self, limit: int = None) -> pd.DataFrame:
         """Load inference predictions that don't have ground truth yet."""

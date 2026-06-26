@@ -1296,7 +1296,8 @@ Resources:
                 inference_latency_ms DOUBLE, model_load_time_ms DOUBLE, preprocessing_time_ms DOUBLE,
                 transaction_id STRING, transaction_amount DOUBLE, customer_id STRING,
                 is_high_confidence BOOLEAN, is_low_confidence BOOLEAN, prediction_bucket STRING,
-                request_id STRING, response_time TIMESTAMP, error_message STRING, inference_mode STRING
+                request_id STRING, response_time TIMESTAMP, error_message STRING, inference_mode STRING,
+                monitoring_run_id STRING
             )
             PARTITIONED BY (day(request_timestamp), endpoint_name)
             LOCATION 's3://{BUCKET}/{PREFIX}/inference_responses/'

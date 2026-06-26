@@ -39,6 +39,9 @@ COLUMNS = [
     ('response_time', 'timestamp'),
     ('error_message', 'varchar'),
     ('inference_mode', 'varchar'),
+    # Initially NULL — backfilled by the drift-detection run that scored this
+    # prediction. See notebook cell 6.4 (UPDATE statement) for the join key.
+    ('monitoring_run_id', 'varchar'),
 ]
 
 

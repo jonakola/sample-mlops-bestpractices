@@ -101,9 +101,19 @@ def run_classification_report(
 
     Both DataFrames must contain the target and prediction columns.
 
+    ⚠ Evidently quirk — both class labels (0 AND 1) must appear in BOTH
+    ``baseline_df`` and ``current_df``. If either side has only one class
+    (common when sampling a highly-imbalanced eval set with a flat LIMIT),
+    ClassificationPreset raises ``KeyError: '0'`` deep inside Evidently's
+    metric parser. Stratify the baseline by class label (e.g. UNION ALL
+    of N fraud + N non-fraud rows) to guarantee both classes appear.
+    https://github.com/evidentlyai/evidently/issues  (see ClassMetric parsing)
+
     Args:
-        baseline_df: Reference data with target and prediction columns.
-        current_df: Current data with target and prediction columns.
+        baseline_df: Reference data with target and prediction columns. Must
+            contain BOTH class labels (0 and 1).
+        current_df: Current data with target and prediction columns. Must
+            also contain BOTH class labels.
         target_column: Name of the ground-truth label column.
         prediction_column: Name of the predicted label column.
         output_path: If provided, saves the HTML report to this path.
@@ -112,7 +122,22 @@ def run_classification_report(
         Dictionary with:
             - 'snapshot': The Evidently report snapshot
             - 'metrics': Raw metrics dict extracted from the report
+
+    Raises:
+        ValueError: If either dataframe lacks both class labels (caught
+            early before Evidently crashes with a confusing KeyError).
     """
+    # Pre-flight check — Evidently's KeyError is unhelpful; fail loudly here.
+    for label, df in (("baseline_df", baseline_df), ("current_df", current_df)):
+        n_classes = df[target_column].nunique()
+        if n_classes < 2:
+            raise ValueError(
+                f"{label} has only {n_classes} class in column '{target_column}' "
+                f"(values: {sorted(df[target_column].unique().tolist())}). "
+                f"Evidently ClassificationPreset requires BOTH 0 and 1 to be present "
+                f"in both datasets. Stratify the source query if you hit this."
+            )
+
     data_def = DataDefinition(
         classification=[
             BinaryClassification(

@@ -336,10 +336,19 @@ aws events describe-rule --name fraud-detection-drift-check
 ### Query monitoring results
 
 ```sql
-SELECT *
+SELECT monitoring_run_id, monitoring_timestamp, endpoint_name, model_package_arn,
+       data_drift_detected, drifted_columns_share, model_drift_detected, current_roc_auc
 FROM fraud_detection.monitoring_responses
-WHERE timestamp > current_timestamp - interval '7' day
-ORDER BY timestamp DESC
+WHERE monitoring_timestamp > current_timestamp - interval '7' day
+ORDER BY monitoring_timestamp DESC
+```
+
+To see the inference rows scored by a specific run, join through `monitoring_run_id`:
+
+```sql
+SELECT ir.*
+FROM fraud_detection.inference_responses ir
+WHERE ir.monitoring_run_id = '<the_id_from_above>'
 ```
 
 ---

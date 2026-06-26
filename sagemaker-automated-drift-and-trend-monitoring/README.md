@@ -76,8 +76,9 @@ Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/
 ### Monitoring (Notebook 3)
 - **Inference logging** — Every prediction → SQS → Lambda batches (10 msgs or 30s) → `inference_responses` Iceberg table
 - **Ground truth integration** — Simulated (dev) or fed from fraud investigation systems (prod) → `ground_truth_updates` table → MERGE into `inference_responses`
-- **Drift detection** — Evidently `DataDriftPreset` (KS test for numerics, chi-square for categoricals, PSI per feature) + `ClassificationPreset` (ROC, PR, confusion matrix). Configurable via `src/config/config.yaml`.
-- **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Logs metrics + interactive HTML reports to MLflow, writes summary to `monitoring_responses` table, sends SNS alert if drift exceeds thresholds.
+- **Drift detection** — Evidently `DataDriftPreset` against the frozen `training_data` baseline (KS for numerics, chi-square for categoricals, PSI per feature) + `ClassificationPreset` against the frozen `evaluation_data` baseline (ROC, PR, confusion matrix). Thresholds configurable via `src/config/config.yaml`.
+- **Per-run traceability** — Each drift run gets a `monitoring_run_id` (`notebook-drift-*` from the notebook, `drift-*` from the Lambda). Both writers (a) record one row in `monitoring_responses` keyed on this id, and (b) backfill the same id onto the `inference_responses` rows the run scored — `WHERE monitoring_run_id IS NULL` makes this naturally delta-shaped, so each run only tags predictions never measured before. QuickSight can join the two tables on `monitoring_run_id` to show "what predictions did this run measure?". The **notebook additionally** scopes the *drift compute window itself* to `request_timestamp > MAX(monitoring_timestamp)`, letting you re-run drift detection on just the new predictions since the last run.
+- **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Logs metrics + interactive HTML reports to MLflow, writes summary to `monitoring_responses` table, sends SNS alert if drift exceeds thresholds. Lambda scopes its drift compute to fixed 7/30-day rolling windows (data drift / model drift respectively); the `monitoring_run_id` backfill runs after every Lambda invocation.
 
 ### Governance (Notebook 4)
 - QuickSight dashboard with prediction volume, fraud probability distribution, accuracy breakdown, risk tiers, latency trend, drift trends, ROC-AUC over time
@@ -119,13 +120,15 @@ sagemaker-automated-drift-and-trend-monitoring/
 
 > The principle: **anything that participates in a model's lineage must be addressable by an immutable reference. Names are pointers. Pointers are fine for humans, fatal for joins.**
 
-Three immutable references anchor every model in this system:
+Four immutable references anchor every model in this system:
 
 | Reference | Where it comes from | What it pins |
 |---|---|---|
 | **Model package ARN** | `sagemaker:Register` step | The model artifact + its metrics |
-| **Iceberg snapshot ID** | `INSERT` commit on `evaluation_data` | The exact rows the model was scored on |
+| **`training_snapshot_id`** | `INSERT` commit on `training_data` | The exact rows the model was **trained** on (used as the data-drift baseline) |
+| **`evaluation_snapshot_id`** | `INSERT` commit on `evaluation_data` | The exact rows the model was **scored** on (used as the model-drift baseline) |
 | **Code commit SHA** | Captured by `pipeline.py` at definition time (overridable via the `CodeCommitSha` pipeline parameter in CI) | The preprocessing & training logic |
+| **`monitoring_run_id`** | Generated per drift run (notebook or Lambda) | Stamped on every row in `monitoring_responses` AND backfilled onto the `inference_responses` rows that the run scored — so QuickSight can join the two tables to answer "which predictions did monitoring run X measure?" |
 
 These travel together inside `baseline.json`, which is registered as `ModelPackage.ModelMetrics.ModelStatistics` on every model. The drift Lambda dereferences them on every run.
 
@@ -165,15 +168,28 @@ Never `ListModelPackages(SortOrder=Descending, MaxResults=1)` — that conflates
 
 ### How baseline data is sampled
 
+Two drift checks, two different baselines — both Iceberg-snapshot-pinned via `baseline.json`:
+
 ```sql
+-- DATA DRIFT — compares production features to the distribution the model was TRAINED on
 SELECT ...
-FROM fraud_detection.evaluation_data
-  FOR VERSION AS OF <evaluation_snapshot_id>      -- Iceberg time travel
+FROM fraud_detection.training_data
+  FOR VERSION AS OF <training_snapshot_id>      -- Iceberg time travel
 WHERE is_fraud IS NOT NULL
 LIMIT 5000
 ```
 
-Re-seeding `evaluation_data` later cannot retroactively corrupt the reference. The Lambda falls back to the live table only when no snapshot ID is pinned (first runs, schema-v1 baselines).
+```sql
+-- MODEL DRIFT — compares (target, prediction) pairs to the labeled held-out set
+SELECT CAST(is_fraud AS INT) AS target, CAST(fraud_prediction AS INT) AS prediction
+FROM fraud_detection.evaluation_data
+  FOR VERSION AS OF <evaluation_snapshot_id>    -- different snapshot, different table
+WHERE is_fraud IS NOT NULL AND fraud_prediction IS NOT NULL
+```
+
+Re-seeding either table later cannot retroactively corrupt the reference because each model package's `baseline.json` pins the exact snapshot it was bound to. The Lambda falls back to the live table only when no snapshot ID is recorded (first runs, schema-v1 baselines).
+
+**Why training_data for data drift?** Industry standard (SageMaker Model Monitor, NannyML, Arize): data drift measures whether the production input distribution has moved away from what the model was *trained on*. Comparing to `evaluation_data` instead would only flag shifts away from the held-out test slice — a narrower question. `evaluation_data` is the right baseline for model drift because it carries the model's scored predictions, which is what you compare current performance to.
 
 ### The seven-questions test
 
@@ -257,11 +273,11 @@ See [Understanding Drift Scores](docs/screenshots/quicksight/README.md) for a vi
 
 | Table | Type | Purpose |
 |-------|------|---------|
-| `training_data` | Iceberg | Training features (~80% of Kaggle rows, 30 features). Populated by the `SeedAthenaTrainingData` pipeline step. |
-| `evaluation_data` | Iceberg | Held-out evaluation slice (~20%, same hash split). Read by preprocessing for the test channel and by the drift monitor as the **frozen baseline** (time-travelled via Iceberg snapshot ID). |
-| `inference_responses` | Iceberg | All endpoint predictions, partitioned by day. `ground_truth` column populated via MERGE from `ground_truth_updates`. |
+| `training_data` | Iceberg | Training features (~80% of Kaggle rows, 30 features). Populated by the `SeedAthenaTrainingData` pipeline step. Also serves as the **data-drift baseline** (time-travelled via `training_snapshot_id`). |
+| `evaluation_data` | Iceberg | Held-out evaluation slice (~20%, same hash split). Read by preprocessing for the test channel and by the drift monitor as the **model-drift baseline** (time-travelled via `evaluation_snapshot_id`) — its `is_fraud` + `fraud_prediction` columns let the monitor compare current performance to the model's scored test set. |
+| `inference_responses` | Iceberg | All endpoint predictions, partitioned by day. `ground_truth` column populated via MERGE from `ground_truth_updates`. `monitoring_run_id` column backfilled by each drift run so QuickSight can join with `monitoring_responses` to show "which predictions this run measured". |
 | `ground_truth_updates` | Iceberg | Lightweight patches: `inference_id` + `actual_fraud` + confirmation metadata |
-| `monitoring_responses` | Iceberg | Output of each drift monitoring run. Includes `model_package_arn` and `evaluation_snapshot_id` so the table can be queried per-version. |
+| `monitoring_responses` | Iceberg | One row per drift run. Includes `monitoring_run_id`, `model_package_arn`, and `evaluation_snapshot_id` so the table can be queried per-run and per-version. |
 | `drifted_data` | External (Parquet) | Synthetic drifted samples for testing |
 
 ### Ground Truth Flow
@@ -340,7 +356,7 @@ The custom handler sends predictions to SQS; Lambda batches and writes to Athena
 
 ### Drift Lambda timing out or missing data
 
-The drift Lambda compares the last 7 days of inference data against the frozen `evaluation_data` baseline (resolved from the deployed model's registered `baseline.json` via Iceberg snapshot). If inference volume is low, override the lookback window:
+The drift Lambda compares the last 7 days of inference data against the frozen `training_data` baseline for **data drift** and the last 30 days against the frozen `evaluation_data` baseline for **model drift** (both resolved from the deployed model's registered `baseline.json` via Iceberg snapshots). If inference volume is low, override the lookback windows:
 ```python
 lambda_client.update_function_configuration(
     FunctionName='fraud-detection-monitoring-drift-monitor',
