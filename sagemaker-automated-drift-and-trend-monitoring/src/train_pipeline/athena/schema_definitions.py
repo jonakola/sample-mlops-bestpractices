@@ -6,7 +6,8 @@ This module contains DDL statements for all Iceberg and external tables:
 - ground_truth: Labeled ground truth data (partitioned)
 - inference_responses: Prediction logs (partitioned)
 - drifted_data: Data drift samples (external table)
-- monitoring_responses: Model monitoring results with drift metrics (partitioned)
+
+Note: monitoring_responses and evaluation_data are created by CloudFormation, not this module.
 """
 
 from src.config.config import (
@@ -17,9 +18,6 @@ from src.config.config import (
     S3_DRIFTED_DATA,
     S3_GROUND_TRUTH_UPDATES,
 )
-
-# Import monitoring schema
-from .monitoring_schema import CREATE_MONITORING_RESULTS_TABLE
 
 # =============================================================================
 # Training Data Table (Iceberg)
@@ -312,7 +310,8 @@ ALL_TABLE_DEFINITIONS = {
     'inference_responses': CREATE_INFERENCE_RESPONSES_TABLE,
     'drifted_data': CREATE_DRIFTED_DATA_TABLE,
     'ground_truth_updates': CREATE_GROUND_TRUTH_UPDATES_TABLE,
-    'monitoring_responses': CREATE_MONITORING_RESULTS_TABLE,
+    # NOTE: monitoring_responses and evaluation_data are created by CloudFormation
+    # (cloudformation/sagemaker-mlflow-setup.yaml). Do not duplicate the DDL here.
 }
 
 # =============================================================================
@@ -415,8 +414,16 @@ def list_all_tables() -> list:
 
 
 def get_iceberg_tables() -> list:
-    """Get list of Iceberg tables (excludes external tables)."""
-    return ['training_data', 'ground_truth', 'inference_responses', 'ground_truth_updates', 'monitoring_responses']
+    """Get list of Iceberg tables (excludes external tables).
+
+    Includes CFN-managed tables (monitoring_responses, evaluation_data) so
+    iceberg_manager.* membership checks (is_iceberg / verify / stats) work
+    against the full set, even though this module no longer owns their DDL.
+    """
+    return [
+        'training_data', 'evaluation_data', 'ground_truth',
+        'inference_responses', 'ground_truth_updates', 'monitoring_responses',
+    ]
 
 
 def get_partitioned_tables() -> list:
