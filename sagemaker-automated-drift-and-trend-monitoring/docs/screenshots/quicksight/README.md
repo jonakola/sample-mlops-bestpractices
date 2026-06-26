@@ -354,15 +354,27 @@ You ran drift monitoring on **107 new transactions** with confirmed ground truth
 Here's what happens when you click "Run Drift Monitoring":
 
 ### Step 1: Data Collection (Automated)
+
+Two distinct queries — one per drift check:
+
 ```python
-# System queries Athena for recent inferences with ground truth
-query = """
-SELECT * FROM inference_responses
-WHERE ground_truth IS NOT NULL
-AND timestamp >= CURRENT_DATE - INTERVAL '7' DAY
+# DATA DRIFT: recent inferences (NO ground-truth filter — drift is unsupervised)
+data_drift_query = """
+SELECT input_features FROM inference_responses
+WHERE endpoint_name = 'fraud-detector-endpoint'
+  AND request_timestamp >= CURRENT_DATE - INTERVAL '7' DAY
 """
-# Returns your 107 records
+
+# MODEL DRIFT: only rows where ground truth has arrived
+model_drift_query = """
+SELECT prediction, probability_fraud, ground_truth FROM inference_responses
+WHERE endpoint_name = 'fraud-detector-endpoint'
+  AND ground_truth IS NOT NULL
+  AND request_timestamp >= CURRENT_DATE - INTERVAL '30' DAY
+"""
 ```
+
+The notebook (Section 6) further restricts the "current" window to `request_timestamp > MAX(monitoring_timestamp)` — so each notebook drift run measures only the new predictions since the previous run, not the cumulative pile.
 
 ### Step 2: Feature Extraction
 ```python
@@ -561,7 +573,7 @@ PSI = Σ (Actual% - Expected%) × ln(Actual% / Expected%)
 
 **Total PSI = 0.208 + 0.515 + 0.138 + 0.007 + 1.788 = 2.656**
 
-(Note: Your actual PSI of 74.47 comes from the intentional 8x credit_limit spike in the test data - configurable via `src/config/config.yaml` → `drift_generation.variable_patterns.run3.credit_limit.factor`)
+(Note: Your actual PSI of 74.47 comes from intentional drift in the test data — configurable via `src/config/config.yaml` → `drift_generation.default_drift`)
 
 **Interpretation:**
 - PSI < 0.10: No significant change
@@ -595,8 +607,28 @@ PSI = Σ (Actual% - Expected%) × ln(Actual% / Expected%)
 
 - **Main README:** `/README.md` — Complete system architecture
 - **Drift Configuration:** `/src/config/config.yaml` — Adjust thresholds and sensitivity
-- **QuickSight Setup:** `/notebooks/3_governance_dashboard.ipynb` — Dashboard creation
+- **Drift Compute Workflow:** `/notebooks/3_inference_monitoring.ipynb` — Section 6 (Drift Detection)
+- **QuickSight Setup:** `/notebooks/4_governance_dashboard.ipynb` — Dashboard creation
 - **Feature-Level Drift Visuals:** `FEATURE_LEVEL_SUMMARY.md` — Add detailed per-feature drift analysis to your dashboard
+
+## 🔑 Tracing a drift verdict back to its predictions
+
+Every row in `monitoring_responses` carries a `monitoring_run_id`. That same id is backfilled onto the `inference_responses` rows the run scored — so you can pivot from "this run flagged drift" to "show me the exact predictions it saw" in a single join:
+
+```sql
+-- 1. Pick a drift run
+SELECT monitoring_run_id, monitoring_timestamp, data_drift_detected, drifted_columns_share
+FROM fraud_detection.monitoring_responses
+ORDER BY monitoring_timestamp DESC
+LIMIT 1;
+
+-- 2. Pull the inferences it scored
+SELECT inference_id, request_timestamp, prediction, probability_fraud, ground_truth
+FROM fraud_detection.inference_responses
+WHERE monitoring_run_id = '<id_from_above>';
+```
+
+In QuickSight, both datasets expose `monitoring_run_id` — drop it into a filter control to scope every visual on the page to one specific run.
 
 ---
 

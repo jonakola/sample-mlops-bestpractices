@@ -353,6 +353,24 @@ _drift_cfg = _yaml_cfg.get("drift_thresholds", {}) if isinstance(
 MIN_ROC_AUC_THRESHOLD: float = float(
     _drift_cfg.get("min_roc_auc", os.environ.get("MIN_ROC_AUC_THRESHOLD", "0.85"))
 )
+# Data-drift threshold: fraction of features whose distribution must shift
+# (Evidently DataDriftPreset) before alerting. Used by notebook 3 cells
+# 56 (CloudWatch alarms) and 62 (alert config).
+DATA_DRIFT_THRESHOLD: float = float(
+    _drift_cfg.get("data_drift", os.environ.get("DATA_DRIFT_THRESHOLD", "0.20"))
+)
+# Model-drift threshold: relative ROC-AUC degradation vs baseline.
+MODEL_DRIFT_THRESHOLD: float = float(
+    _drift_cfg.get("model_drift", os.environ.get("MODEL_DRIFT_THRESHOLD", "0.05"))
+)
+
+# EventBridge schedule for the drift-monitor Lambda.
+_drift_mon_cfg = _yaml_cfg.get("drift_monitor", {}) if isinstance(
+    _yaml_cfg.get("drift_monitor"), dict
+) else {}
+DRIFT_MONITOR_SCHEDULE: str = _drift_mon_cfg.get(
+    "schedule", os.environ.get("DRIFT_MONITOR_SCHEDULE", "cron(0 2 * * ? *)")
+)
 
 # ===================================================================
 # Monitoring lookback windows (used by notebook 2 + monitor_model_performance.py)
@@ -376,12 +394,9 @@ MONITORING_MODEL_DRIFT_LOOKBACK_DAYS: int = int(
 GROUND_TRUTH_SIM_ACCURACY: float = float(
     os.environ.get("GROUND_TRUTH_SIM_ACCURACY", "0.85")
 )
-GROUND_TRUTH_SIM_FEATURE_DRIFT_MAG: float = float(
-    os.environ.get("GROUND_TRUTH_SIM_FEATURE_DRIFT_MAG", "0.0")
-)
-GROUND_TRUTH_SIM_FEATURE_DRIFT_COUNT: int = int(
-    os.environ.get("GROUND_TRUTH_SIM_FEATURE_DRIFT_COUNT", "0")
-)
+# Two knobs reduce the simulator's "effective accuracy":
+#   effective_accuracy = base - feature_drift_impact - model_drift_magnitude
+# Set either > 0 to inject errors. Floored at 0.5 inside the simulator.
 GROUND_TRUTH_SIM_FEATURE_DRIFT_IMPACT: float = float(
     os.environ.get("GROUND_TRUTH_SIM_FEATURE_DRIFT_IMPACT", "0.0")
 )
@@ -397,9 +412,7 @@ _drift_gen_cfg = _yaml_cfg.get("drift_generation", {}) if isinstance(
 ) else {}
 
 DRIFT_GEN_DEFAULT_CONFIG: dict = _drift_gen_cfg.get("default_drift", {})
-DRIFT_GEN_VARIABLE_PATTERNS: dict = _drift_gen_cfg.get("variable_patterns", {})
 DRIFT_GEN_NUM_SAMPLES: int = int(_drift_gen_cfg.get("num_samples", "5000"))
-DRIFT_GEN_NUM_SAMPLES_PER_RUN: int = int(_drift_gen_cfg.get("num_samples_per_run", "2000"))
 DRIFT_GEN_RANDOM_STATE: int = int(_drift_gen_cfg.get("random_state", "123"))
 
 # ===================================================================

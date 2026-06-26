@@ -30,8 +30,10 @@ LOW_CONFIDENCE_UPPER = float(os.getenv('LOW_CONFIDENCE_UPPER', '0.6'))
 sqs_client = None
 
 
-def _region_from_queue_url(url: str) -> str | None:
+def _region_from_queue_url(url):
     # URL shape: https://sqs.<region>.amazonaws.com/<account>/<queue>
+    # Untyped return — the SageMaker XGBoost container ships Python 3.9
+    # and chokes on PEP 604 `str | None` syntax at import time.
     try:
         host = url.split('//', 1)[1].split('/', 1)[0]
         parts = host.split('.')

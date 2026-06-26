@@ -49,7 +49,7 @@ sagemaker_client = boto3.client('sagemaker')
 ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'fraud_detection')
 ATHENA_OUTPUT_S3 = os.getenv('ATHENA_OUTPUT_S3', 's3://fraud-detection-data-lake/athena-query-results/')
 ATHENA_EVALUATION_TABLE = os.getenv('ATHENA_EVALUATION_TABLE', 'evaluation_data')
-MODEL_PACKAGE_GROUP = os.getenv('MODEL_PACKAGE_GROUP', 'xgboost-fraud-detector')
+MODEL_PACKAGE_GROUP = os.getenv('MODEL_PACKAGE_GROUP', 'fraud-detection')
 SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN')
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
 MONITORING_SQS_QUEUE_URL = os.getenv('MONITORING_SQS_QUEUE_URL', '')
@@ -211,10 +211,14 @@ def load_baseline_from_registry() -> dict | None:
 
     try:
         pkg = sagemaker_client.describe_model_package(ModelPackageName=arn)
+        # SageMaker's describe-model-package returns model statistics under
+        # ModelMetrics.ModelQuality.Statistics.S3Uri (per the boto3 schema).
+        # The legacy key ModelMetrics.ModelStatistics.S3Uri is kept as a
+        # fallback in case older SDK versions populate it.
+        metrics = pkg.get('ModelMetrics', {})
         s3_uri = (
-            pkg.get('ModelMetrics', {})
-               .get('ModelStatistics', {})
-               .get('S3Uri')
+            metrics.get('ModelQuality', {}).get('Statistics', {}).get('S3Uri')
+            or metrics.get('ModelStatistics', {}).get('S3Uri')
         )
         if not s3_uri:
             print(f"⚠️ ModelPackage {arn} has no ModelStatistics URI — skipping baseline")
@@ -377,23 +381,22 @@ def check_data_drift():
 
     current_df = pd.DataFrame(current_rows)
 
-    # Sample baseline data from the frozen evaluation slice. We pin the
-    # exact Iceberg snapshot the model was scored on (carried in
-    # baseline.json) so re-seeding evaluation_data later cannot
-    # retroactively change "what this model considers normal". If no
-    # snapshot is available we fall back to the live table (still
-    # better than the training table since evaluation_data is frozen
-    # between pipeline runs, but loses per-version reproducibility).
+    # Industry-standard data-drift baseline: training_data (the distribution
+    # the model was TRAINED on). Pin the exact Iceberg snapshot the training
+    # job used (carried in baseline.json as training_snapshot_id) so
+    # re-seeding training_data later doesn't retroactively change "what
+    # this model considers normal". Model drift uses evaluation_data
+    # (the labeled held-out set) — see check_model_drift below.
     baseline = load_baseline_from_registry()
-    baseline_table = (baseline or {}).get('evaluation_table') or ATHENA_EVALUATION_TABLE
-    eval_snapshot = (baseline or {}).get('evaluation_snapshot_id') or ''
+    baseline_table = (baseline or {}).get('training_table') or 'training_data'
+    train_snapshot = (baseline or {}).get('training_snapshot_id') or ''
 
-    if eval_snapshot:
+    if train_snapshot:
         from_clause = (
             f"{ATHENA_DATABASE}.{baseline_table} "
-            f"FOR VERSION AS OF {eval_snapshot}"
+            f"FOR VERSION AS OF {train_snapshot}"
         )
-        snapshot_log = f"snapshot {eval_snapshot}"
+        snapshot_log = f"snapshot {train_snapshot}"
     else:
         from_clause = f"{ATHENA_DATABASE}.{baseline_table}"
         snapshot_log = "live table (no snapshot pinned)"
@@ -1039,6 +1042,31 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
         print(f"✓ Monitoring results sent to SQS: {run_id}")
     except Exception as e:
         print(f"❌ Failed to send monitoring results to SQS: {e}")
+
+    # Backfill monitoring_run_id onto the inference rows this run scored.
+    # The `monitoring_run_id IS NULL` guard makes this naturally delta-shaped:
+    # each scheduled run only tags predictions never tagged by any prior run.
+    # Same id is now in monitoring_responses (above) and inference_responses
+    # (here) → QuickSight can join the two tables on monitoring_run_id.
+    if ENDPOINT_NAME:
+        backfill_sql = f"""
+        UPDATE {ATHENA_DATABASE}.inference_responses
+        SET monitoring_run_id = '{run_id}'
+        WHERE endpoint_name = '{ENDPOINT_NAME}'
+          AND monitoring_run_id IS NULL
+          AND request_timestamp <= TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}'
+        """
+        try:
+            execute_athena_query(backfill_sql, wait=True)
+            print(f"✓ Backfilled monitoring_run_id={run_id} onto inference_responses (delta since last run)")
+        except Exception as e:
+            # Athena UPDATE manifest parse may raise but the UPDATE still succeeded.
+            # Treat real failures distinctly from the parse warning.
+            msg = str(e)
+            if 'Query failed' in msg:
+                print(f"⚠️ Backfill UPDATE failed: {e}")
+            else:
+                print(f"✓ Backfilled monitoring_run_id={run_id} (result-parse warning ignored: {msg[:80]})")
 
 
 # =========================================================================
