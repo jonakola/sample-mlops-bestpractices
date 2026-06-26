@@ -30,10 +30,39 @@ LOW_CONFIDENCE_UPPER = float(os.getenv('LOW_CONFIDENCE_UPPER', '0.6'))
 sqs_client = None
 
 
+def _region_from_queue_url(url: str) -> str | None:
+    # URL shape: https://sqs.<region>.amazonaws.com/<account>/<queue>
+    try:
+        host = url.split('//', 1)[1].split('/', 1)[0]
+        parts = host.split('.')
+        if len(parts) >= 3 and parts[0] == 'sqs':
+            return parts[1]
+    except Exception:
+        pass
+    return None
+
+
 def get_sqs_client():
     global sqs_client
     if sqs_client is None:
-        region = os.getenv('SAGEMAKER_REGION', 'us-east-1')
+        # Region must be resolved deterministically — no hardcoded default.
+        # A wrong region gives "NonExistentQueue" against a queue URL that
+        # is in fact valid; we'd rather fail loudly than silently log to
+        # the void. Resolution order:
+        #   1. Region embedded in SQS_QUEUE_URL (source of truth)
+        #   2. SAGEMAKER_REGION env (set by SageMaker container)
+        #   3. AWS_REGION env (standard AWS default)
+        region = (
+            _region_from_queue_url(SQS_QUEUE_URL)
+            or os.getenv('SAGEMAKER_REGION')
+            or os.getenv('AWS_REGION')
+        )
+        if not region:
+            raise RuntimeError(
+                "Cannot determine AWS region for SQS client. None of "
+                "SQS_QUEUE_URL, SAGEMAKER_REGION, or AWS_REGION yielded a "
+                f"region. SQS_QUEUE_URL={SQS_QUEUE_URL!r}"
+            )
         sqs_client = boto3.client('sqs', region_name=region)
     return sqs_client
 
