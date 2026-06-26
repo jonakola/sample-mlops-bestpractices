@@ -208,9 +208,9 @@ S3_BATCH_TRANSFORM_OUTPUT: str = _s3_path(
 # ===================================================================
 # SQS
 # ===================================================================
-SQS_QUEUE_NAME: str = _get(
-    "sqs", "inference_queue_name", "SQS_QUEUE_NAME", "fraud-inference-logs"
-)
+# SQS_QUEUE_URL is set at endpoint-deploy time (notebook 2 resolves the URL
+# from CFN's InferenceLoggerQueue and passes it into the container env).
+# Empty by default — the inference handler skips Athena logging if unset.
 SQS_QUEUE_URL: str = _get("sqs", "inference_queue_url", "SQS_QUEUE_URL", "")
 MONITORING_SQS_QUEUE_NAME: str = _get(
     "sqs", "monitoring_queue_name", "MONITORING_SQS_QUEUE_NAME",
@@ -223,18 +223,11 @@ MONITORING_SQS_QUEUE_URL: str = _get(
 # ===================================================================
 # Inference logging
 # ===================================================================
-# These configure the legacy direct-Athena writer (inference_handler.py). The
-# CloudFormation-provisioned SQS→Lambda batch parameters are set in the CFN
-# template; these values only apply when SQS_QUEUE_URL is unset.
+# Master switch — when false, the inference handler returns predictions but
+# does NOT send to SQS. Used at endpoint-deploy time as a container env var.
 ENABLE_ATHENA_LOGGING: bool = (
     _get("inference_logging", "enable_athena_logging", "ENABLE_ATHENA_LOGGING", "true")
     .lower() in ("true", "1", "yes")
-)
-INFERENCE_LOG_BATCH_SIZE: int = int(
-    _get("inference_logging", "batch_size", "INFERENCE_LOG_BATCH_SIZE", "50")
-)
-INFERENCE_LOG_FLUSH_INTERVAL: int = int(
-    _get("inference_logging", "flush_interval", "INFERENCE_LOG_FLUSH_INTERVAL", "300")
 )
 
 # ===================================================================
@@ -253,9 +246,6 @@ LOW_CONFIDENCE_UPPER: float = float(
 # ===================================================================
 # Lambda
 # ===================================================================
-LAMBDA_LOGGER_NAME: str = _get(
-    "lambda", "logger_name", "LAMBDA_LOGGER_NAME", "fraud-inference-log-consumer"
-)
 LAMBDA_EXEC_ROLE: str = _get("lambda", "exec_role", "LAMBDA_EXEC_ROLE", "")
 
 # ===================================================================
