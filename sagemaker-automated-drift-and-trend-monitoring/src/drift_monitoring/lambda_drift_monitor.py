@@ -599,13 +599,37 @@ def check_model_drift():
         suffix='.html', prefix='model_perf_', delete=False, dir='/tmp'
     ).name
 
-    classification_result = run_classification_report(
-        baseline_df=baseline_df,
-        current_df=current_df,
-        target_column='ground_truth',
-        prediction_column='prediction',
-        output_path=html_path,
-    )
+    # Evidently's ClassificationPreset needs BOTH classes (0 AND 1) in BOTH
+    # `ground_truth` and `prediction` of BOTH datasets — otherwise it raises
+    # KeyError: '0' deep inside ClassificationQualityByClass. On highly
+    # imbalanced data (fraud ≈ 0.2%) it's common for the model to never
+    # predict the minority class on a small sample. Skip the report
+    # generation in that case rather than failing the whole Lambda run.
+    sides = [
+        ('baseline.ground_truth', baseline_df['ground_truth']),
+        ('baseline.prediction',   baseline_df['prediction']),
+        ('current.ground_truth',  current_df['ground_truth']),
+        ('current.prediction',    current_df['prediction']),
+    ]
+    degenerate = [name for name, col in sides if col.nunique() < 2]
+    classification_result = None
+    if degenerate:
+        print(f"  ⚠ Skipping Evidently classification report — single-class column(s): {degenerate}")
+        print(f"    Likely cause: model never predicted the minority class on this sample.")
+        print(f"    Numeric metrics (ROC-AUC, precision, recall) above are still valid.")
+    else:
+        try:
+            classification_result = run_classification_report(
+                baseline_df=baseline_df,
+                current_df=current_df,
+                target_column='ground_truth',
+                prediction_column='prediction',
+                output_path=html_path,
+            )
+        except ValueError as e:
+            # Pre-flight in run_classification_report caught a degenerate case
+            # we didn't (e.g., NaN-filtering inside Evidently). Log and proceed.
+            print(f"  ⚠ Skipping Evidently classification report: {e}")
 
     detected = degradation_pct >= (MODEL_DRIFT_THRESHOLD * 100)
     if detected:
@@ -623,8 +647,8 @@ def check_model_drift():
         'precision': current_precision,
         'recall': current_recall,
         'sample_size': len(recent_performance),
-        'html_report_path': html_path,
-        'evidently_metrics': classification_result.get('metrics', []),
+        'html_report_path': html_path if classification_result else None,
+        'evidently_metrics': classification_result.get('metrics', []) if classification_result else [],
     }
 
 

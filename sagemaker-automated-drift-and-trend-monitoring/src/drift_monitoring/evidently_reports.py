@@ -128,15 +128,23 @@ def run_classification_report(
             early before Evidently crashes with a confusing KeyError).
     """
     # Pre-flight check — Evidently's KeyError is unhelpful; fail loudly here.
+    # Both `target` AND `prediction` columns must contain BOTH classes (0 AND 1)
+    # in BOTH datasets. Evidently's `ClassificationQualityByClass` internally
+    # calls sklearn's `classification_report` without `labels=` — sklearn then
+    # omits classes that never appear as predictions, and Evidently crashes
+    # with `KeyError: '0'` when it tries to read the omitted class.
     for label, df in (("baseline_df", baseline_df), ("current_df", current_df)):
-        n_classes = df[target_column].nunique()
-        if n_classes < 2:
-            raise ValueError(
-                f"{label} has only {n_classes} class in column '{target_column}' "
-                f"(values: {sorted(df[target_column].unique().tolist())}). "
-                f"Evidently ClassificationPreset requires BOTH 0 and 1 to be present "
-                f"in both datasets. Stratify the source query if you hit this."
-            )
+        for col in (target_column, prediction_column):
+            unique = sorted(df[col].dropna().unique().tolist())
+            if len(unique) < 2:
+                raise ValueError(
+                    f"{label}.{col} has only {len(unique)} unique value(s): {unique}. "
+                    f"Evidently ClassificationPreset needs BOTH 0 and 1 in BOTH "
+                    f"target and prediction columns of BOTH datasets. "
+                    f"If the model never predicted the minority class on this sample, "
+                    f"either increase the sample size, lower the decision threshold, "
+                    f"or stratify the upstream query to guarantee class diversity."
+                )
 
     data_def = DataDefinition(
         classification=[
