@@ -741,12 +741,36 @@ class FraudDetectionPipeline:
             version=self.config['xgboost_version']
         )
 
-        # Create ModelBuilder with training artifacts (v3 pattern)
+        # Create ModelBuilder with training artifacts AND the custom inference
+        # handler. Passing source_code here is critical: ModelBuilder.register()
+        # repackages the training tarball to include code/inference.py and sets
+        # SAGEMAKER_PROGRAM/SAGEMAKER_SUBMIT_DIRECTORY on the ModelPackage so
+        # the container loads in script mode when a downstream
+        # CreateModel/CreateEndpoint deploys from the registry. Omitting
+        # source_code produces a bare xgboost tarball that loads in algorithm
+        # mode — feature_names.json gets picked up as the model file and the
+        # endpoint fails to start.
         model_builder = ModelBuilder(
             image_uri=xgboost_image,
             s3_model_data_url=training_step.properties.ModelArtifacts.S3ModelArtifacts,
             role_arn=self.role,
+            source_code=SourceCode(
+                source_dir=str(Path(__file__).parent / "pipeline_steps"),
+                entry_script="inference.py",
+            ),
             sagemaker_session=self.session,
+            env_vars={
+                'MLFLOW_TRACKING_URI': MLFLOW_TRACKING_URI if MLFLOW_TRACKING_URI else '',
+                'MLFLOW_MODEL_NAME': MLFLOW_MODEL_NAME,
+                'ENABLE_ATHENA_LOGGING': 'true',
+                'ENDPOINT_NAME': params['endpoint_name'],
+                'ATHENA_DATABASE': ATHENA_DATABASE,
+                'ATHENA_OUTPUT_S3': ATHENA_OUTPUT_S3,
+                'DATA_S3_BUCKET': DATA_S3_BUCKET,
+                'SQS_QUEUE_URL': os.getenv('SQS_QUEUE_URL', SQS_QUEUE_URL),
+                'MODEL_VERSION': 'pipeline',
+                'MLFLOW_RUN_ID': 'pipeline',
+            },
         )
 
         # ModelStep wraps model_builder.register() to produce a pipeline step
