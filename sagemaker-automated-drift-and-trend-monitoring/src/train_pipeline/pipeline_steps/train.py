@@ -493,12 +493,23 @@ def save_model(
     output_dir: str
 ) -> None:
     """
-    Save model and feature metadata.
+    Save model + feature metadata + custom inference handler.
+
+    The handler must live under ``{output_dir}/code/inference.py`` so the
+    SageMaker XGBoost container picks it up in script mode at deploy time.
+    SageMaker tars whatever's in ``output_dir`` at the end of the training
+    job; everything inside ``code/`` ends up at ``/opt/ml/model/code/`` on
+    the inference container, which is where SAGEMAKER_SUBMIT_DIRECTORY
+    points by default. Without this copy, the registered ModelPackage's
+    tarball would have only the model file + feature_names.json, the
+    container would fall back to algorithm mode, and predictions would
+    never go through our custom predict_fn (no SQS logging → empty
+    inference_responses Athena table).
 
     Args:
         model: Trained XGBoost model
         feature_names: List of feature names
-        output_dir: Output directory path
+        output_dir: Output directory path (typically /opt/ml/model)
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -517,6 +528,23 @@ def save_model(
     logger.info(f"Saving feature metadata to {feature_path}")
     with open(feature_path, 'w') as f:
         json.dump(feature_metadata, f, indent=2)
+
+    # Bundle the inference handler so the deployed endpoint runs in script mode.
+    # train.py and inference.py are uploaded together via ModelTrainer(source_code=...)
+    # to /opt/ml/code/, so we just copy the sibling file into the model output.
+    import shutil
+    code_src = Path(__file__).parent / "inference.py"
+    code_dst_dir = output_path / "code"
+    code_dst_dir.mkdir(exist_ok=True)
+    code_dst = code_dst_dir / "inference.py"
+    if code_src.exists():
+        shutil.copy2(code_src, code_dst)
+        logger.info(f"Bundled inference handler: {code_dst}")
+    else:
+        logger.warning(
+            f"inference.py not found at {code_src} — deployed endpoint will "
+            f"fall back to algorithm mode and inference logging will not work."
+        )
 
     logger.info("✓ Model saved successfully")
 
