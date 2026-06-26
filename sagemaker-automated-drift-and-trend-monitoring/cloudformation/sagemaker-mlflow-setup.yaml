@@ -1496,6 +1496,8 @@ Resources:
               ('response_time', 'timestamp'),
               ('error_message', 'varchar'),
               ('inference_mode', 'varchar'),
+              # NULL on initial insert; backfilled by the drift run that scored this row.
+              ('monitoring_run_id', 'varchar'),
           ]
 
           def sql_val(v, col_type):

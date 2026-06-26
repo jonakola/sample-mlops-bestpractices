@@ -79,25 +79,22 @@ s3:
 # ---------------------------------------------------------------------------
 # SQS queue configuration
 # ---------------------------------------------------------------------------
+# Inference-logging queue (CFN resource InferenceLoggerQueue, name
+# ${ProjectName}-inference-logging) is resolved at endpoint-deploy time —
+# notebook 2 looks it up by name and passes the URL into the container env.
+# The monitoring-results queue below is created by notebook 3 (Section 5).
 sqs:
-  # Inference logging queue
-  inference_queue_name: fraud-inference-logs
-  inference_queue_url: ""        # Full SQS queue URL (set after creation)
-  # Monitoring results queue
   monitoring_queue_name: fraud-monitoring-results
   monitoring_queue_url: ""
 
 # ---------------------------------------------------------------------------
-# Inference logging
+# Inference logging master switch
 # ---------------------------------------------------------------------------
-# The CloudFormation stack provisions the actual SQS→Lambda batch parameters
-# (batch_size=10, flush_window=30s) in sagemaker-mlflow-setup.yaml. The values
-# below configure the legacy direct-Athena writer in inference_handler.py if
-# enable_athena_logging is "true" but SQS_QUEUE_URL is unset.
+# Container env var. When false, the inference handler returns predictions
+# but skips the SQS send. Used for endpoints where you want pure inference
+# without the drift-monitoring side-effects.
 inference_logging:
   enable_athena_logging: "true"
-  batch_size: "50"               # Buffered direct-Athena writer flush size
-  flush_interval: "300"          # Seconds between flush cycles
 
 # ---------------------------------------------------------------------------
 # Inference confidence thresholds
@@ -110,12 +107,14 @@ inference:
 # ---------------------------------------------------------------------------
 # Lambda configuration
 # ---------------------------------------------------------------------------
+# inference-logger (${ProjectName}-inference-logger): CloudFormation-provisioned
+#   (cloudformation/sagemaker-mlflow-setup.yaml → InferenceLoggerFunction).
+# monitoring-writer (fraud-monitoring-results-writer): deployed by
+#   src/drift_monitoring/deploy_monitoring_writer.py (notebook 3 Section 5).
+# drift-monitor (fraud-detection-drift-monitor): deployed as a container image
+#   by scripts/deploy_lambda_container.sh (notebook 3 Section 7).
 lambda:
   exec_role: ""                  # ARN of the Lambda execution role
-  logger_name: fraud-inference-log-consumer
-  # monitoring_writer_name: set via MONITORING_WRITER_LAMBDA_NAME env var in
-  # src/drift_monitoring/deploy_monitoring_writer.py
-  # drift monitor (fraud-detection-drift-monitor): provisioned by CloudFormation
 
 # ---------------------------------------------------------------------------
 # Data file paths

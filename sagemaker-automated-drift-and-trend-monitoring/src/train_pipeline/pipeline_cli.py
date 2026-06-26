@@ -1,19 +1,23 @@
 """
-CLI for SageMaker Pipeline operations.
+Library of SageMaker Pipeline operations.
 
-This CLI provides commands for:
-- Creating/updating pipelines (with optional deployment steps)
-- Starting pipeline executions
-- Listing executions
-- Describing execution details
-- Listing pipeline versions
-- Deleting pipelines
+Functions:
+- create_pipeline     — create or update the pipeline definition
+- start_execution     — start a pipeline run
+- wait_for_execution  — block until a run completes
+- list_executions     — list recent runs
+- describe_execution  — get full run details
+- list_pipeline_versions — list registered versions
+- delete_pipeline     — delete a pipeline
+
+Consumed by the project's user-facing CLI in `main.py` (subcommand `pipeline`)
+and by `notebooks/1_training_pipeline.ipynb`. This module is intentionally
+library-only — no `__main__` block — so there is one entry point (`main.py`)
+for command-line use.
 """
 
-import argparse
 import json
 import logging
-import sys
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -370,142 +374,3 @@ def delete_pipeline(pipeline_name: str) -> Dict[str, Any]:
         raise
 
 
-def main():
-    """Main CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="SageMaker Pipeline CLI",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Create pipeline
-  python pipeline_cli.py create-pipeline --pipeline-name fraud-detection-pipeline
-
-  # Start execution
-  python pipeline_cli.py start-execution --pipeline-name fraud-detection-pipeline
-
-  # Start execution with parameters
-  python pipeline_cli.py start-execution --pipeline-name fraud-detection-pipeline \\
-    --parameters '{"EndpointName": "fraud-detector-v2", "MinRocAuc": "0.90"}'
-
-  # List executions
-  python pipeline_cli.py list-executions --pipeline-name fraud-detection-pipeline
-
-  # Describe execution
-  python pipeline_cli.py describe-execution --execution-arn <arn>
-
-  # List versions
-  python pipeline_cli.py list-versions --pipeline-name fraud-detection-pipeline
-
-  # Delete pipeline
-  python pipeline_cli.py delete-pipeline --pipeline-name fraud-detection-pipeline
-        """
-    )
-
-    subparsers = parser.add_subparsers(dest='command', help='Command to run')
-
-    # Create pipeline command
-    create_parser = subparsers.add_parser('create-pipeline', help='Create or update pipeline')
-    create_parser.add_argument('--pipeline-name', required=True, help='Pipeline name')
-    create_parser.add_argument('--region', default='us-east-1', help='AWS region')
-    create_parser.add_argument('--role', help='SageMaker execution role ARN')
-    create_parser.add_argument('--description', default='Fraud detection pipeline',
-                              help='Pipeline description')
-
-    # Start execution command
-    start_parser = subparsers.add_parser('start-execution', help='Start pipeline execution')
-    start_parser.add_argument('--pipeline-name', required=True, help='Pipeline name')
-    start_parser.add_argument('--execution-name', help='Execution name (auto-generated if not provided)')
-    start_parser.add_argument('--parameters', type=json.loads,
-                             help='Pipeline parameters as JSON string')
-    start_parser.add_argument('--wait', action='store_true',
-                             help='Wait for execution to complete')
-
-    # List executions command
-    list_exec_parser = subparsers.add_parser('list-executions', help='List pipeline executions')
-    list_exec_parser.add_argument('--pipeline-name', required=True, help='Pipeline name')
-    list_exec_parser.add_argument('--max-results', type=int, default=10,
-                                  help='Maximum number of results')
-
-    # Describe execution command
-    describe_parser = subparsers.add_parser('describe-execution', help='Describe pipeline execution')
-    describe_parser.add_argument('--execution-arn', required=True, help='Execution ARN')
-
-    # List versions command
-    versions_parser = subparsers.add_parser('list-versions', help='List pipeline versions')
-    versions_parser.add_argument('--pipeline-name', required=True, help='Pipeline name')
-    versions_parser.add_argument('--max-results', type=int, default=10,
-                                help='Maximum number of results')
-
-    # Delete pipeline command
-    delete_parser = subparsers.add_parser('delete-pipeline', help='Delete pipeline')
-    delete_parser.add_argument('--pipeline-name', required=True, help='Pipeline name')
-    delete_parser.add_argument('--confirm', action='store_true',
-                              help='Confirm deletion')
-
-    # Parse arguments
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return 1
-
-    try:
-        # Execute command
-        if args.command == 'create-pipeline':
-            result = create_pipeline(
-                pipeline_name=args.pipeline_name,
-                region=args.region,
-                role=args.role,
-                description=args.description
-            )
-            print(json.dumps(result, indent=2))
-
-        elif args.command == 'start-execution':
-            result = start_execution(
-                pipeline_name=args.pipeline_name,
-                execution_name=args.execution_name,
-                parameters=args.parameters,
-                wait=args.wait
-            )
-            print(json.dumps(result, indent=2, default=str))
-
-        elif args.command == 'list-executions':
-            results = list_executions(
-                pipeline_name=args.pipeline_name,
-                max_results=args.max_results
-            )
-            print(json.dumps(results, indent=2))
-
-        elif args.command == 'describe-execution':
-            result = describe_execution(args.execution_arn)
-            print(json.dumps(result, indent=2))
-
-        elif args.command == 'list-versions':
-            results = list_pipeline_versions(
-                pipeline_name=args.pipeline_name,
-                max_results=args.max_results
-            )
-            print(json.dumps(results, indent=2))
-
-        elif args.command == 'delete-pipeline':
-            if not args.confirm:
-                print("WARNING: This will delete the pipeline permanently.")
-                print("Use --confirm to proceed with deletion.")
-                return 1
-
-            result = delete_pipeline(args.pipeline_name)
-            print(json.dumps(result, indent=2))
-
-        else:
-            logger.error(f"Unknown command: {args.command}")
-            return 1
-
-        return 0
-
-    except Exception as e:
-        logger.error(f"Command failed: {e}", exc_info=True)
-        return 1
-
-
-if __name__ == '__main__':
-    sys.exit(main())
