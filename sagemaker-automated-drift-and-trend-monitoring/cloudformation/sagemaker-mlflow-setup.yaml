@@ -20,8 +20,12 @@ Parameters:
 
   JupyterLabInstance:
     Type: String
-    Default: 'ml.t3.medium'
-    Description: Instance type for JupyterLab space
+    Default: 'ml.m5.large'
+    Description: >-
+      Instance type for JupyterLab space. Default ml.m5.large (8 GB) — needed
+      because notebook 3 drift detection runs two Evidently reports whose
+      reference + current datasets hold ~1-2 GB resident. ml.t3.medium (4 GB)
+      hits 97% memory and OOM-kills the kernel during drift compute.
     AllowedValues:
       - ml.t3.medium
       - ml.t3.large

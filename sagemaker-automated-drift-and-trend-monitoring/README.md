@@ -38,7 +38,10 @@ To pick up new commits without redeploying: **Stop Space**, then **Run Space** (
 
 ### Step 3: Run the Notebooks in Order
 
-Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/notebooks/` and run these notebooks sequentially:
+Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/notebooks/` and run these notebooks sequentially.
+
+> 📊 **Viewing the notebooks online**: GitHub's renderer strips the JavaScript that powers Evidently's interactive drift reports, plotly charts, and ipywidgets — so the saved output cells degrade to raw HTML. To see the live, interactive output without re-running the notebooks, open them via [nbviewer](https://nbviewer.org/github/aws-samples/sample-mlops-bestpractices/tree/main/sagemaker-automated-drift-and-trend-monitoring/notebooks/) instead. Each notebook has a direct nbviewer link in its title cell.
+
 
 | # | Notebook | Purpose | Time |
 |---|----------|---------|------|
