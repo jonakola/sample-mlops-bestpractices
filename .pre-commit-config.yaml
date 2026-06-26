@@ -1,0 +1,17 @@
+# Pre-commit hooks — install per clone with `pre-commit install`.
+# See README "Pre-commit hooks" section for setup.
+repos:
+  - repo: local
+    hooks:
+      - id: scrub-account-numbers
+        name: Scrub AWS account numbers
+        description: >-
+          Replace any 12-digit AWS account number found in staged files with
+          <ACCOUNT_ID>. Fails the commit if changes were made so the user
+          can review with `git diff` and re-stage.
+        entry: scripts/pre-commit-scrub.sh
+        language: script
+        # Limit to the file types most likely to contain leaked account IDs.
+        # ipynb is the big one — every cell output may carry an S3 URI or ARN.
+        files: \.(py|ipynb|yaml|yml|md|json|txt|sh|tf|cfg|ini)$
+        pass_filenames: true
