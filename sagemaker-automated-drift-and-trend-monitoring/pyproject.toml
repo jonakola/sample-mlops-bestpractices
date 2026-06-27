@@ -29,6 +29,15 @@ dependencies = [
     "ipykernel>=6.29.0",       # Jupyter kernel for notebook execution
     "ipywidgets>=8.1.0",       # Silences tqdm IProgress warning; required by Evidently HTML reports
     "kagglehub>=0.2.0",        # Download Kaggle datasets for training data
+    # sm-docker (ships as `sagemaker-studio-image-build`) is required by
+    # notebook 3 Section 7.2 to build the drift-monitor Lambda container
+    # image. SageMaker Studio JupyterLab spaces do NOT have a Docker daemon —
+    # so `docker build` fails. sm-docker provisions an ephemeral AWS CodeBuild
+    # project, runs the build there, and pushes the resulting image to ECR.
+    # The deploy_lambda_container.sh script auto-detects which path to take:
+    # if a local Docker daemon is reachable it uses `docker build` directly;
+    # otherwise it falls back to `sm-docker build`.
+    "sagemaker-studio-image-build>=0.6.0",
 ]
 
 # Explicitly point setuptools at `src/` (and all sub-packages it auto-discovers

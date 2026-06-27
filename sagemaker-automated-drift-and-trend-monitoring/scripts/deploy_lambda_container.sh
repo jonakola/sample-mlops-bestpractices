@@ -158,17 +158,43 @@ aws ecr create-repository \
 echo "  ✓ Repository: $REPO_NAME"
 
 # Step 4: Build and push Docker image
+#
+# Two paths, auto-detected:
+#   - Local Docker daemon reachable → use `docker build` directly (fast, ~2 min)
+#   - No local daemon (SageMaker Studio JupyterLab) → use `sm-docker build`
+#     which runs the build in an AWS-managed CodeBuild project and pushes
+#     the result to ECR (no daemon needed; ~5-8 min)
+#
+# `sm-docker` ships in the sagemaker-studio-image-build package. Install
+# inside the kernel before re-running notebook 3 Section 7.2:
+#     pip install sagemaker-studio-image-build
 echo ""
 echo "[4/7] Building Docker image..."
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
-docker build --platform linux/amd64 -t $REPO_NAME:latest -f src/drift_monitoring/Dockerfile.lambda . -q
-docker tag $REPO_NAME:latest $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME:latest
-echo "  ✓ Image built"
 
-echo "  Pushing to ECR..."
-docker push $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME:latest | tail -5
 IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME:latest"
-echo "  ✓ Image pushed: $IMAGE_URI"
+
+if docker info >/dev/null 2>&1; then
+    echo "  ✓ Local Docker daemon detected — using direct build"
+    aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+    docker build --platform linux/amd64 -t $REPO_NAME:latest -f src/drift_monitoring/Dockerfile.lambda . -q
+    docker tag $REPO_NAME:latest $IMAGE_URI
+    echo "  ✓ Image built"
+    echo "  Pushing to ECR..."
+    docker push $IMAGE_URI | tail -5
+    echo "  ✓ Image pushed: $IMAGE_URI"
+elif command -v sm-docker >/dev/null 2>&1; then
+    echo "  ℹ No local Docker daemon — using sm-docker (SageMaker Studio CodeBuild) instead."
+    echo "  This takes ~5-8 minutes; the build runs in AWS, output streams below."
+    sm-docker build . \
+        --repository "$REPO_NAME:latest" \
+        --file src/drift_monitoring/Dockerfile.lambda
+    echo "  ✓ Image built and pushed via CodeBuild: $IMAGE_URI"
+else
+    echo "❌ Cannot build image — no Docker daemon and sm-docker not installed."
+    echo "   Install it inside the kernel:  pip install sagemaker-studio-image-build"
+    echo "   Or run this script from a host with Docker (e.g. your laptop)."
+    exit 1
+fi
 
 # Step 5: Create/Update Lambda function
 echo ""
