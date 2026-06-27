@@ -58,7 +58,12 @@ Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/
 | 6 | `6_optional_cleanup.ipynb` | Deletes all AWS resources created outside CloudFormation (Lambda functions, endpoints, SNS topics, dashboards, CloudWatch alarms). |
 | 7 | `7_shap_explainability.ipynb` | Generates SHAP global and per-prediction feature importance plots for the trained model. |
 
-> **Note:** Notebook 1 cell 2 runs `! uv pip install -e ../`. If you see `No virtual environment found`, the error message tells you how to resolve it (run `uv venv` or add `--system`).
+### What to expect during long-running cells
+
+- **Notebook 1 cell 2** runs `! uv pip install -e ../`. If you see `No virtual environment found`, the error message tells you how to resolve it (run `uv venv` or add `--system`).
+- **Notebook 3 Section 7.2** builds the drift-monitor Lambda as a container image. SageMaker JupyterLab spaces don't have a local Docker daemon, so the script auto-falls back to `sm-docker build`, which provisions an ephemeral AWS CodeBuild project to do the build. **First build takes ~5–8 minutes**; subsequent rebuilds (when you set `REDEPLOY_LAMBDAS = True`) take ~3–5 min. Watch the CodeBuild output stream in the cell.
+- **Notebook 4 cell 2** queries QuickSight. QuickSight has a fixed *identity region* (the region your QuickSight account was first activated in) — all QuickSight API calls must hit that endpoint regardless of where your data lives. Default is `us-east-1`; override via `QUICKSIGHT_IDENTITY_REGION` in `.env` if your account is elsewhere.
+- **Notebook 3 Section 7.1** defaults `ALERT_EMAIL=nobody@example.com` so the deploy succeeds out of the box. Replace it with a real email in `.env` if you want SNS alerts to actually arrive — `example.com` is IANA-reserved as non-deliverable.
 
 ## What This Solution Does
 
