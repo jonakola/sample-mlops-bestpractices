@@ -147,6 +147,11 @@ def write_to_athena(data):
     Column list MUST match the CFN `monitoring_responses` DDL exactly —
     INSERT VALUES with no column list is positional, so adding or
     reordering columns in CFN requires the same change here.
+
+    ⚠️ Source of truth: cloudformation/sagemaker-mlflow-setup.yaml
+    monitoring_responses DDL block (search for "monitoring_run_id STRING,
+    monitoring_timestamp TIMESTAMP"). Editing one without the other will
+    cause silent INSERT failures or column misalignment.
     """
     columns = [
         'monitoring_run_id', 'monitoring_timestamp',

@@ -18,8 +18,20 @@ project:
 # ---------------------------------------------------------------------------
 # AWS
 # ---------------------------------------------------------------------------
+# `region` is the data-plane region: everything you provision (SageMaker
+# domain, Lambdas, S3, Athena, ECR, EventBridge) lives here. CFN, the
+# notebooks, and the deploy/delete shell scripts ALL read this value
+# (overridable per-run via AWS_REGION / AWS_DEFAULT_REGION env vars).
+#
+# `quicksight_identity_region` is independent — QuickSight has a single
+# identity endpoint per account (the region where you first activated the
+# subscription). ALL QuickSight API calls must hit that endpoint regardless
+# of where the data lives. Default to us-east-1 since that's the most
+# common identity region; override here or via QUICKSIGHT_IDENTITY_REGION
+# env var if your account was activated elsewhere.
 aws:
-  region: us-east-1
+  region: us-west-2
+  quicksight_identity_region: us-east-1
 
 # ---------------------------------------------------------------------------
 # SageMaker
@@ -40,7 +52,10 @@ mlflow:
   inference_experiment_name: credit-card-fraud-detection-inference
   batch_experiment_name: credit-card-fraud-detection-batch
   monitoring_experiment_name: credit-card-fraud-detection-monitoring
-  model_name: xgboost-fraud-detector
+  # Single canonical identifier — used as both the MLflow registered-model name
+  # AND the SageMaker Model Package Group name. pipeline.py's MPG parameter
+  # defaults to this value; the drift Lambda reads it from MODEL_PACKAGE_GROUP env.
+  model_name: fraud-detection
 
 # ---------------------------------------------------------------------------
 # Athena data lake settings
@@ -50,14 +65,19 @@ athena:
   workgroup: primary
   output_s3: ""                  # S3 path for Athena query results (derived from data bucket if empty)
   query_timeout: 300             # Seconds
+  # All seven tables created by CloudFormation (sagemaker-mlflow-setup.yaml
+  # SetupAthenaTables custom resource) and exposed as constants in config.py.
   training_table: training_data
   evaluation_table: evaluation_data
   inference_table: inference_responses
+  monitoring_responses_table: monitoring_responses
+  # Two ground-truth tables — `ground_truth` is the raw labels feed (one
+  # row per labeled transaction), `ground_truth_updates` records the
+  # ground-truth-applied audit trail per inference_id and is what the
+  # drift Lambda joins against for model-drift scoring.
   ground_truth_table: ground_truth
   ground_truth_updates_table: ground_truth_updates
   drifted_data_table: drifted_data
-  # monitoring_responses_table is hardcoded in deploy_monitoring_writer.py
-  # (inline Lambda code, override via MONITORING_TABLE_NAME env var).
 
 # ---------------------------------------------------------------------------
 # S3 storage
@@ -79,10 +99,14 @@ s3:
 # ---------------------------------------------------------------------------
 # SQS queue configuration
 # ---------------------------------------------------------------------------
-# Inference-logging queue (CFN resource InferenceLoggerQueue, name
-# ${ProjectName}-inference-logging) is resolved at endpoint-deploy time —
-# notebook 2 looks it up by name and passes the URL into the container env.
-# The monitoring-results queue below is created by notebook 3 (Section 5).
+# Two SQS queues exist:
+#   1. Inference-logging queue (CFN resource InferenceLoggerQueue, name
+#      ${ProjectName}-inference-logging). Resolved at endpoint-deploy time —
+#      notebook 2 looks it up by name and passes the URL into the container env.
+#   2. Monitoring-results queue (name below). Created at runtime by
+#      src/drift_monitoring/deploy_monitoring_writer.py — calls sqs.create_queue
+#      with this name, then wires the queue → fraud-monitoring-results-writer
+#      Lambda. Triggered from notebook 3 Section 5.2.
 sqs:
   monitoring_queue_name: fraud-monitoring-results
   monitoring_queue_url: ""
@@ -107,21 +131,50 @@ inference:
 # ---------------------------------------------------------------------------
 # Lambda configuration
 # ---------------------------------------------------------------------------
-# inference-logger (${ProjectName}-inference-logger): CloudFormation-provisioned
-#   (cloudformation/sagemaker-mlflow-setup.yaml → InferenceLoggerFunction).
-# monitoring-writer (fraud-monitoring-results-writer): deployed by
-#   src/drift_monitoring/deploy_monitoring_writer.py (notebook 3 Section 5).
-# drift-monitor (fraud-detection-drift-monitor): deployed as a container image
-#   by scripts/deploy_lambda_container.sh (notebook 3 Section 7).
+# Three Lambdas in this project (none of their names are configurable here —
+# they're set in their respective deployers/CFN):
+#
+#   inference-logger  (${ProjectName}-inference-logger)
+#     CloudFormation-provisioned (sagemaker-mlflow-setup.yaml →
+#     InferenceLoggerFunction). Drains the inference-logging SQS queue into
+#     the inference_responses Athena table.
+#
+#   monitoring-writer (fraud-monitoring-results-writer)
+#     Out-of-band — deployed by src/drift_monitoring/deploy_monitoring_writer.py,
+#     invoked from notebook 3 Section 5.2. Drains the monitoring-results SQS
+#     queue (above) into monitoring_responses + back-fills monitoring_run_id
+#     on inference_responses.
+#
+#   drift-monitor    (fraud-detection-drift-monitor)
+#     Out-of-band container image — built+pushed via CodeBuild and deployed
+#     by scripts/deploy_lambda_container.sh, invoked from notebook 3
+#     Section 7.2. Runs Evidently data + model drift on a daily EventBridge
+#     schedule; SQS-sends the result for monitoring-writer to persist.
 lambda:
   exec_role: ""                  # ARN of the Lambda execution role
 
 # ---------------------------------------------------------------------------
 # Data file paths
 # ---------------------------------------------------------------------------
-# Local paths are relative to project root (used only by upload_data_to_s3.py
-# and download_kaggle_dataset.py). Pipeline/Athena code uses the S3 paths below.
+# Training data is downloaded from Kaggle at runtime by
+# src/setup/download_kaggle_dataset.py — the local CSVs below are NOT in the
+# repo and only materialize if you run that script.
+#
+# Drifted data is generated at runtime by src/drift_monitoring/generate_drift_dataset.py
+# (see drift_generation block further down) and written to
+# data/creditcard_drifted.csv.
+#
+# Ground truth is generated at runtime by
+# src/drift_monitoring/simulate_ground_truth_from_athena.py (notebook 3
+# Section 4) and written directly to the ground_truth_updates Athena table —
+# no local CSV.
+#
+# Pipeline + Athena code use the S3 paths below, not the local files.
 data:
+  # CSV defaults referenced only by:
+  #   src/setup/setup_athena_tables.py (legacy bulk-load path)
+  #   src/train_pipeline/athena/data_migrator.py (one-off Athena bootstrap)
+  # The normal flow (notebook 1 → Kaggle download → train) never reads these.
   csv_training_data: "data/creditcard_predictions_final.csv"
   csv_ground_truth: "data/creditcard_ground_truth.csv"
   csv_drifted_data: "data/creditcard_drifted.csv"
@@ -133,10 +186,12 @@ data:
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-# Target column, test split, and feature list are defined in
-# src/setup/download_kaggle_dataset.py (the column-rename map) and the preprocessing
-# step. Only XGBoost hyperparameters live here because they need to be
-# tunable without re-deriving the dataset.
+# Target column, feature list, and column-rename map live in code, not YAML —
+# changing them requires updating preprocessing + the training pipeline:
+#   - TARGET_COLUMN / TRAINING_FEATURES → src/config/config.py
+#   - Kaggle-column → project-column rename map → src/setup/download_kaggle_dataset.py
+# Only XGBoost hyperparameters live in this section because they're tunable
+# without re-deriving the dataset.
 training:
   random_state: 42
   # XGBoost hyperparameters tuned for severe class imbalance (~580:1 in the
@@ -157,13 +212,19 @@ training:
     eval_metric: "auc"
 
 # ---------------------------------------------------------------------------
-# Drift detection thresholds (used by monitor_model_performance.py)
+# Drift detection thresholds
 # ---------------------------------------------------------------------------
-# Note: the daily drift Lambda (fraud-detection-drift-monitor) does NOT read
-# these — it reads DATA_DRIFT_THRESHOLD / KS_PVALUE_THRESHOLD / MODEL_DRIFT_THRESHOLD
-# / DATA_DRIFT_LOOKBACK_DAYS / MODEL_DRIFT_LOOKBACK_DAYS from its Lambda
-# environment variables (set at deploy time). To tune the Lambda, update its
-# environment configuration, not this file.
+# Read into config.py as MIN_ROC_AUC_THRESHOLD / DATA_DRIFT_THRESHOLD /
+# MODEL_DRIFT_THRESHOLD. Consumers:
+#   - src/drift_monitoring/monitor_model_performance.py (in-notebook drift run)
+#   - notebook 3 Section 6.5 (alert summary) + Section 7.1 (deploy banner)
+#
+# NOT read by the daily fraud-detection-drift-monitor Lambda — that one
+# reads its thresholds (DATA_DRIFT_THRESHOLD, KS_PVALUE_THRESHOLD,
+# MODEL_DRIFT_THRESHOLD, DATA_DRIFT_LOOKBACK_DAYS, MODEL_DRIFT_LOOKBACK_DAYS)
+# from its own Lambda env vars set by scripts/deploy_lambda_container.sh.
+# To tune the deployed Lambda, redeploy with new env vars; this YAML only
+# affects in-notebook checks.
 drift_thresholds:
   # Minimum acceptable ROC-AUC before alerting (monitor_model_performance.py)
   min_roc_auc: 0.85
@@ -174,9 +235,11 @@ drift_thresholds:
   # 0.05 = alert if AUC drops by 5 percentage points or more.
   model_drift: 0.05
 
-# Schedule for the daily drift-monitor Lambda (EventBridge expression).
-# Notebook deploys the rule with this expression; the Lambda binary itself
-# does not read this — it is invoked on the schedule.
+# Schedule for the daily drift-monitor Lambda (EventBridge cron expression).
+# Read by notebook 3 Section 7.1 as DRIFT_MONITOR_SCHEDULE for display. The
+# actual EventBridge rule is created by scripts/deploy_lambda_container.sh
+# which reads its own EVENTBRIDGE_SCHEDULE env var (same default), so to
+# truly override the schedule both this value AND that env var must change.
 drift_monitor:
   schedule: "cron(0 2 * * ? *)"  # Daily at 2 AM UTC
 
@@ -217,8 +280,11 @@ drift_generation:
       shift: 1
       noise: 0.5
 
-# QuickSight resource IDs and display names are defined directly in
-# src/governance/setup_quicksight_governance.py (no YAML duplication).
+# QuickSight resource IDs (datasource/dataset/analysis/dashboard) and the
+# QuickSight service-role name are constants in src/config/config.py
+# (QUICKSIGHT_*). They are NOT duplicated in this YAML because they should
+# be stable across environments — changing them would orphan existing
+# datasets/dashboards.
 
 # ---------------------------------------------------------------------------
 # SHAP explainability

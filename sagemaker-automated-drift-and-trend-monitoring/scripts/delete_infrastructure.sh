@@ -2,233 +2,199 @@
 set -e
 
 #############################################################################
-# Delete Drift Monitoring Infrastructure
-#############################################################################
-# This script safely deletes all drift monitoring resources:
-# 1. EventBridge rule and targets
-# 2. Lambda function
-# 3. SQS queue (monitoring writer)
-# 4. Lambda (monitoring writer)
-# 5. SNS topic and subscriptions
-# 6. IAM roles and policies
-# 7. ECR repository (optional)
+# Delete drift-monitor resources NOT managed by CloudFormation.
+#
+# The CFN stack (cloudformation/sagemaker-mlflow-setup.yaml) owns: SQS queues,
+# Lambda IAM roles, the monitoring-writer Lambda, the SageMaker domain, S3
+# buckets, Athena database. Those are torn down by:
+#
+#     ./cloudformation/delete_stack.sh
+#
+# This script tears down what `deploy_lambda_container.sh` and
+# `create_cloudwatch_monitoring.py` create OUTSIDE CFN:
+#
+#   1. EventBridge rule + target (drift-monitor daily schedule)
+#   2. Drift-monitor Lambda function (container-image based)
+#   3. SNS topic (drift alerts) + its subscriptions
+#   4. ECR repository for the drift-monitor image  (optional — pass --ecr)
+#   5. CloudWatch dashboard + alarms (Section 6.6 of notebook 3)
+#
+# Run this BEFORE delete_stack.sh — the stack delete refuses to proceed if
+# the drift Lambda still exists, because the Lambda's execution role and
+# the SQS queue + SNS topic it references are all CFN-owned. Killing this
+# Lambda first lets CFN tear those dependencies down cleanly.
+#
+# Usage:
+#     scripts/delete_infrastructure.sh                # dry-run by default — shows what would happen, deletes nothing
+#     scripts/delete_infrastructure.sh --execute      # actually delete
+#     scripts/delete_infrastructure.sh --execute --ecr   # also delete ECR repo
 #############################################################################
 
-REGION="${AWS_REGION:-us-east-1}"
-DELETE_ECR="${1:-no}"  # Pass 'yes' to delete ECR images
+DRY_RUN=true
+DELETE_ECR=false
+for arg in "$@"; do
+    case "$arg" in
+        --execute|-x) DRY_RUN=false ;;
+        --ecr|-e)     DELETE_ECR=true ;;
+        --help|-h)
+            sed -n '2,/^####/p' "$0" | sed 's/^#//' | head -n -1
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            echo "Run with --help to see usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Every name below is sourced from src/config/config.py via get_config.
+# Single source of truth — no shell-side defaults.
+source "$(dirname "${BASH_SOURCE[0]}")/_read_config.sh"
+REGION="$(get_config AWS_DEFAULT_REGION)"
+LAMBDA_NAME="$(get_config DRIFT_LAMBDA_NAME)"
+RULE_NAME="$(get_config EVENTBRIDGE_RULE_NAME)"
+REPO_NAME="$(get_config ECR_REPO_NAME)"
+SNS_TOPIC_NAME="$(get_config SNS_TOPIC_NAME)"
+DASHBOARD_NAME="$(get_config CLOUDWATCH_DASHBOARD_NAME)"
+ALARM_NAMES=(
+    "FraudDetection-DataDrift-PSI"
+    "FraudDetection-ModelDrift-ROCAUCDEGRADATION"
+    "FraudDetection-ModelDrift-ACCURACY"
+    "FraudDetection-ModelDrift-PRECISION"
+    "FraudDetection-ModelDrift-RECALL"
+)
+
+if $DRY_RUN; then
+    MODE="DRY-RUN (no changes — pass --execute to actually delete)"
+else
+    MODE="EXECUTE (resources WILL be deleted)"
+fi
 
 echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║  Deleting Drift Monitoring Infrastructure                          ║"
+echo "║  Out-of-band drift-monitor resource cleanup                        ║"
+echo "║  $MODE"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
-echo "  Region: $REGION"
-echo "  Delete ECR images: $DELETE_ECR"
+echo "  Region:           $REGION"
+echo "  EventBridge rule: $RULE_NAME"
+echo "  Lambda function:  $LAMBDA_NAME"
+echo "  SNS topic:        $SNS_TOPIC_NAME"
+echo "  Dashboard:        $DASHBOARD_NAME"
+echo "  CW alarms:        ${#ALARM_NAMES[@]} alarms"
+echo "  ECR repo:         $REPO_NAME  (delete = $DELETE_ECR)"
 echo ""
 
-# Load configuration from .env if available
-if [ -f ../.env ]; then
-    echo "Loading configuration from .env..."
-    set -a
-    source ../.env
-    set +a
-    echo "  ✓ Environment variables loaded"
+if ! $DRY_RUN; then
+    read -p "Type 'yes' to confirm: " CONFIRM
+    if [ "$CONFIRM" != "yes" ]; then
+        echo "Cancelled."
+        exit 0
+    fi
     echo ""
 fi
 
-# Read deployment config if available
-CONFIG_FILE="src/config/drift_monitoring_config.json"
-if [ -f "$CONFIG_FILE" ]; then
-    echo "Loading deployment configuration from $CONFIG_FILE..."
-    SNS_TOPIC_ARN=$(jq -r '.sns_topic_arn' $CONFIG_FILE)
-    LAMBDA_FUNCTION_ARN=$(jq -r '.lambda_function_arn' $CONFIG_FILE)
-    EVENTBRIDGE_RULE=$(jq -r '.eventbridge_rule_arn' $CONFIG_FILE | sed 's/.*rule\///')
-    echo "  ✓ Deployment configuration loaded"
-    echo ""
-else
-    echo "No deployment config file found, using resource names from .env..."
-    SNS_TOPIC_ARN=""
-    LAMBDA_FUNCTION_ARN=""
-    EVENTBRIDGE_RULE="${EVENTBRIDGE_RULE_NAME:-fraud-detection-drift-check}"
-fi
+# Helper: prefix actions with [DRY-RUN] or run them depending on mode.
+run() {
+    if $DRY_RUN; then
+        echo "  [DRY-RUN] would run: $*"
+    else
+        "$@"
+    fi
+}
 
-# Get AWS account info
-ACCOUNT_ID=$(aws sts get-caller_identity --query Account --output text)
-
-# Resource names (from .env with defaults)
-LAMBDA_NAME="${DRIFT_LAMBDA_NAME:-fraud-detection-drift-monitor}"
-LAMBDA_WRITER_NAME="${MONITORING_WRITER_LAMBDA_NAME:-fraud-monitoring-results-writer}"
-SNS_TOPIC="${SNS_TOPIC_NAME:-fraud-detection-drift-alerts}"
-ROLE_NAME=$(echo "${LAMBDA_EXEC_ROLE:-fraud-detection-drift-monitor-role}" | awk -F'/' '{print $NF}')
-ROLE_WRITER_NAME="${LAMBDA_WRITER_NAME}-role"
-REPO_NAME="fraud-detection-drift-monitor"
-SQS_QUEUE="fraud-monitoring-results"
-
-# Confirmation
-echo "⚠️  WARNING: This will delete the following resources:"
-echo "  - EventBridge Rule: $EVENTBRIDGE_RULE"
-echo "  - Lambda Function: $LAMBDA_NAME"
-echo "  - Lambda Function: $LAMBDA_WRITER_NAME"
-echo "  - SQS Queue: $SQS_QUEUE"
-echo "  - SNS Topic: $SNS_TOPIC"
-echo "  - IAM Roles: $ROLE_NAME, $ROLE_WRITER_NAME"
-if [ "$DELETE_ECR" = "yes" ]; then
-    echo "  - ECR Repository: $REPO_NAME (INCLUDING ALL IMAGES)"
-fi
-echo ""
-read -p "Are you sure? (type 'yes' to confirm): " CONFIRM
-
-if [ "$CONFIRM" != "yes" ]; then
-    echo "Deletion cancelled."
-    exit 0
-fi
-
-echo ""
-echo "Starting deletion..."
-echo ""
-
-# Step 1: EventBridge Rule
-echo "[1/8] Deleting EventBridge rule..."
-if aws events describe-rule --name $EVENTBRIDGE_RULE --region $REGION > /dev/null 2>&1; then
-    # Remove targets first
-    aws events remove-targets --rule $EVENTBRIDGE_RULE --ids 1 --region $REGION 2>/dev/null || true
-    # Delete rule
-    aws events delete-rule --name $EVENTBRIDGE_RULE --region $REGION
-    echo "  ✓ EventBridge rule deleted"
+# ────────────────────────────────────────────────────────────────────────────
+# 1. EventBridge rule (remove targets first, then the rule)
+# ────────────────────────────────────────────────────────────────────────────
+echo "[1/5] EventBridge rule..."
+if aws events describe-rule --name "$RULE_NAME" --region "$REGION" >/dev/null 2>&1; then
+    TARGET_IDS=$(aws events list-targets-by-rule --rule "$RULE_NAME" --region "$REGION" \
+        --query 'Targets[].Id' --output text 2>/dev/null || echo "")
+    if [ -n "$TARGET_IDS" ]; then
+        run aws events remove-targets --rule "$RULE_NAME" --ids $TARGET_IDS --region "$REGION"
+    fi
+    run aws events delete-rule --name "$RULE_NAME" --region "$REGION"
+    echo "  ✓ Rule: $RULE_NAME"
 else
     echo "  (rule not found, skipping)"
 fi
 
-# Step 2: Lambda Function (drift monitor)
+# ────────────────────────────────────────────────────────────────────────────
+# 2. Drift-monitor Lambda function
+# ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[2/8] Deleting Lambda function (drift monitor)..."
-if aws lambda get-function --function-name $LAMBDA_NAME --region $REGION > /dev/null 2>&1; then
-    aws lambda delete-function --function-name $LAMBDA_NAME --region $REGION
-    echo "  ✓ Lambda function deleted: $LAMBDA_NAME"
+echo "[2/5] Lambda function..."
+if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" >/dev/null 2>&1; then
+    run aws lambda delete-function --function-name "$LAMBDA_NAME" --region "$REGION"
+    echo "  ✓ Lambda: $LAMBDA_NAME"
 else
     echo "  (function not found, skipping)"
 fi
 
-# Step 3: Lambda Function (monitoring writer)
+# ────────────────────────────────────────────────────────────────────────────
+# 3. SNS topic + all confirmed subscriptions
+# ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[3/8] Deleting Lambda function (monitoring writer)..."
-if aws lambda get-function --function-name $LAMBDA_WRITER_NAME --region $REGION > /dev/null 2>&1; then
-    aws lambda delete-function --function-name $LAMBDA_WRITER_NAME --region $REGION
-    echo "  ✓ Lambda function deleted: $LAMBDA_WRITER_NAME"
-else
-    echo "  (function not found, skipping)"
-fi
-
-# Step 4: SQS Queue
-echo ""
-echo "[4/8] Deleting SQS queue..."
-QUEUE_URL=$(aws sqs get-queue-url --queue-name $SQS_QUEUE --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
-if [ -n "$QUEUE_URL" ]; then
-    aws sqs delete-queue --queue-url "$QUEUE_URL" --region $REGION
-    echo "  ✓ SQS queue deleted: $SQS_QUEUE"
-else
-    echo "  (queue not found, skipping)"
-fi
-
-# Step 5: SNS Topic
-echo ""
-echo "[5/8] Deleting SNS topic..."
-if [ -n "$SNS_TOPIC_ARN" ]; then
-    TOPIC_ARN=$SNS_TOPIC_ARN
-else
-    TOPIC_ARN=$(aws sns list-topics --region $REGION --query "Topics[?contains(TopicArn, '$SNS_TOPIC')].TopicArn" --output text)
-fi
-
-if [ -n "$TOPIC_ARN" ]; then
-    # Delete all subscriptions first
-    SUBSCRIPTIONS=$(aws sns list-subscriptions-by-topic --topic-arn $TOPIC_ARN --region $REGION --query 'Subscriptions[].SubscriptionArn' --output text)
-    for sub in $SUBSCRIPTIONS; do
-        if [ "$sub" != "PendingConfirmation" ]; then
-            aws sns unsubscribe --subscription-arn $sub --region $REGION 2>/dev/null || true
-        fi
+echo "[3/5] SNS topic..."
+TOPIC_ARN=$(aws sns list-topics --region "$REGION" \
+    --query "Topics[?ends_with(TopicArn, ':${SNS_TOPIC_NAME}')].TopicArn | [0]" \
+    --output text 2>/dev/null || echo "")
+if [ -n "$TOPIC_ARN" ] && [ "$TOPIC_ARN" != "None" ]; then
+    SUBS=$(aws sns list-subscriptions-by-topic --topic-arn "$TOPIC_ARN" --region "$REGION" \
+        --query "Subscriptions[?SubscriptionArn != 'PendingConfirmation'].SubscriptionArn" \
+        --output text 2>/dev/null || echo "")
+    for sub in $SUBS; do
+        run aws sns unsubscribe --subscription-arn "$sub" --region "$REGION"
     done
-    # Delete topic
-    aws sns delete-topic --topic-arn $TOPIC_ARN --region $REGION
-    echo "  ✓ SNS topic deleted: $SNS_TOPIC"
+    run aws sns delete-topic --topic-arn "$TOPIC_ARN" --region "$REGION"
+    echo "  ✓ Topic: $SNS_TOPIC_NAME"
 else
     echo "  (topic not found, skipping)"
 fi
 
-# Step 6: IAM Role (drift monitor)
+# ────────────────────────────────────────────────────────────────────────────
+# 4. CloudWatch dashboard + alarms
+# ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[6/8] Deleting IAM role (drift monitor)..."
-if aws iam get-role --role-name $ROLE_NAME --region $REGION > /dev/null 2>&1; then
-    # Detach managed policies
-    for policy in \
-        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" \
-        "arn:aws:iam::aws:policy/AmazonAthenaFullAccess" \
-        "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"; do
-        aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn $policy --region $REGION 2>/dev/null || true
-    done
-
-    # Delete inline policies
-    INLINE_POLICIES=$(aws iam list-role-policies --role-name $ROLE_NAME --region $REGION --query 'PolicyNames' --output text)
-    for policy in $INLINE_POLICIES; do
-        aws iam delete-role-policy --role-name $ROLE_NAME --policy-name $policy --region $REGION 2>/dev/null || true
-    done
-
-    # Delete role
-    aws iam delete-role --role-name $ROLE_NAME --region $REGION
-    echo "  ✓ IAM role deleted: $ROLE_NAME"
+echo "[4/5] CloudWatch dashboard + alarms..."
+if aws cloudwatch get-dashboard --dashboard-name "$DASHBOARD_NAME" --region "$REGION" >/dev/null 2>&1; then
+    run aws cloudwatch delete-dashboards --dashboard-names "$DASHBOARD_NAME" --region "$REGION"
+    echo "  ✓ Dashboard: $DASHBOARD_NAME"
 else
-    echo "  (role not found, skipping)"
+    echo "  (dashboard not found, skipping)"
 fi
+# delete-alarms is a no-op for names that don't exist — safe to call once with the full list.
+run aws cloudwatch delete-alarms --alarm-names "${ALARM_NAMES[@]}" --region "$REGION"
+echo "  ✓ Alarms: ${#ALARM_NAMES[@]} (any non-existent ones silently skipped)"
 
-# Step 7: IAM Role (monitoring writer)
+# ────────────────────────────────────────────────────────────────────────────
+# 5. ECR repository (only if --ecr — keeps the image around for fast redeploy)
+# ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[7/8] Deleting IAM role (monitoring writer)..."
-if aws iam get-role --role-name $ROLE_WRITER_NAME --region $REGION > /dev/null 2>&1; then
-    # Detach managed policies
-    for policy in \
-        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" \
-        "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole" \
-        "arn:aws:iam::aws:policy/AmazonAthenaFullAccess"; do
-        aws iam detach-role-policy --role-name $ROLE_WRITER_NAME --policy-arn $policy --region $REGION 2>/dev/null || true
-    done
-
-    # Delete inline policies
-    INLINE_POLICIES=$(aws iam list-role-policies --role-name $ROLE_WRITER_NAME --region $REGION --query 'PolicyNames' --output text)
-    for policy in $INLINE_POLICIES; do
-        aws iam delete-role-policy --role-name $ROLE_WRITER_NAME --policy-name $policy --region $REGION 2>/dev/null || true
-    done
-
-    # Delete role
-    aws iam delete-role --role-name $ROLE_WRITER_NAME --region $REGION
-    echo "  ✓ IAM role deleted: $ROLE_WRITER_NAME"
-else
-    echo "  (role not found, skipping)"
-fi
-
-# Step 8: ECR Repository (optional)
-echo ""
-echo "[8/8] ECR Repository..."
-if [ "$DELETE_ECR" = "yes" ]; then
-    if aws ecr describe-repositories --repository-names $REPO_NAME --region $REGION > /dev/null 2>&1; then
-        aws ecr delete-repository --repository-name $REPO_NAME --force --region $REGION
-        echo "  ✓ ECR repository deleted: $REPO_NAME"
+echo "[5/5] ECR repository..."
+if $DELETE_ECR; then
+    if aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$REGION" >/dev/null 2>&1; then
+        run aws ecr delete-repository --repository-name "$REPO_NAME" --force --region "$REGION"
+        echo "  ✓ Repository: $REPO_NAME"
     else
         echo "  (repository not found, skipping)"
     fi
 else
-    echo "  Keeping ECR repository (pass 'yes' as argument to delete)"
-    echo "  To delete manually: aws ecr delete-repository --repository-name $REPO_NAME --force"
+    echo "  Keeping ECR repository $REPO_NAME (re-run with --ecr to delete)"
 fi
 
-# Delete configuration file
-if [ -f "$CONFIG_FILE" ]; then
-    rm -f "$CONFIG_FILE"
+echo ""
+if $DRY_RUN; then
+    echo "╔════════════════════════════════════════════════════════════════════╗"
+    echo "║  Dry-run complete. Re-run with --execute to actually delete.       ║"
+    echo "╚════════════════════════════════════════════════════════════════════╝"
+else
+    echo "╔════════════════════════════════════════════════════════════════════╗"
+    echo "║  ✅ Out-of-band resources deleted                                  ║"
+    echo "╚════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "  ✓ Configuration file deleted"
+    echo "Next: tear down everything else (SageMaker domain, Lambda IAM roles,"
+    echo "SQS, S3, Athena DB) by running:"
+    echo ""
+    echo "    ./cloudformation/delete_stack.sh"
 fi
-
-echo ""
-echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║  ✅ DELETION COMPLETE                                              ║"
-echo "╚════════════════════════════════════════════════════════════════════╝"
-echo ""
-echo "All drift monitoring resources have been deleted."
-echo ""

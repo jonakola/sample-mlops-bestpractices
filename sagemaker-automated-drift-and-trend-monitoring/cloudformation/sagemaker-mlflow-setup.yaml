@@ -1399,6 +1399,12 @@ Resources:
                 # evaluation_snapshot_id pins the Iceberg snapshot the
                 # drift Lambda sampled the baseline from (per-version
                 # reproducibility).
+                #
+                # ⚠️ KEEP IN SYNC: src/drift_monitoring/deploy_monitoring_writer.py
+                # has a hardcoded `columns = [...]` list in its embedded Lambda
+                # code that MUST mirror this DDL. Adding/removing columns
+                # requires editing BOTH places. Order matters in the writer's
+                # parameterized INSERT.
                 "monitoring_responses": f"""
             CREATE TABLE IF NOT EXISTS {DATABASE}.monitoring_responses (
                 monitoring_run_id STRING, monitoring_timestamp TIMESTAMP,

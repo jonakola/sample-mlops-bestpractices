@@ -39,19 +39,27 @@ for arg in "$@"; do
 done
 set -- "${POSITIONAL[@]:-}"
 
-STACK_NAME="${1:-${STACK_NAME:-fraud-detection-monitoring}}"
-REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
+# Stack name + region are read from src/config/config.py (single source of
+# truth across CFN, python config, every shell script). Env vars still work
+# as overrides via the standard precedence inside config.py.
+source "$(dirname "$0")/../scripts/_read_config.sh"
+PROJECT_NAME_FROM_CONFIG="$(get_config PROJECT_NAME)"
+STACK_NAME="${1:-${STACK_NAME:-$PROJECT_NAME_FROM_CONFIG}}"
+REGION="$(get_config AWS_DEFAULT_REGION)"
+
 TEMPLATE="${TEMPLATE:-$(dirname "$0")/sagemaker-mlflow-setup.yaml}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 S3_BUCKET="${S3_BUCKET:-cfn-deploy-${ACCOUNT_ID}-${REGION}}"
 TEMPLATE_KEY="$(basename "$TEMPLATE").$(date +%s)"
 
-# These must match the CFN ProjectName param default and the lifecycle script's
-# DATABASE/PREFIX constants. Keep in sync.
-PROJECT_NAME="${PROJECT_NAME:-fraud-detection-monitoring}"
+# Reuse the same names config.py exposes; no second copy of defaults here.
+PROJECT_NAME="$PROJECT_NAME_FROM_CONFIG"
 DATA_BUCKET="${PROJECT_NAME}-data-${ACCOUNT_ID}"
-ATHENA_DATABASE="fraud_detection"
+ATHENA_DATABASE="$(get_config ATHENA_DATABASE)"
+# S3 prefix used by the CFN lifecycle script for Athena table data.
+# Kept as-is here because the prefix is a CFN-template constant (line 1278
+# of sagemaker-mlflow-setup.yaml) — not a config.py knob.
 S3_TABLE_PREFIX="fraud-detection"
 RESETTABLE_TABLES=(
   training_data evaluation_data inference_responses
@@ -173,10 +181,16 @@ if [ "$ACTION" = "update" ]; then
   echo "Waiting for update to complete..."
   aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME" --region "$REGION"
 else
+  # CREATE: pass ProjectName from config.yaml so the template's default
+  # doesn't silently win if the user later changes the yaml. All other
+  # template parameters use their CFN-template defaults (documented in
+  # cloudformation/README.md) — pass more here if you want them yaml-driven.
+  CREATE_PARAMS="ParameterKey=ProjectName,ParameterValue=$PROJECT_NAME_FROM_CONFIG"
   aws cloudformation create-stack \
     --stack-name "$STACK_NAME" \
     --region "$REGION" \
     --template-url "$TEMPLATE_URL" \
+    --parameters $CREATE_PARAMS \
     --capabilities CAPABILITY_NAMED_IAM \
     --on-failure ROLLBACK
   echo "Waiting for create to complete..."

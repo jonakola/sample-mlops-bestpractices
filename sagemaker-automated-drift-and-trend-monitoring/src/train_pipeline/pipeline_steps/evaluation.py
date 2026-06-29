@@ -857,7 +857,7 @@ def main():
     parser.add_argument('--training-table', type=str, default='training_data',
                        help='Athena table the model was trained on '
                             '(captured for lineage; not required by drift monitor)')
-    parser.add_argument('--model-package-group', type=str, default='xgboost-fraud-detector',
+    parser.add_argument('--model-package-group', type=str, default='fraud-detection',
                        help='Model Registry group this baseline applies to')
     parser.add_argument('--code-commit-sha', type=str, default='unknown',
                        help='Git commit SHA of the pipeline code that produced this baseline')

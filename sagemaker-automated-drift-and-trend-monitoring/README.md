@@ -56,7 +56,7 @@ Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/
 |---|----------|---------|
 | 5 | `5_optional_version_validation.ipynb` | Verifies MLflow model version matches the deployed endpoint and Athena inference logs (traceability check). |
 | 6 | `6_optional_cleanup.ipynb` | Deletes all AWS resources created outside CloudFormation (Lambda functions, endpoints, SNS topics, dashboards, CloudWatch alarms). |
-| 7 | `7_shap_explainability.ipynb` | Generates SHAP global and per-prediction feature importance plots for the trained model. |
+| 7 | `7_optional_shap_explainability.ipynb` | Generates SHAP global and per-prediction feature importance plots for the trained model. |
 
 ### What to expect during long-running cells
 
@@ -107,16 +107,15 @@ sagemaker-automated-drift-and-trend-monitoring/
 │   ├── 4_governance_dashboard.ipynb
 │   ├── 5_optional_version_validation.ipynb
 │   ├── 6_optional_cleanup.ipynb
-│   └── 7_shap_explainability.ipynb
+│   └── 7_optional_shap_explainability.ipynb
 ├── src/
 │   ├── train_pipeline/                # Pipeline definition + preprocessing/training/evaluation steps
 │   ├── drift_monitoring/              # Drift detection Lambdas, ground truth utilities, Evidently wrappers
 │   ├── governance/                    # QuickSight dashboard provisioning
-│   ├── setup/                         # IAM role + infrastructure helpers
+│   ├── setup/                         # IAM role + infrastructure helpers, Kaggle dataset downloader (download_kaggle_dataset.py)
 │   ├── config/                        # config.py + config.yaml (drift thresholds, simulation params)
 │   └── utils/                         # AWS session, MLflow, visualization helpers
-├── data/
-│   └── download_kaggle_dataset.py     # Downloads Kaggle credit card fraud dataset
+├── data/                              # Local CSVs (gitignored; populated at runtime by Kaggle download / drift generator)
 ├── docs/
 │   ├── ARCHITECTURE_STEPS.md          # 11-step architecture walkthrough
 │   ├── VERSION_MANAGEMENT.md          # MLflow model versioning guide
@@ -145,7 +144,8 @@ These travel together inside `baseline.json`, which is registered as `ModelPacka
 ```json
 {
   "schema_version": 2,
-  "model_package_group": "xgboost-fraud-detector",
+  "created_at": "2026-06-29T14:30:45.123456",
+  "model_package_group": "fraud-detection",
   "code_commit_sha": "a1b2c3...",
   "evaluation_table": "evaluation_data",
   "training_table":   "training_data",
@@ -153,8 +153,18 @@ These travel together inside `baseline.json`, which is registered as `ModelPacka
   "training_snapshot_id":   "1825...",
   "feature_schema_version": 1,
   "feature_schema": [{"name": "transaction_amount", "dtype": "double"}, ...],
-  "metrics": { "roc_auc": 0.94, "pr_auc": 0.78, ... },
-  "sample_size": 56960
+  "metrics": {
+    "roc_auc": 0.94,
+    "pr_auc": 0.78,
+    "precision": 0.91,
+    "recall": 0.88,
+    "f1_score": 0.89,
+    "accuracy": 0.99
+  },
+  "sample_size": 56960,
+  "positive_samples": 98,
+  "negative_samples": 56862,
+  "threshold": 0.5
 }
 ```
 
@@ -325,7 +335,7 @@ The lifecycle script downloads training data, uploads to S3, and creates Athena 
 ```bash
 cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
 source .env
-pip install -e .
+uv pip install --system -e .   # same install command notebook 1 cell 2 uses
 python -m src.setup.download_kaggle_dataset
 python -m src.setup.upload_data_to_s3
 python -m src.setup.setup_athena_tables

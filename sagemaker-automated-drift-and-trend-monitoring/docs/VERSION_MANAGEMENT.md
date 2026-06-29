@@ -218,7 +218,7 @@ from src.utils.mlflow_utils import setup_mlflow_tracking
 
 setup_mlflow_tracking(MLFLOW_TRACKING_URI)
 client = MlflowClient()
-versions = client.search_model_versions(\"name='xgboost-fraud-detector'\")
+versions = client.search_model_versions(\"name='fraud-detection'\")
 for v in versions:
     print(f'Version {v.version}: Stage={v.current_stage}, RunID={v.run_id}')
 "
@@ -267,7 +267,7 @@ from src.train_pipeline.test_endpoint import test_version_consistency_end_to_end
 # Run version consistency validation
 results = test_version_consistency_end_to_end(
     endpoint_name="fraud-detection-endpoint",
-    mlflow_model_name="xgboost-fraud-detector"
+    mlflow_model_name="fraud-detection"
 )
 
 print(f"Status: {results['status']}")
@@ -328,7 +328,7 @@ print(perf[['model_version', 'total_predictions', 'fraud_rate', 'avg_latency_ms'
    ```python
    from mlflow.tracking import MlflowClient
    client = MlflowClient()
-   versions = client.search_model_versions("name='xgboost-fraud-detector'")
+   versions = client.search_model_versions("name='fraud-detection'")
    print(f"Latest: {max([int(v.version) for v in versions])}")
    ```
 

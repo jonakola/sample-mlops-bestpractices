@@ -16,17 +16,17 @@ The batch transform:
 Usage:
     # Create scheduled batch transform (daily at 2 AM UTC)
     python scripts/setup_scheduled_batch_transform.py \\
-        --model-name sg-xgboost-fraud-detector \\
+        --model-name fraud-detection-batch-model \\
         --schedule "cron(0 2 * * ? *)"
     
     # Create with rate expression (every 6 hours)
     python scripts/setup_scheduled_batch_transform.py \\
-        --model-name sg-xgboost-fraud-detector \\
+        --model-name fraud-detection-batch-model \\
         --schedule "rate(6 hours)"
     
     # Delete the scheduled batch transform
     python scripts/setup_scheduled_batch_transform.py \\
-        --model-name sg-xgboost-fraud-detector \\
+        --model-name fraud-detection-batch-model \\
         --delete
 """
 
@@ -68,7 +68,7 @@ athena_client = boto3.client('athena')
 s3_client = boto3.client('s3')
 
 # Configuration from environment
-MODEL_NAME = os.environ.get('MODEL_NAME', 'sg-xgboost-fraud-detector')
+MODEL_NAME = os.environ.get('MODEL_NAME', 'fraud-detection-batch-model')
 ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE', 'fraud_detection')
 ATHENA_OUTPUT_S3 = os.environ.get('ATHENA_OUTPUT_S3')
 DATA_S3_BUCKET = os.environ.get('DATA_S3_BUCKET')
@@ -615,17 +615,17 @@ def main():
 Examples:
   # Create scheduled batch transform (daily at 2 AM UTC)
   python scripts/setup_scheduled_batch_transform.py \\
-      --model-name sg-xgboost-fraud-detector \\
+      --model-name fraud-detection-batch-model \\
       --schedule "cron(0 2 * * ? *)"
   
   # Every 6 hours
   python scripts/setup_scheduled_batch_transform.py \\
-      --model-name sg-xgboost-fraud-detector \\
+      --model-name fraud-detection-batch-model \\
       --schedule "rate(6 hours)"
   
   # With custom configuration
   python scripts/setup_scheduled_batch_transform.py \\
-      --model-name sg-xgboost-fraud-detector \\
+      --model-name fraud-detection-batch-model \\
       --schedule "cron(0 2 * * ? *)" \\
       --instance-type ml.m5.2xlarge \\
       --instance-count 2 \\
@@ -634,7 +634,7 @@ Examples:
   
   # Delete scheduled batch transform
   python scripts/setup_scheduled_batch_transform.py \\
-      --model-name sg-xgboost-fraud-detector \\
+      --model-name fraud-detection-batch-model \\
       --delete
 
 Schedule Expression Examples:
