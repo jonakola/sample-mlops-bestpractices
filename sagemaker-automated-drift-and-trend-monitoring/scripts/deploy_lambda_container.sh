@@ -150,12 +150,45 @@ sleep 10
 # Step 3: Create ECR repository if needed
 echo ""
 echo "[3/7] Setting up ECR repository..."
-aws ecr describe-repositories --repository-names $REPO_NAME --region $REGION 2>/dev/null || \
+aws ecr describe-repositories --repository-names $REPO_NAME --region $REGION >/dev/null 2>&1 || \
 aws ecr create-repository \
     --repository-name $REPO_NAME \
     --region $REGION \
     --image-scanning-configuration scanOnPush=false > /dev/null
-echo "  ✓ Repository: $REPO_NAME"
+
+# Attach repository policy so Lambda (this account) can pull the image. Without
+# this, `aws lambda create-function --code ImageUri=...` fails with
+# "Lambda does not have permission to access the ECR image" even when the
+# Lambda execution role has ECR perms — container Lambdas authenticate via
+# the ECR repo policy, not the execution role.
+ECR_POLICY_FILE=$(mktemp -t ecr-policy.XXXXXX.json)
+trap 'rm -f "$ENV_FILE" "$ECR_POLICY_FILE"' EXIT
+cat > "$ECR_POLICY_FILE" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LambdaECRImageRetrievalPolicy",
+      "Effect": "Allow",
+      "Principal": {"Service": "lambda.amazonaws.com"},
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:sourceArn": "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:*"
+        }
+      }
+    }
+  ]
+}
+EOF
+aws ecr set-repository-policy \
+    --repository-name "$REPO_NAME" \
+    --policy-text "file://$ECR_POLICY_FILE" \
+    --region "$REGION" > /dev/null
+echo "  ✓ Repository: $REPO_NAME (Lambda pull policy attached)"
 
 # Step 4: Build and push Docker image
 #
@@ -217,7 +250,9 @@ SQS_QUEUE_URL=$(aws sqs get-queue-url --queue-name fraud-monitoring-results --re
 # with the shorthand "Variables={...}" or inline JSON trips the AWS CLI parser
 # on the embedded braces/quotes. file:// sidesteps shell quoting entirely.
 ENV_FILE=$(mktemp -t lambda-env.XXXXXX.json)
-trap 'rm -f "$ENV_FILE"' EXIT
+# Note: cleanup trap for $ENV_FILE was already registered alongside $ECR_POLICY_FILE
+# in Step 3 — don't re-register here or it would shadow the earlier trap and
+# leak the policy file.
 
 cat > "$ENV_FILE" <<EOF
 {
