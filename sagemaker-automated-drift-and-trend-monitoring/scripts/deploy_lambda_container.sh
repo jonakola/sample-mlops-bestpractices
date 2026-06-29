@@ -185,9 +185,21 @@ if docker info >/dev/null 2>&1; then
 elif command -v sm-docker >/dev/null 2>&1; then
     echo "  ℹ No local Docker daemon — using sm-docker (SageMaker Studio CodeBuild) instead."
     echo "  This takes ~5-8 minutes; the build runs in AWS, output streams below."
+    # sm-docker's auto-role-detection calls sagemaker.get_execution_role(),
+    # a v2-SDK function removed in v3. We pass the role explicitly via --role
+    # to bypass that broken code path. Strip the IAM ARN prefix so sm-docker
+    # gets just the role-name suffix it actually wants (it later re-prefixes
+    # it before handing to CodeBuild).
+    SM_ROLE_NAME=$(aws sts get-caller-identity --query Arn --output text \
+        | sed -E 's|arn:aws:sts::[0-9]+:assumed-role/([^/]+)/.*|\1|')
+    if [ -z "$SM_ROLE_NAME" ]; then
+        echo "❌ Could not resolve SageMaker execution role — set SAGEMAKER_EXEC_ROLE in .env"
+        exit 1
+    fi
     sm-docker build . \
         --repository "$REPO_NAME:latest" \
-        --file src/drift_monitoring/Dockerfile.lambda
+        --file src/drift_monitoring/Dockerfile.lambda \
+        --role "$SM_ROLE_NAME"
     echo "  ✓ Image built and pushed via CodeBuild: $IMAGE_URI"
 else
     echo "❌ Cannot build image — no Docker daemon and sm-docker not installed."
