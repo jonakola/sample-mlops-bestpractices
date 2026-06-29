@@ -80,6 +80,18 @@ if [ "$STATUS" = "MISSING" ]; then
 fi
 echo "  Current status: $STATUS"
 
+# Special case: stack is already at DELETE_FAILED from a prior run. Tell the
+# user what we'll do (sweep EFS orphans, retry delete) and proceed in execute
+# mode; in dry-run we just describe the recovery.
+IS_RETRY_FROM_DELETE_FAILED=false
+if [ "$STATUS" = "DELETE_FAILED" ]; then
+    IS_RETRY_FROM_DELETE_FAILED=true
+    echo ""
+    echo "  Detected DELETE_FAILED — likely orphaned EFS mount targets from"
+    echo "  the SageMaker domain (a known AWS race). This script will sweep"
+    echo "  them and retry the stack delete."
+fi
+
 # Refuse to run (in execute mode) if the out-of-band Lambda still exists —
 # it references the CFN-owned IAM role + SQS queue + SNS topic, so its
 # presence will fail the stack delete.
@@ -208,6 +220,108 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
+# Helper: sweep orphaned EFS mount targets in the stack's subnets.
+#
+# Why this exists:
+#   AWS::SageMaker::Domain provisions an EFS file system at create time but
+#   leaves it BEHIND on delete (not deterministically — sometimes 10-30 min,
+#   sometimes never). The orphaned EFS mount targets hold ENIs in the stack's
+#   subnets, so AWS::EC2::Subnet can't delete and the stack lands in
+#   DELETE_FAILED with "subnet has dependencies and cannot be deleted".
+#
+#   The EFS file system itself is NOT in CFN, so CFN can't drain it.
+#
+# Sweep strategy:
+#   1. Find the VPC + subnets the stack owns (works whether stack is
+#      mid-delete, DELETE_FAILED, or pre-delete).
+#   2. List all EFS mount targets in those subnets.
+#   3. Delete each mount target (releases the ENI in ~30-60s).
+#   4. Optionally delete the file system once mount targets are gone.
+# ────────────────────────────────────────────────────────────────────────────
+sweep_orphan_efs() {
+    local action_label="${1:-sweep}"
+    echo ""
+    echo "Sweeping orphaned EFS mount targets ($action_label)..."
+
+    # Get all subnets owned by the stack (works in any stack status as long
+    # as the resources still exist — CFN lists them even when DELETE_FAILED).
+    local subnets
+    subnets=$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
+        --query "StackResourceSummaries[?ResourceType=='AWS::EC2::Subnet'].PhysicalResourceId" \
+        --output text 2>/dev/null || echo "")
+    if [ -z "$subnets" ]; then
+        echo "  (no subnets in stack — nothing to sweep)"
+        return 0
+    fi
+
+    # For each subnet, list EFS mount targets attached. EFS doesn't have a
+    # by-subnet filter, so we walk all file systems in the account and check
+    # if any of their mount targets land in our subnets.
+    local subnet_set
+    subnet_set=" $(echo "$subnets" | tr '\n\t' '  ') "  # space-padded for substring match
+
+    local fs_ids
+    fs_ids=$(aws efs describe-file-systems --region "$REGION" \
+        --query 'FileSystems[].FileSystemId' --output text 2>/dev/null || echo "")
+
+    local found=0
+    local fs_to_delete=()
+    for fs in $fs_ids; do
+        local mts
+        mts=$(aws efs describe-mount-targets --file-system-id "$fs" --region "$REGION" \
+            --query 'MountTargets[].[MountTargetId,SubnetId]' --output text 2>/dev/null || echo "")
+        local fs_has_orphan=false
+        while IFS=$'\t' read -r mt_id mt_subnet; do
+            [ -z "$mt_id" ] && continue
+            # Substring check: is mt_subnet in our space-padded subnet set?
+            if [[ "$subnet_set" == *" $mt_subnet "* ]]; then
+                found=$((found+1))
+                fs_has_orphan=true
+                echo "  - Mount target $mt_id (fs=$fs, subnet=$mt_subnet)"
+                run aws efs delete-mount-target --mount-target-id "$mt_id" --region "$REGION"
+            fi
+        done <<< "$mts"
+        if $fs_has_orphan; then
+            fs_to_delete+=("$fs")
+        fi
+    done
+
+    if [ "$found" = "0" ]; then
+        echo "  ✓ No orphan EFS mount targets in stack subnets."
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        echo "  [DRY-RUN] would wait for $found mount target(s) to fully delete, then drop the EFS"
+        return 0
+    fi
+
+    # Wait for mount targets to fully delete (releases ENIs)
+    echo "  Waiting up to 3 min for mount targets to release ENIs..."
+    for i in $(seq 1 18); do
+        local remaining=0
+        for fs in "${fs_to_delete[@]}"; do
+            local cnt
+            cnt=$(aws efs describe-mount-targets --file-system-id "$fs" --region "$REGION" \
+                --query 'length(MountTargets)' --output text 2>/dev/null || echo "0")
+            remaining=$((remaining + cnt))
+        done
+        if [ "$remaining" = "0" ]; then
+            echo "  ✓ All mount targets gone."
+            break
+        fi
+        sleep 10
+    done
+
+    # Drop the now-empty EFS file systems too (they're orphans — domain owned them).
+    for fs in "${fs_to_delete[@]}"; do
+        echo "  - Deleting orphan EFS $fs"
+        aws efs delete-file-system --file-system-id "$fs" --region "$REGION" 2>/dev/null || \
+            echo "    (could not delete $fs — may still have lingering mount targets)"
+    done
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 # 3. Revoke Lake Formation grants on the Athena DB (best-effort).
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -254,6 +368,14 @@ PYEOF
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
+# 3b. If we're recovering from DELETE_FAILED, sweep orphaned EFS mount
+#     targets NOW — they're the most common cause and CFN can't drain them.
+# ────────────────────────────────────────────────────────────────────────────
+if $IS_RETRY_FROM_DELETE_FAILED; then
+    sweep_orphan_efs "DELETE_FAILED recovery"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
 # 4. Issue delete-stack.
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -288,6 +410,7 @@ if $DRY_RUN; then
 fi
 
 LAST_STATUS=""
+AUTO_RETRIED_EFS=false   # one-shot guard so we don't loop infinitely
 while true; do
     STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
         --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DELETE_COMPLETE")
@@ -296,6 +419,25 @@ while true; do
         break
     fi
     if [ "$STATUS" = "DELETE_FAILED" ]; then
+        # Check whether the failure is the known EFS-mount-target → subnet
+        # dependency. If so, sweep + retry ONCE (the auto-retry guard).
+        SUBNET_DEP_FAIL=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
+            --query "StackEvents[?ResourceStatus=='DELETE_FAILED' && contains(ResourceStatusReason, 'subnet') && contains(ResourceStatusReason, 'dependencies')] | length(@)" \
+            --output text 2>/dev/null || echo "0")
+        if [ "$SUBNET_DEP_FAIL" != "0" ] && ! $AUTO_RETRIED_EFS; then
+            echo ""
+            echo "  ⚠ Subnets failed to delete (dependencies present). Sweeping"
+            echo "    orphan EFS mount targets and retrying stack delete once..."
+            sweep_orphan_efs "auto-retry after subnet-dependency failure"
+            AUTO_RETRIED_EFS=true
+            echo ""
+            echo "  Re-issuing delete-stack..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
+            LAST_STATUS=""  # reset so the next transition prints
+            sleep 30
+            continue
+        fi
+
         echo ""
         echo "  ❌ DELETE_FAILED. Resources that failed to delete:"
         aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
@@ -305,9 +447,11 @@ while true; do
         echo "  Common fixes:"
         echo "    - 'Bucket not empty' → re-run this script; Step 1 will re-drain it"
         echo "    - 'Role still has attached policies' → manually detach + retry"
-        echo "    - 'Network Interface in use' → wait 10 min for ENIs to detach,"
-        echo "      then aws cloudformation delete-stack --stack-name $STACK_NAME"
-        echo "         --retain-resources <ids>"
+        echo "    - 'subnet has dependencies' → re-run this script; the EFS-sweep"
+        echo "      retry already ran, so investigate other ENIs in those subnets:"
+        echo "      aws ec2 describe-network-interfaces --filters Name=subnet-id,Values=..."
+        echo "    - Last resort: aws cloudformation delete-stack --stack-name $STACK_NAME \\"
+        echo "          --region $REGION --retain-resources <LogicalResourceId(s)>"
         exit 1
     fi
     if [ "$STATUS" != "$LAST_STATUS" ]; then
