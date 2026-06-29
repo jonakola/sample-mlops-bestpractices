@@ -811,6 +811,11 @@ Resources:
               Service:
                 - sagemaker.amazonaws.com
                 - lambda.amazonaws.com
+                # codebuild.amazonaws.com is needed by src/setup/codebuild_image.py.
+                # Notebook 3 Section 7.2 passes this role to CodeBuild as the
+                # build project's service role; CodeBuild must be able to assume it
+                # to pull source from S3, push images to ECR, and emit CloudWatch logs.
+                - codebuild.amazonaws.com
             Action: 'sts:AssumeRole'
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
