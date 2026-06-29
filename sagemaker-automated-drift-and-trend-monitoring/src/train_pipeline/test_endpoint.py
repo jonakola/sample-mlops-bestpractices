@@ -397,7 +397,7 @@ def test_endpoint(
 
 def test_version_consistency_end_to_end(
     endpoint_name: str,
-    mlflow_model_name: str = "xgboost-fraud-detector",
+    mlflow_model_name: str = "fraud-detection",
 ) -> Dict[str, Any]:
     """
     End-to-end test to validate version consistency across the ML pipeline.

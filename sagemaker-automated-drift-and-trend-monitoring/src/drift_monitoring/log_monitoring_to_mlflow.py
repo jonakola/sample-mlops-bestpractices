@@ -51,7 +51,7 @@ def log_monitoring_to_mlflow(
     mlflow_uri = os.getenv('MLFLOW_TRACKING_URI')
     experiment_name = os.getenv('MLFLOW_EXPERIMENT_NAME', 'credit-card-fraud-detection-monitoring')
     if model_name is None:
-        model_name = os.getenv('MLFLOW_MODEL_NAME', 'xgboost-fraud-detector')
+        model_name = os.getenv('MLFLOW_MODEL_NAME', 'fraud-detection')
 
     if not mlflow_uri:
         return {

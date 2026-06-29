@@ -76,7 +76,7 @@ def load_model_from_mlflow(
         # Try model registry first
         try:
             logger.info("Attempting to load from model registry...")
-            model_registry_name = os.getenv('MLFLOW_MODEL_NAME', 'xgboost-fraud-detector')
+            model_registry_name = os.getenv('MLFLOW_MODEL_NAME', 'fraud-detection')
             model_uri_registry = f"models:/{model_registry_name}/latest"
             model = mlflow.xgboost.load_model(model_uri_registry)
             logger.info("✓ Successfully loaded from model registry")

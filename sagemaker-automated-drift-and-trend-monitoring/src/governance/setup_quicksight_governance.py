@@ -233,8 +233,8 @@ class QuickSightDashboardManager:
                                 },
                                 # Short chart-friendly label derived from the
                                 # ModelPackage ARN. ARN tail looks like
-                                #   .../model-package/xgboost-fraud-detector/7
-                                # so we keep "xgboost-fraud-detector:7". Use as
+                                #   .../model-package/fraud-detection/7
+                                # so we keep "fraud-detection:7". Use as
                                 # the X-axis or color dimension to slice
                                 # per-version trends.
                                 {

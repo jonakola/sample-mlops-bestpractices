@@ -694,7 +694,7 @@ def log_to_mlflow(
 
             # Log model
             logger.info("Logging model to MLflow...")
-            model_name = os.getenv('MLFLOW_MODEL_NAME', 'sg-xgboost-fraud-detector')
+            model_name = os.getenv('MLFLOW_MODEL_NAME', 'fraud-detection')
             model_info = mlflow.xgboost.log_model(
                 model,
                 artifact_path="model",

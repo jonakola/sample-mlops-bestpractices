@@ -48,10 +48,48 @@ def _get(yaml_section: str, yaml_key: str, env_var: str, default=None):
     return default
 
 
+# ===========================================================================
+# 🔁 Lambda env-var sync invariant
+# ---------------------------------------------------------------------------
+# Constants below tagged with `🔁 SYNC: lambda_drift_monitor.py` are also
+# read by the drift-monitor Lambda. The Lambda container image does NOT
+# include config.py — it can't (you can't `pip install` a relative source
+# package into the Lambda runtime, and we want env vars to be the
+# operator-facing config knob: the AWS Lambda console exposes them as a
+# first-class tab, lets you edit + re-test without rebuilding the image,
+# lets you per-environment override the same image, etc.).
+#
+# So the Lambda uses `os.getenv('NAME', '<hardcoded fallback>')`. The fallback
+# is a DEFENSIVE safety net for "what if the env var is missing at runtime"
+# (CloudFormation glitch, manual misconfigure, partial update) — NOT a
+# competing source of truth. At deploy time, the env var is always set from
+# config.py by scripts/deploy_lambda_container.sh.
+#
+# Rule when changing any 🔁 SYNC constant:
+#   1. Update the value here in config.py (this is the canonical source).
+#   2. Update the matching `os.getenv(K, '<fallback>')` in
+#      src/drift_monitoring/lambda_drift_monitor.py so the fallback stays
+#      consistent with config.py — they drift silently if you skip this.
+#   3. Re-run `scripts/deploy_lambda_container.sh --execute` to push the
+#      new env value to the deployed Lambda function.
+# ===========================================================================
+
+
 # ===================================================================
 # AWS
 # ===================================================================
-AWS_DEFAULT_REGION: str = _get("aws", "region", "AWS_DEFAULT_REGION", "us-east-1")
+# Data-plane region. Single source of truth — config.yaml `aws.region`, with
+# AWS_REGION / AWS_DEFAULT_REGION env vars allowed to override at runtime.
+# Keep the third-arg default in sync with config.yaml so nothing falls back
+# to a different region if the yaml fails to load.
+AWS_DEFAULT_REGION: str = _get("aws", "region", "AWS_DEFAULT_REGION", "us-west-2")
+
+# QuickSight identity region (where the QuickSight account was first
+# activated). Distinct from data-plane region — all QuickSight API calls
+# must hit this endpoint regardless of where the data lives.
+QUICKSIGHT_IDENTITY_REGION: str = _get(
+    "aws", "quicksight_identity_region", "QUICKSIGHT_IDENTITY_REGION", "us-east-1"
+)
 
 # ===================================================================
 # SageMaker
@@ -75,6 +113,8 @@ BATCH_TRANSFORM_MAX_CONCURRENT: int = int(
 # ===================================================================
 # MLflow
 # ===================================================================
+# 🔁 SYNC: lambda_drift_monitor.py:54 — Lambda reads MLFLOW_TRACKING_URI from
+# env; no Lambda-side fallback (MLflow run logging is skipped if missing).
 MLFLOW_TRACKING_URI: str = _get(
     "mlflow", "tracking_uri", "MLFLOW_TRACKING_URI", ""
 )
@@ -94,15 +134,25 @@ MLFLOW_MONITORING_EXPERIMENT_NAME: str = _get(
     "mlflow", "monitoring_experiment_name", "MLFLOW_MONITORING_EXPERIMENT_NAME",
     "credit-card-fraud-detection-monitoring",
 )
+# 🔁 SYNC: lambda_drift_monitor.py:52 — Lambda reads this as
+# `MODEL_PACKAGE_GROUP` (the SageMaker MPG name happens to equal the MLflow
+# registered-model name in this project; deploy_lambda_container.sh sets the
+# env var from this constant). Lambda fallback: 'fraud-detection'.
 MLFLOW_MODEL_NAME: str = _get(
-    "mlflow", "model_name", "MLFLOW_MODEL_NAME", "xgboost-fraud-detector"
+    "mlflow", "model_name", "MLFLOW_MODEL_NAME", "fraud-detection"
 )
 
 # ===================================================================
 # Athena
 # ===================================================================
+# 🔁 SYNC: lambda_drift_monitor.py:49 — Lambda fallback: 'fraud_detection'.
 ATHENA_DATABASE: str = _get("athena", "database", "ATHENA_DATABASE", "fraud_detection")
 ATHENA_WORKGROUP: str = _get("athena", "workgroup", "ATHENA_WORKGROUP", "primary")
+# 🔁 SYNC: lambda_drift_monitor.py:50 — Lambda fallback:
+# 's3://fraud-detection-data-lake/athena-query-results/'. That fallback path
+# is wrong on accounts that don't have that bucket — at deploy time
+# deploy_lambda_container.sh derives the correct s3://<data-bucket>/...
+# from PROJECT_NAME + account ID and overrides via the env var.
 ATHENA_OUTPUT_S3: str = _get("athena", "output_s3", "ATHENA_OUTPUT_S3", "")
 ATHENA_QUERY_TIMEOUT: int = int(
     _get("athena", "query_timeout", "ATHENA_QUERY_TIMEOUT", "300")
@@ -111,6 +161,7 @@ ATHENA_QUERY_TIMEOUT: int = int(
 ATHENA_TRAINING_TABLE: str = _get(
     "athena", "training_table", "ATHENA_TRAINING_TABLE", "training_data"
 )
+# 🔁 SYNC: lambda_drift_monitor.py:51 — Lambda fallback: 'evaluation_data'.
 ATHENA_EVALUATION_TABLE: str = _get(
     "athena", "evaluation_table", "ATHENA_EVALUATION_TABLE", "evaluation_data"
 )
@@ -127,8 +178,18 @@ ATHENA_GROUND_TRUTH_UPDATES_TABLE: str = _get(
 ATHENA_DRIFTED_DATA_TABLE: str = _get(
     "athena", "drifted_data_table", "ATHENA_DRIFTED_DATA_TABLE", "drifted_data"
 )
-ATHENA_MONITORING_RESPONSES_TABLE: str = os.environ.get(
-    "ATHENA_MONITORING_RESPONSES_TABLE", "monitoring_responses"
+ATHENA_MONITORING_RESPONSES_TABLE: str = _get(
+    "athena", "monitoring_responses_table", "ATHENA_MONITORING_RESPONSES_TABLE",
+    "monitoring_responses",
+)
+
+# ===================================================================
+# Project
+# ===================================================================
+# Used as a name prefix for CFN, IAM roles, S3 buckets, etc. Single source
+# of truth — every shell script + CFN reads this via _get / config_shell.py.
+PROJECT_NAME: str = _get(
+    "project", "name", "PROJECT_NAME", "fraud-detection-monitoring"
 )
 
 # ===================================================================
@@ -147,9 +208,10 @@ def _derive_data_bucket() -> str:
     if explicit:
         return explicit
 
-    project_name = _get("project", "name", "PROJECT_NAME", "")
-    if not project_name:
+    # Reuse the canonical PROJECT_NAME constant — single source of truth.
+    if not PROJECT_NAME:
         return ""
+    project_name = PROJECT_NAME
 
     try:
         import boto3
@@ -216,6 +278,11 @@ MONITORING_SQS_QUEUE_NAME: str = _get(
     "sqs", "monitoring_queue_name", "MONITORING_SQS_QUEUE_NAME",
     "fraud-monitoring-results",
 )
+# 🔁 SYNC: lambda_drift_monitor.py:55 — Lambda fallback: '' (empty string).
+# When empty, the Lambda computes drift results but skips SQS dispatch, so
+# the monitoring-writer Lambda never persists them. deploy_lambda_container.sh
+# resolves the URL from `aws sqs get-queue-url` at deploy time and bakes it
+# into the Lambda env, so the empty fallback is the "misconfigured" path.
 MONITORING_SQS_QUEUE_URL: str = _get(
     "sqs", "monitoring_queue_url", "MONITORING_SQS_QUEUE_URL", ""
 )
@@ -343,13 +410,15 @@ _drift_cfg = _yaml_cfg.get("drift_thresholds", {}) if isinstance(
 MIN_ROC_AUC_THRESHOLD: float = float(
     _drift_cfg.get("min_roc_auc", os.environ.get("MIN_ROC_AUC_THRESHOLD", "0.85"))
 )
-# Data-drift threshold: fraction of features whose distribution must shift
-# (Evidently DataDriftPreset) before alerting. Used by notebook 3 cells
-# 56 (CloudWatch alarms) and 62 (alert config).
+# 🔁 SYNC: lambda_drift_monitor.py:58 — Lambda fallback: 0.2. Data-drift
+# threshold: fraction of features whose distribution must shift (Evidently
+# DataDriftPreset) before alerting. Used by notebook 3 cells 56 (CloudWatch
+# alarms) and 62 (alert config).
 DATA_DRIFT_THRESHOLD: float = float(
     _drift_cfg.get("data_drift", os.environ.get("DATA_DRIFT_THRESHOLD", "0.20"))
 )
-# Model-drift threshold: relative ROC-AUC degradation vs baseline.
+# 🔁 SYNC: lambda_drift_monitor.py:60 — Lambda fallback: 0.05. Model-drift
+# threshold: relative ROC-AUC degradation vs baseline.
 MODEL_DRIFT_THRESHOLD: float = float(
     _drift_cfg.get("model_drift", os.environ.get("MODEL_DRIFT_THRESHOLD", "0.05"))
 )
@@ -363,16 +432,85 @@ DRIFT_MONITOR_SCHEDULE: str = _drift_mon_cfg.get(
 )
 
 # ===================================================================
+# Resource names — single source of truth for everything CFN, the deploy
+# scripts, the delete scripts, the notebooks, and the Lambdas reference.
+# Each constant below is THE place to change a name; shell scripts read
+# them via `python -m src.config.config_shell` (no shell-side defaults).
+# ===================================================================
+# 🔁 SYNC: lambda_drift_monitor.py:132 + line 1034 — Lambda reads
+# ENDPOINT_NAME from env (fallback '' at module init, then 'fraud-detector-endpoint'
+# at the final write site). deploy_lambda_container.sh resolves this constant
+# and sets the env var so both reads land on the same name.
+ENDPOINT_NAME: str = _get(
+    "endpoint", "name", "ENDPOINT_NAME", "fraud-detector-endpoint"
+)
+DRIFT_LAMBDA_NAME: str = _get(
+    "drift_monitor", "lambda_name", "DRIFT_LAMBDA_NAME",
+    "fraud-detection-drift-monitor",
+)
+MONITORING_WRITER_LAMBDA_NAME: str = _get(
+    "monitoring_writer", "lambda_name", "MONITORING_WRITER_LAMBDA_NAME",
+    "fraud-monitoring-results-writer",
+)
+EVENTBRIDGE_RULE_NAME: str = _get(
+    "drift_monitor", "eventbridge_rule_name", "EVENTBRIDGE_RULE_NAME",
+    "fraud-detection-drift-check",
+)
+SNS_TOPIC_NAME: str = _get(
+    "drift_monitor", "sns_topic_name", "SNS_TOPIC_NAME",
+    "fraud-detection-drift-alerts",
+)
+CLOUDWATCH_DASHBOARD_NAME: str = _get(
+    "drift_monitor", "cloudwatch_dashboard_name", "CLOUDWATCH_DASHBOARD_NAME",
+    "FraudDetection-DriftMonitoring",
+)
+ECR_REPO_NAME: str = _get(
+    "drift_monitor", "ecr_repo_name", "ECR_REPO_NAME",
+    DRIFT_LAMBDA_NAME,   # convention: ECR repo matches Lambda name
+)
+
+# ===================================================================
 # Monitoring lookback windows (used by notebook 2 + monitor_model_performance.py)
 # ===================================================================
-# Override via env vars when the Lambda runs — see also DATA_DRIFT_LOOKBACK_DAYS /
-# MODEL_DRIFT_LOOKBACK_DAYS read directly by lambda_drift_monitor.py.
+# 🔁 SYNC: lambda_drift_monitor.py:64-65 — note the Lambda reads SHORTER
+# env-var names (`DATA_DRIFT_LOOKBACK_DAYS`, `MODEL_DRIFT_LOOKBACK_DAYS`)
+# with fallbacks of 7 and 30 respectively. The constants below use longer
+# `MONITORING_*` names so notebook code can use different windows than the
+# scheduled Lambda. deploy_lambda_container.sh sets the SHORT-name env vars
+# to whatever value you want the Lambda to use (currently '1' for testing).
+# Keep both pairs aligned conceptually; the numeric values can intentionally
+# differ between notebook (longer history) and Lambda (daily delta).
 MONITORING_DATA_DRIFT_LOOKBACK_DAYS: int = int(
     os.environ.get("MONITORING_DATA_DRIFT_LOOKBACK_DAYS", "7")
 )
 MONITORING_MODEL_DRIFT_LOOKBACK_DAYS: int = int(
     os.environ.get("MONITORING_MODEL_DRIFT_LOOKBACK_DAYS", "30")
 )
+
+# ---------------------------------------------------------------------------
+# Lambda env vars WITHOUT a config.py counterpart (intentionally)
+# ---------------------------------------------------------------------------
+# The drift-monitor Lambda reads a few env vars that have no corresponding
+# constant here. They fall into two buckets:
+#
+#  (a) Lambda-only operational knobs — not interesting to the rest of the
+#      project. If you need to tune one, change deploy_lambda_container.sh
+#      or edit the Lambda env directly in the console:
+#         KS_PVALUE_THRESHOLD   (lambda_drift_monitor.py:59, fallback 0.05)
+#         MIN_SAMPLES           (lambda_drift_monitor.py:61, fallback 100)
+#         BASELINE_ROC_AUC      (lambda_drift_monitor.py:563, fallback 0.92)
+#
+#  (b) Values resolved at deploy time, not at config-load time. Lives in
+#      deploy_lambda_container.sh because the value depends on what AWS
+#      returned just now:
+#         SNS_TOPIC_ARN         (created by deploy script, ARN passed in)
+#         MODEL_VERSION         (resolved from latest approved MPG package)
+#         MLFLOW_TRACKING_URI   (looked up via list-mlflow-tracking-servers)
+#         ATHENA_OUTPUT_S3      (derived from PROJECT_NAME + account ID)
+#         MONITORING_SQS_QUEUE_URL  (looked up via sqs get-queue-url)
+#
+# Both buckets are deliberately NOT 🔁 SYNC-tagged: there is no second
+# source of truth to keep aligned.
 
 # ===================================================================
 # Ground-truth simulation (dev/test only — see notebook 2 Section 4)
