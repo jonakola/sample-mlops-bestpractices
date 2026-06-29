@@ -213,24 +213,31 @@ echo "[5/7] Deploying Lambda function..."
 MLFLOW_URI=$(aws sagemaker list-mlflow-tracking-servers --region $REGION --query 'TrackingServerSummaries[0].TrackingServerArn' --output text 2>/dev/null || echo "")
 SQS_QUEUE_URL=$(aws sqs get-queue-url --queue-name fraud-monitoring-results --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
 
-ENV_VARS=$(cat <<EOF
+# Write env config to a temp file and pass via file:// — using --environment
+# with the shorthand "Variables={...}" or inline JSON trips the AWS CLI parser
+# on the embedded braces/quotes. file:// sidesteps shell quoting entirely.
+ENV_FILE=$(mktemp -t lambda-env.XXXXXX.json)
+trap 'rm -f "$ENV_FILE"' EXIT
+
+cat > "$ENV_FILE" <<EOF
 {
-  "ATHENA_DATABASE": "$ATHENA_DB",
-  "ATHENA_OUTPUT_S3": "$ATHENA_OUTPUT",
-  "ATHENA_EVALUATION_TABLE": "evaluation_data",
-  "MODEL_PACKAGE_GROUP": "xgboost-fraud-detector",
-  "SNS_TOPIC_ARN": "$TOPIC_ARN",
-  "MLFLOW_TRACKING_URI": "$MLFLOW_URI",
-  "BASELINE_ROC_AUC": "0.92",
-  "DATA_DRIFT_THRESHOLD": "$DATA_DRIFT_THRESHOLD",
-  "KS_PVALUE_THRESHOLD": "0.05",
-  "MODEL_DRIFT_THRESHOLD": "$MODEL_DRIFT_THRESHOLD",
-  "MONITORING_SQS_QUEUE_URL": "$SQS_QUEUE_URL",
-  "DATA_DRIFT_LOOKBACK_DAYS": "1",
-  "MODEL_DRIFT_LOOKBACK_DAYS": "1"
+  "Variables": {
+    "ATHENA_DATABASE": "$ATHENA_DB",
+    "ATHENA_OUTPUT_S3": "$ATHENA_OUTPUT",
+    "ATHENA_EVALUATION_TABLE": "evaluation_data",
+    "MODEL_PACKAGE_GROUP": "fraud-detection",
+    "SNS_TOPIC_ARN": "$TOPIC_ARN",
+    "MLFLOW_TRACKING_URI": "$MLFLOW_URI",
+    "BASELINE_ROC_AUC": "0.92",
+    "DATA_DRIFT_THRESHOLD": "$DATA_DRIFT_THRESHOLD",
+    "KS_PVALUE_THRESHOLD": "0.05",
+    "MODEL_DRIFT_THRESHOLD": "$MODEL_DRIFT_THRESHOLD",
+    "MONITORING_SQS_QUEUE_URL": "$SQS_QUEUE_URL",
+    "DATA_DRIFT_LOOKBACK_DAYS": "1",
+    "MODEL_DRIFT_LOOKBACK_DAYS": "1"
+  }
 }
 EOF
-)
 
 # Check if function exists
 FUNCTION_EXISTS=$(aws lambda get-function --function-name $LAMBDA_NAME --region $REGION 2>/dev/null && echo "true" || echo "false")
@@ -254,7 +261,7 @@ if [ "$FUNCTION_EXISTS" = "true" ]; then
             --function-name $LAMBDA_NAME \
             --timeout 300 \
             --memory-size 512 \
-            --environment "Variables=$ENV_VARS" \
+            --environment "file://$ENV_FILE" \
             --region $REGION > /dev/null
         aws lambda wait function-updated-v2 --function-name $LAMBDA_NAME --region $REGION
     fi
@@ -270,7 +277,7 @@ if [ "$FUNCTION_EXISTS" = "false" ]; then
         --timeout 300 \
         --memory-size 512 \
         --description "Automated drift detection with Evidently + MLflow" \
-        --environment "Variables=$ENV_VARS" \
+        --environment "file://$ENV_FILE" \
         --region $REGION > /dev/null
     aws lambda wait function-active-v2 --function-name $LAMBDA_NAME --region $REGION
 fi
