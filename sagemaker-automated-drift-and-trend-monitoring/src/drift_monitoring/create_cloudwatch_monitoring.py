@@ -240,19 +240,25 @@ def create_cloudwatch_monitoring(
     print("")
     print(f"[3/3] Creating CloudWatch dashboard: {DASHBOARD_NAME}...")
 
+    # CloudWatch dashboard widget rules:
+    #   - Header text uses type="text" with `markdown` property.
+    #     (type="metric" with `markdown` is rejected as invalid.)
+    #   - Every widget needs x/y/width/height. The grid is 24 columns wide.
     dashboard_body = {
         "widgets": [
             {
-                "type": "metric",
+                "type": "text",
+                "x": 0, "y": 0, "width": 24, "height": 2,
                 "properties": {
                     "markdown": f"# Fraud Detection - Drift Monitoring Dashboard\n**Endpoint:** `{endpoint_name}` | **Threshold:** {drift_threshold*100:.0f}% variance | **Updated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
                 }
             },
             {
                 "type": "metric",
+                "x": 0, "y": 2, "width": 12, "height": 6,
                 "properties": {
                     "metrics": [
-                        [NAMESPACE, "DataDriftPSI", {"stat": "Average"}]
+                        [NAMESPACE, "DataDriftPSI", "Endpoint", endpoint_name, {"stat": "Average"}]
                     ],
                     "view": "timeSeries",
                     "stacked": False,
@@ -269,12 +275,13 @@ def create_cloudwatch_monitoring(
             },
             {
                 "type": "metric",
+                "x": 12, "y": 2, "width": 12, "height": 6,
                 "properties": {
                     "metrics": [
-                        [NAMESPACE, "ROCAUCDegradation", {"stat": "Average", "label": "ROC-AUC Degradation"}],
-                        [NAMESPACE, "Accuracy", {"stat": "Average", "label": "Accuracy Degradation"}],
-                        [NAMESPACE, "Precision", {"stat": "Average", "label": "Precision Degradation"}],
-                        [NAMESPACE, "Recall", {"stat": "Average", "label": "Recall Degradation"}],
+                        [NAMESPACE, "ROCAUCDegradation", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC Degradation"}],
+                        [NAMESPACE, "Accuracy", "Endpoint", endpoint_name, {"stat": "Average", "label": "Accuracy Degradation"}],
+                        [NAMESPACE, "Precision", "Endpoint", endpoint_name, {"stat": "Average", "label": "Precision Degradation"}],
+                        [NAMESPACE, "Recall", "Endpoint", endpoint_name, {"stat": "Average", "label": "Recall Degradation"}],
                     ],
                     "view": "timeSeries",
                     "stacked": False,
@@ -291,6 +298,7 @@ def create_cloudwatch_monitoring(
             },
             {
                 "type": "alarm",
+                "x": 0, "y": 8, "width": 24, "height": 4,
                 "properties": {
                     "title": "Drift Alarms Status",
                     "alarms": [

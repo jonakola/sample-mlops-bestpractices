@@ -910,6 +910,14 @@ Resources:
                   - 'ecr:InitiateLayerUpload'
                   - 'ecr:UploadLayerPart'
                   - 'ecr:CompleteLayerUpload'
+                  # Required to attach a repository policy that lets the Lambda
+                  # service (lambda.amazonaws.com) pull container images from
+                  # the repo. Without this, `aws lambda create-function --code
+                  # ImageUri=...` fails with "Lambda does not have permission
+                  # to access the ECR image" — container Lambdas authenticate
+                  # via the ECR repo policy, not the execution role.
+                  - 'ecr:SetRepositoryPolicy'
+                  - 'ecr:GetRepositoryPolicy'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-LambdaAccess'
           PolicyDocument:
