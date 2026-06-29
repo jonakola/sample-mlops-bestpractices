@@ -1059,14 +1059,14 @@ Resources:
                   - 'lakeformation:DescribeResource'
                   - 'lakeformation:RegisterResource'
                 Resource: '*'
-        # CodeBuild: notebook 3 Section 7.2 uses `sm-docker build` (from the
-        # sagemaker-studio-image-build package) to build the drift-monitor
-        # Lambda container image when no local Docker daemon is available
-        # (the default in SageMaker JupyterLab spaces). `sm-docker` provisions
-        # an on-demand CodeBuild project that runs `docker build` + `docker push`
-        # on AWS-managed infrastructure. This policy grants the SageMaker
-        # exec role the permissions sm-docker needs:
-        #   - codebuild:* — create/start/inspect the ephemeral build project
+        # CodeBuild: notebook 3 Section 7.2 builds the drift-monitor Lambda
+        # container image via src/setup/codebuild_image.py — a plain boto3
+        # wrapper around AWS CodeBuild. SageMaker JupyterLab spaces don't
+        # have a Docker daemon, so the wrapper provisions an on-demand
+        # CodeBuild project that runs `docker build` + `docker push` on
+        # AWS-managed infrastructure, then cleans up. This policy grants
+        # the SageMaker exec role the permissions the wrapper needs:
+        #   - codebuild:* — create/start/inspect/delete the ephemeral project
         #   - logs:* read — stream CodeBuild output back to the notebook
         #   - iam:PassRole (scoped to codebuild.amazonaws.com) — let the
         #     SageMaker role delegate its build role to CodeBuild at start time

@@ -161,13 +161,13 @@ echo "  ✓ Repository: $REPO_NAME"
 #
 # Two paths, auto-detected:
 #   - Local Docker daemon reachable → use `docker build` directly (fast, ~2 min)
-#   - No local daemon (SageMaker Studio JupyterLab) → use `sm-docker build`
-#     which runs the build in an AWS-managed CodeBuild project and pushes
-#     the result to ECR (no daemon needed; ~5-8 min)
+#   - No local daemon (SageMaker Studio JupyterLab) → fall back to AWS
+#     CodeBuild via src/setup/codebuild_image.py (~5-8 min)
 #
-# `sm-docker` ships in the sagemaker-studio-image-build package. Install
-# inside the kernel before re-running notebook 3 Section 7.2:
-#     pip install sagemaker-studio-image-build
+# We use our own CodeBuild wrapper (codebuild_image.py) rather than the
+# third-party sm-docker package because sm-docker calls v2-only SageMaker
+# SDK APIs (sagemaker.get_execution_role, sagemaker.session) that were
+# removed in v3 — and our project requires v3.
 echo ""
 echo "[4/7] Building Docker image..."
 
@@ -182,30 +182,27 @@ if docker info >/dev/null 2>&1; then
     echo "  Pushing to ECR..."
     docker push $IMAGE_URI | tail -5
     echo "  ✓ Image pushed: $IMAGE_URI"
-elif command -v sm-docker >/dev/null 2>&1; then
-    echo "  ℹ No local Docker daemon — using sm-docker (SageMaker Studio CodeBuild) instead."
-    echo "  This takes ~5-8 minutes; the build runs in AWS, output streams below."
-    # sm-docker's auto-role-detection calls sagemaker.get_execution_role(),
-    # a v2-SDK function removed in v3. We pass the role explicitly via --role
-    # to bypass that broken code path. Strip the IAM ARN prefix so sm-docker
-    # gets just the role-name suffix it actually wants (it later re-prefixes
-    # it before handing to CodeBuild).
-    SM_ROLE_NAME=$(aws sts get-caller-identity --query Arn --output text \
-        | sed -E 's|arn:aws:sts::[0-9]+:assumed-role/([^/]+)/.*|\1|')
-    if [ -z "$SM_ROLE_NAME" ]; then
-        echo "❌ Could not resolve SageMaker execution role — set SAGEMAKER_EXEC_ROLE in .env"
-        exit 1
-    fi
-    sm-docker build . \
-        --repository "$REPO_NAME:latest" \
-        --file src/drift_monitoring/Dockerfile.lambda \
-        --role "$SM_ROLE_NAME"
-    echo "  ✓ Image built and pushed via CodeBuild: $IMAGE_URI"
 else
-    echo "❌ Cannot build image — no Docker daemon and sm-docker not installed."
-    echo "   Install it inside the kernel:  pip install sagemaker-studio-image-build"
-    echo "   Or run this script from a host with Docker (e.g. your laptop)."
-    exit 1
+    echo "  ℹ No local Docker daemon — using AWS CodeBuild to build the image."
+    echo "  This takes ~5-8 minutes; the build runs in AWS, output streams below."
+    # Resolve the SageMaker execution role ARN (CodeBuild project needs one
+    # role to assume — it needs ECR push perms + CloudWatch log perms).
+    # Prefer SAGEMAKER_EXEC_ROLE from .env (set by CFN); fall back to the
+    # current caller's role.
+    if [ -n "${SAGEMAKER_EXEC_ROLE:-}" ]; then
+        BUILD_ROLE_ARN="$SAGEMAKER_EXEC_ROLE"
+    else
+        CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+        ROLE_NAME=$(echo "$CALLER_ARN" | sed -E 's|arn:aws:sts::[0-9]+:assumed-role/([^/]+)/.*|\1|')
+        BUILD_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+    fi
+    python3 -m src.setup.codebuild_image \
+        --source-dir . \
+        --dockerfile src/drift_monitoring/Dockerfile.lambda \
+        --repository "$REPO_NAME" \
+        --role-arn "$BUILD_ROLE_ARN" \
+        --region "$REGION"
+    echo "  ✓ Image built and pushed via CodeBuild: $IMAGE_URI"
 fi
 
 # Step 5: Create/Update Lambda function

@@ -29,14 +29,12 @@ dependencies = [
     "ipykernel>=6.29.0",       # Jupyter kernel for notebook execution
     "ipywidgets>=8.1.0",       # Silences tqdm IProgress warning; required by Evidently HTML reports
     "kagglehub>=0.2.0",        # Download Kaggle datasets for training data
-    # NOTE: sm-docker (PyPI: sagemaker-studio-image-build) is NOT listed here
-    # because its setup.py pins sagemaker<3.0, conflicting with our
-    # sagemaker>=3.4.0 requirement. Notebook 3 installs it separately with
-    # --no-deps:
-    #     pip install --no-deps sagemaker-studio-image-build
-    # That's safe — sm-docker's only runtime use of the sagemaker SDK is a
-    # one-line `from sagemaker import Session` for fetching the default
-    # bucket, which works fine across v2 and v3.
+    # Container image builds in SageMaker Studio JupyterLab (which has no
+    # Docker daemon) go through src/setup/codebuild_image.py — a plain
+    # boto3 wrapper around AWS CodeBuild. We deliberately do NOT use
+    # `sagemaker-studio-image-build` (sm-docker): it pins sagemaker<3.0
+    # AND calls v2-only SDK APIs (get_execution_role, sagemaker.session)
+    # that were removed in v3, both of which our pipeline depends on.
 ]
 
 # Explicitly point setuptools at `src/` (and all sub-packages it auto-discovers
