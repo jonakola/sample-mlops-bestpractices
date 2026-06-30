@@ -7,26 +7,27 @@
 # hook that rejects this template on update. Direct submission works.
 #
 # Usage:
-#   ./cloudformation/deploy-stack.sh                       # default: fraud-detection-monitoring in us-west-2
-#   ./cloudformation/deploy-stack.sh my-other-stack        # override stack name positionally
-#   ./cloudformation/deploy-stack.sh --drop-database       # one-shot wipe of the fraud_detection database
-#                                                          # + all 7 table S3 prefixes BEFORE the CFN deploy
-#                                                          # runs. Tables get recreated empty by the
-#                                                          # lifecycle script on next Space launch.
-#   AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh  # override region via env var
+#   ./cloudformation/deploy-stack.sh                          # default: fraud-detection-monitoring in us-west-2
+#   ./cloudformation/deploy-stack.sh my-other-stack           # override stack name positionally
+#   ./cloudformation/deploy-stack.sh --recreate-database      # one-shot wipe of the fraud_detection database
+#                                                             # + all 7 table S3 prefixes BEFORE the CFN deploy
+#                                                             # runs. Tables get recreated empty by the
+#                                                             # lifecycle script on next Space launch.
+#   AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh     # override region via env var
 #   TEMPLATE=path/to/other.yaml ./cloudformation/deploy-stack.sh
 #
-# --drop-database is destructive but ONE-SHOT: it fires once at deploy time and
+# --recreate-database is destructive but ONE-SHOT: it fires once at deploy time and
 # does NOT persist as stack state. Subsequent Space restarts won't wipe data.
 #
 set -euo pipefail
 
-DROP_DATABASE="false"
+RECREATE_DATABASE="false"
 POSITIONAL=()
 for arg in "$@"; do
   case "$arg" in
-    --drop-database)
-      DROP_DATABASE="true"
+    --recreate-database|--drop-database)
+      RECREATE_DATABASE="true"
+      # Accept --drop-database as alias for backwards compatibility
       ;;
     --help|-h)
       sed -n '1,/^set -euo pipefail$/p' "$0" | sed '$d'
@@ -71,18 +72,18 @@ echo "Stack:    $STACK_NAME"
 echo "Region:   $REGION"
 echo "Template: $TEMPLATE"
 echo "S3 stage: s3://$S3_BUCKET/$TEMPLATE_KEY"
-if [ "$DROP_DATABASE" = "true" ]; then
-  echo "Drop database: ENABLED — one-shot wipe will run BEFORE the CFN deploy"
+if [ "$RECREATE_DATABASE" = "true" ]; then
+  echo "Recreate database: ENABLED — one-shot wipe will run BEFORE the CFN deploy"
 fi
 echo ""
 
 # ----------------------------------------------------------------------------
 # Pre-deploy: one-shot DROP DATABASE + clear table S3 prefixes if requested.
-# Runs ONLY when --drop-database was passed on the command line; nothing in
+# Runs ONLY when --recreate-database was passed on the command line; nothing in
 # the CFN template carries this flag forward, so subsequent Space restarts
 # never wipe data.
 # ----------------------------------------------------------------------------
-if [ "$DROP_DATABASE" = "true" ]; then
+if [ "$RECREATE_DATABASE" = "true" ]; then
   echo "=== Pre-deploy: DROP DATABASE $ATHENA_DATABASE CASCADE ==="
   if aws s3api head-bucket --bucket "$DATA_BUCKET" --region "$REGION" >/dev/null 2>&1; then
     OUTPUT_LOC="s3://${DATA_BUCKET}/athena-results/"
