@@ -9,17 +9,24 @@ set -uo pipefail
 # dashboard/alarms. This one drains everything CFN can't drain on its own,
 # then issues the delete-stack call and waits.
 #
-# Why we don't just `aws cloudformation delete-stack`: this stack has 3 known
+# Why we don't just `aws cloudformation delete-stack`: this stack has 4 known
 # resources that block delete unless they're drained first.
 #
-#   1. S3 buckets with objects (CFN can't delete a non-empty bucket).
+#   1. Glue/Athena Iceberg tables MUST be dropped BEFORE the data bucket
+#      empties — Iceberg metadata files live in S3, and if those vanish
+#      while the Glue catalog still points at them, the next deploy hits
+#      `ICEBERG_MISSING_METADATA: Metadata not found in metadata location`
+#      on every SELECT. CFN doesn't clean the catalog on its own (tables
+#      are created by a custom resource Lambda; the catalog entries survive).
+#
+#   2. S3 buckets with objects (CFN can't delete a non-empty bucket).
 #      → empty the bucket via `aws s3 rm --recursive` + clear versioned
 #        delete markers if versioning ever ran on it.
 #
-#   2. SageMaker Studio Space — if a JupyterLab app is RUNNING, the Space
+#   3. SageMaker Studio Space — if a JupyterLab app is RUNNING, the Space
 #      can't be deleted. We list apps for the user profile and stop each.
 #
-#   3. Lake Formation grants on the Athena database — they reference the
+#   4. Lake Formation grants on the Athena database — they reference the
 #      SageMaker exec role, which can hold up the role delete on stack
 #      teardown.
 #
@@ -129,9 +136,51 @@ run() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# 1. Inventory + (if executing) empty S3 buckets owned by the stack.
+# 1. Drop Glue/Athena tables BEFORE emptying the S3 bucket.
+#
+# Why this order matters:
+#   The Athena tables are Iceberg-format and store their `metadata/` pointer
+#   files in the data bucket. If we empty the bucket first, those metadata
+#   files vanish and the tables become unreadable with
+#       ICEBERG_MISSING_METADATA: Metadata not found in metadata location
+#   on the next deploy (when someone tries `SELECT * FROM training_data`).
+#
+#   The Glue Catalog entries are NOT tracked by CFN directly — they're
+#   created by the `SetupAthenaTables` custom resource on stack create.
+#   On stack delete CFN tears down the custom resource Lambda but does NOT
+#   re-run any cleanup logic on the catalog. So we have to drop the tables
+#   ourselves, before we touch the bucket.
 # ────────────────────────────────────────────────────────────────────────────
-echo "[1/5] S3 buckets owned by the stack..."
+echo "[1/6] Dropping Glue/Athena tables in '$(get_config ATHENA_DATABASE)'..."
+_GLUE_DB="$(get_config ATHENA_DATABASE)"
+if aws glue get-database --name "$_GLUE_DB" --region "$REGION" >/dev/null 2>&1; then
+    GLUE_TABLES=$(aws glue get-tables --database-name "$_GLUE_DB" --region "$REGION" \
+        --query 'TableList[].Name' --output text 2>/dev/null || echo "")
+    if [ -z "$GLUE_TABLES" ]; then
+        echo "  Database exists but contains no tables — skipping."
+    else
+        for t in $GLUE_TABLES; do
+            if $DRY_RUN; then
+                echo "  [DRY-RUN] would drop $_GLUE_DB.$t"
+            else
+                if aws glue delete-table --database-name "$_GLUE_DB" --name "$t" \
+                    --region "$REGION" 2>/dev/null; then
+                    echo "  ✓ dropped $_GLUE_DB.$t"
+                else
+                    echo "  ⚠ could not drop $_GLUE_DB.$t (continuing)"
+                fi
+            fi
+        done
+    fi
+else
+    echo "  (database '$_GLUE_DB' does not exist — nothing to drop)"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2. Inventory + (if executing) empty S3 buckets owned by the stack.
+# ────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[2/6] S3 buckets owned by the stack..."
 BUCKETS=$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
     --query "StackResourceSummaries[?ResourceType=='AWS::S3::Bucket'].PhysicalResourceId" \
     --output text 2>/dev/null || echo "")
@@ -173,11 +222,11 @@ PYEOF
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 2. Stop running SageMaker Studio apps. A Space delete fails while a
+# 3. Stop running SageMaker Studio apps. A Space delete fails while a
 #    JupyterLab app is RUNNING.
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[2/5] SageMaker Studio apps..."
+echo "[3/6] SageMaker Studio apps..."
 DOMAIN_ID=$(aws cloudformation describe-stack-resource --stack-name "$STACK_NAME" \
     --logical-resource-id SageMakerDomain --region "$REGION" \
     --query 'StackResourceDetail.PhysicalResourceId' --output text 2>/dev/null || echo "")
@@ -423,11 +472,11 @@ sweep_all_orphans() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3. Revoke Lake Formation grants on the Athena DB (best-effort).
+# 4. Revoke Lake Formation grants on the Athena DB (best-effort).
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
 _ATHENA_DB="$(get_config ATHENA_DATABASE)"
-echo "[3/5] Lake Formation grants on Athena database '$_ATHENA_DB' (best-effort)..."
+echo "[4/6] Lake Formation grants on Athena database '$_ATHENA_DB' (best-effort)..."
 LF_GRANTS=$(aws lakeformation list-permissions --resource "{\"Database\":{\"Name\":\"$_ATHENA_DB\"}}" \
     --region "$REGION" --query 'length(PrincipalResourcePermissions)' \
     --output text 2>/dev/null || echo "0")
@@ -469,7 +518,7 @@ PYEOF
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3b. If we're recovering from DELETE_FAILED, sweep orphaned EFS mount
+# 4b. If we're recovering from DELETE_FAILED, sweep orphaned EFS mount
 #     targets NOW — they're the most common cause and CFN can't drain them.
 # ────────────────────────────────────────────────────────────────────────────
 if $IS_RETRY_FROM_DELETE_FAILED; then
@@ -477,10 +526,10 @@ if $IS_RETRY_FROM_DELETE_FAILED; then
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4. Issue delete-stack.
+# 5. Issue delete-stack.
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[4/5] Stack delete..."
+echo "[5/6] Stack delete..."
 if $DRY_RUN; then
     echo "  [DRY-RUN] would run: aws cloudformation delete-stack --stack-name $STACK_NAME --region $REGION"
     # Show the full inventory of resources that would be deleted.
@@ -495,12 +544,12 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 5. Wait for delete (only in execute mode). CFN's wait timeout is 3 hours;
+# 6. Wait for delete (only in execute mode). CFN's wait timeout is 3 hours;
 #    the MLflow tracking server alone takes ~10 min. We poll every 30s and
 #    surface status transitions instead of staring at a silent wait command.
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[5/5] Wait for delete..."
+echo "[6/6] Wait for delete..."
 if $DRY_RUN; then
     echo "  [DRY-RUN] would poll for DELETE_COMPLETE (typically 10-20 min)"
     echo ""
