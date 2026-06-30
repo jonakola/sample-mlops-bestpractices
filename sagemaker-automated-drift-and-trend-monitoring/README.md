@@ -15,12 +15,15 @@ See [ARCHITECTURE_STEPS.md](docs/ARCHITECTURE_STEPS.md) for detailed step-by-ste
 Provisions everything: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 bucket, VPC, SQS queue, Lambda inference logger, and IAM role with all required permissions. On first space launch, the lifecycle script clones this repo, downloads the Kaggle training data, uploads to S3, creates Athena tables, and writes a populated `.env` file.
 
 ```bash
-./cloudformation/deploy-stack.sh                       # default: fraud-detection-monitoring in us-west-2
-./cloudformation/deploy-stack.sh my-stack              # override stack name
-AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh  # override region
+./cloudformation/deploy-stack.sh                           # default: fraud-detection-monitoring in us-west-2
+./cloudformation/deploy-stack.sh my-stack                  # override stack name
+AWS_REGION=us-east-1 ./cloudformation/deploy-stack.sh      # override region
+./cloudformation/deploy-stack.sh --recreate-database       # wipe and recreate Athena database + tables
 ```
 
 Idempotent — re-runs create if missing, update if present. First create takes ~10–15 minutes.
+
+**The `--recreate-database` flag** drops the `fraud_detection` Athena database and all 7 tables, clears their S3 data, then lets the lifecycle script recreate them empty on next Space launch. Use this to reset to a clean state (e.g., after schema changes or when Iceberg metadata becomes corrupted). The flag is destructive but one-shot — it only fires during that specific deploy; subsequent Space restarts won't wipe data.
 
 **Prerequisites:** AWS CLI configured, IAM permissions for CloudFormation/IAM/SageMaker/Lambda/VPC, a region with SageMaker + MLflow availability (`us-east-1`, `us-west-2`, `eu-west-1`).
 
