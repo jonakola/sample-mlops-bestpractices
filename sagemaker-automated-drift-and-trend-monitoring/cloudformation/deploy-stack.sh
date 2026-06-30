@@ -103,6 +103,50 @@ if [ "$DROP_DATABASE" = "true" ]; then
       esac
     done
 
+    # Verify tables are actually gone from Glue catalog (Iceberg tables may
+    # survive DROP DATABASE due to catalog sync issues). Force-delete any
+    # survivors via Glue API to prevent broken metadata state.
+    echo "Verifying tables removed from Glue catalog..."
+    REMAINING_TABLES=$(aws glue get-tables \
+      --database-name "$ATHENA_DATABASE" \
+      --region "$REGION" \
+      --query 'TableList[*].Name' \
+      --output text 2>/dev/null || echo "")
+
+    if [ -n "$REMAINING_TABLES" ]; then
+      echo "  ⚠ Found tables still in catalog after DROP: $REMAINING_TABLES"
+      echo "  Force-deleting via Glue API..."
+
+      for TBL in $REMAINING_TABLES; do
+        if aws glue delete-table \
+          --database-name "$ATHENA_DATABASE" \
+          --name "$TBL" \
+          --region "$REGION" 2>/dev/null; then
+          echo "    ✓ Force-deleted: $TBL"
+        else
+          echo "    ✗ Failed to delete: $TBL"
+        fi
+      done
+
+      # Verify all gone
+      STILL_REMAINING=$(aws glue get-tables \
+        --database-name "$ATHENA_DATABASE" \
+        --region "$REGION" \
+        --query 'TableList[*].Name' \
+        --output text 2>/dev/null || echo "")
+
+      if [ -n "$STILL_REMAINING" ]; then
+        echo ""
+        echo "ERROR: Failed to remove tables from Glue catalog: $STILL_REMAINING"
+        echo "Manual intervention required. Run:"
+        echo "  aws glue delete-table --database-name $ATHENA_DATABASE --name <table> --region $REGION"
+        exit 1
+      fi
+      echo "  ✓ All tables force-deleted from catalog"
+    else
+      echo "  ✓ All tables removed from catalog"
+    fi
+
     echo "Clearing 7 table S3 prefixes under s3://${DATA_BUCKET}/${S3_TABLE_PREFIX}/ ..."
     for TBL in "${RESETTABLE_TABLES[@]}"; do
       PREFIX="${S3_TABLE_PREFIX}/${TBL}/"
