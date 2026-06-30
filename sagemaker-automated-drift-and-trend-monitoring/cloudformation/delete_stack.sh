@@ -322,6 +322,107 @@ sweep_orphan_efs() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
+# Helper: sweep orphaned SageMaker-NFS security groups in the stack's VPC.
+#
+# Why this exists:
+#   AWS::SageMaker::Domain creates two security groups at runtime — named
+#   `security-group-for-inbound-nfs-d-<domain-id>` and
+#   `security-group-for-outbound-nfs-d-<domain-id>`. These are NOT tracked by
+#   CFN. After domain delete they orphan in the VPC and block VPC delete
+#   with "has dependencies and cannot be deleted".
+#
+# Sweep strategy:
+#   1. Find the VPC the stack owns.
+#   2. List SGs in that VPC matching the SageMaker NFS naming pattern.
+#   3. Strip all ingress/egress rules from each (the pair references each
+#      other, so deletion fails until rules are revoked from BOTH).
+#   4. Delete each SG.
+# ────────────────────────────────────────────────────────────────────────────
+sweep_orphan_sagemaker_sgs() {
+    local action_label="${1:-sweep}"
+    echo ""
+    echo "Sweeping orphaned SageMaker NFS security groups ($action_label)..."
+
+    # Get the VPC owned by the stack.
+    local vpc_id
+    vpc_id=$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
+        --query "StackResourceSummaries[?ResourceType=='AWS::EC2::VPC'].PhysicalResourceId | [0]" \
+        --output text 2>/dev/null || echo "")
+    if [ -z "$vpc_id" ] || [ "$vpc_id" = "None" ]; then
+        echo "  (no VPC in stack — nothing to sweep)"
+        return 0
+    fi
+
+    # SageMaker creates SG names matching `security-group-for-*-nfs-d-*`.
+    local sg_list
+    sg_list=$(aws ec2 describe-security-groups --region "$REGION" \
+        --filters "Name=vpc-id,Values=$vpc_id" \
+                  "Name=group-name,Values=security-group-for-*-nfs-d-*" \
+        --query "SecurityGroups[].GroupId" --output text 2>/dev/null || echo "")
+
+    if [ -z "$sg_list" ]; then
+        echo "  ✓ No orphan SageMaker NFS security groups in stack VPC."
+        return 0
+    fi
+
+    echo "  Found orphan security groups:"
+    for sg in $sg_list; do
+        local name
+        name=$(aws ec2 describe-security-groups --group-ids "$sg" --region "$REGION" \
+            --query "SecurityGroups[0].GroupName" --output text 2>/dev/null || echo "?")
+        echo "    - $sg ($name)"
+    done
+
+    if $DRY_RUN; then
+        for sg in $sg_list; do
+            echo "  [DRY-RUN] would strip rules + delete $sg"
+        done
+        return 0
+    fi
+
+    # Two-pass: strip rules from ALL, then delete ALL. They reference each
+    # other so we can't delete the first while the second still has a rule
+    # pointing at it.
+    for sg in $sg_list; do
+        # Revoke ingress (if any)
+        local ingress
+        ingress=$(aws ec2 describe-security-groups --group-ids "$sg" --region "$REGION" \
+            --query "SecurityGroups[0].IpPermissions" --output json 2>/dev/null || echo "[]")
+        if [ "$ingress" != "[]" ] && [ -n "$ingress" ]; then
+            echo "$ingress" | aws ec2 revoke-security-group-ingress \
+                --group-id "$sg" --region "$REGION" --ip-permissions file:///dev/stdin >/dev/null 2>&1 \
+                || echo "    ⚠ could not revoke ingress on $sg"
+        fi
+        # Revoke egress (if any non-default rules)
+        local egress
+        egress=$(aws ec2 describe-security-groups --group-ids "$sg" --region "$REGION" \
+            --query "SecurityGroups[0].IpPermissionsEgress" --output json 2>/dev/null || echo "[]")
+        if [ "$egress" != "[]" ] && [ -n "$egress" ]; then
+            echo "$egress" | aws ec2 revoke-security-group-egress \
+                --group-id "$sg" --region "$REGION" --ip-permissions file:///dev/stdin >/dev/null 2>&1 \
+                || echo "    ⚠ could not revoke egress on $sg"
+        fi
+    done
+
+    # Now delete them.
+    for sg in $sg_list; do
+        if aws ec2 delete-security-group --group-id "$sg" --region "$REGION" 2>/dev/null; then
+            echo "  ✓ Deleted $sg"
+        else
+            echo "  ⚠ Could not delete $sg — check for other resources still referencing it"
+        fi
+    done
+}
+
+# Combined orphan sweep — EFS first (so subnets can go), then SGs (so VPC can go).
+# Called from the DELETE_FAILED recovery path AND from the wait-loop auto-retry.
+sweep_all_orphans() {
+    local label="${1:-sweep}"
+    sweep_orphan_efs "$label"
+    sweep_orphan_sagemaker_sgs "$label"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 # 3. Revoke Lake Formation grants on the Athena DB (best-effort).
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -372,7 +473,7 @@ fi
 #     targets NOW — they're the most common cause and CFN can't drain them.
 # ────────────────────────────────────────────────────────────────────────────
 if $IS_RETRY_FROM_DELETE_FAILED; then
-    sweep_orphan_efs "DELETE_FAILED recovery"
+    sweep_all_orphans "DELETE_FAILED recovery"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -419,16 +520,18 @@ while true; do
         break
     fi
     if [ "$STATUS" = "DELETE_FAILED" ]; then
-        # Check whether the failure is the known EFS-mount-target → subnet
-        # dependency. If so, sweep + retry ONCE (the auto-retry guard).
-        SUBNET_DEP_FAIL=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
-            --query "StackEvents[?ResourceStatus=='DELETE_FAILED' && contains(ResourceStatusReason, 'subnet') && contains(ResourceStatusReason, 'dependencies')] | length(@)" \
+        # Check whether the failure is the known "has dependencies" pattern
+        # on a subnet (EFS mount target orphan) or VPC (SageMaker SG orphan).
+        # If so, sweep + retry ONCE (the auto-retry guard).
+        DEP_FAIL=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
+            --query "StackEvents[?ResourceStatus=='DELETE_FAILED' && (contains(ResourceStatusReason, 'subnet') || contains(ResourceStatusReason, 'vpc')) && contains(ResourceStatusReason, 'dependencies')] | length(@)" \
             --output text 2>/dev/null || echo "0")
-        if [ "$SUBNET_DEP_FAIL" != "0" ] && ! $AUTO_RETRIED_EFS; then
+        if [ "$DEP_FAIL" != "0" ] && ! $AUTO_RETRIED_EFS; then
             echo ""
-            echo "  ⚠ Subnets failed to delete (dependencies present). Sweeping"
-            echo "    orphan EFS mount targets and retrying stack delete once..."
-            sweep_orphan_efs "auto-retry after subnet-dependency failure"
+            echo "  ⚠ Subnet/VPC failed to delete (dependencies present)."
+            echo "    Sweeping orphan EFS mount targets + SageMaker NFS"
+            echo "    security groups, then retrying stack delete once..."
+            sweep_all_orphans "auto-retry after subnet/VPC-dependency failure"
             AUTO_RETRIED_EFS=true
             echo ""
             echo "  Re-issuing delete-stack..."
@@ -447,9 +550,10 @@ while true; do
         echo "  Common fixes:"
         echo "    - 'Bucket not empty' → re-run this script; Step 1 will re-drain it"
         echo "    - 'Role still has attached policies' → manually detach + retry"
-        echo "    - 'subnet has dependencies' → re-run this script; the EFS-sweep"
-        echo "      retry already ran, so investigate other ENIs in those subnets:"
-        echo "      aws ec2 describe-network-interfaces --filters Name=subnet-id,Values=..."
+        echo "    - 'subnet/vpc has dependencies' → re-run this script; the EFS +"
+        echo "      SG sweep retry already ran, so check what else holds the VPC:"
+        echo "      aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=..."
+        echo "      aws ec2 describe-security-groups   --filters Name=vpc-id,Values=..."
         echo "    - Last resort: aws cloudformation delete-stack --stack-name $STACK_NAME \\"
         echo "          --region $REGION --retain-resources <LogicalResourceId(s)>"
         exit 1
