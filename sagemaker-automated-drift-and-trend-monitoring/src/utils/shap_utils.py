@@ -336,13 +336,28 @@ def compute_shap_values(
     logger.info(f"Background data dtype: {X_background_numeric.dtypes.unique()}")
     logger.info(f"Explain data dtype: {X_explain_numeric.dtypes.unique()}")
 
-    # Create explainer with background data
-    # Note: tree_path_dependent only supports model_output='raw'
-    # We'll get log-odds SHAP values which still explain the prediction correctly
+    # Create explainer WITHOUT background data.
+    #
+    # feature_perturbation='tree_path_dependent' is the XGBoost-recommended
+    # SHAP method: it uses the tree's own training-time leaf weights as the
+    # implicit reference distribution. Passing an explicit background sample
+    # with this method requires the sample to visit every leaf in every tree
+    # \u2014 which almost never happens in practice, and raises:
+    #   "The background dataset you provided does not cover all the leaves ..."
+    # Solution: data=None. Background samples are still useful for
+    # visualizations (dependence plots, summary plots) which consume
+    # X_explain / X_background as feature matrices, not as SHAP inputs.
+    #
+    # If you need SHAP values that account for a specific background
+    # distribution (e.g., counterfactual analysis vs a control cohort),
+    # switch to feature_perturbation='interventional' and pass data=
+    # X_background_numeric \u2014 but note that interventional SHAP assumes
+    # feature independence within each perturbation, which is a semantic
+    # change, not just a config knob.
     explainer = shap.TreeExplainer(
         booster,
-        data=X_background_numeric,
-        feature_perturbation='tree_path_dependent'  # XGBoost-optimized method
+        data=None,
+        feature_perturbation='tree_path_dependent'
     )
 
     logger.info(f"Computing SHAP values for {len(X_explain_numeric)} samples...")

@@ -75,11 +75,36 @@ def run_data_drift_report(
 
         elif "ValueDrift" in name:
             col = config.get("column", "unknown")
-            threshold = config.get("threshold", 0.05)
+            threshold = float(config.get("threshold", 0.05))
+            method = config.get("method", "")
             drift_score = float(value) if value is not None else 1.0
+
+            # Evidently picks the test per-column based on sample size and
+            # column type. The comparison direction depends on which test:
+            #   * p-value tests (KS, Chi-Square)   → drift when score < threshold
+            #   * distance / divergence tests      → drift when score > threshold
+            #     (Wasserstein, PSI, Jensen-Shannon, Hellinger, TVD, ...)
+            # Evidently exposes the chosen test in `config.method` but has no
+            # boolean drift flag in the per-metric dict — we compute it here.
+            is_p_value = "p_value" in method.lower() or "p-value" in method.lower()
+            drifted = drift_score < threshold if is_p_value else drift_score > threshold
+
+            # drift_magnitude is a test-agnostic "how far past the threshold":
+            #   1.0 = at threshold, >1.0 = drifted, higher = more drifted
+            # Callers can sort by this descending to get "top N drifted" without
+            # caring which test was used for which column.
+            if is_p_value:
+                # p-values: smaller = more drifted → invert ratio
+                drift_magnitude = (threshold / drift_score) if drift_score > 0 else float("inf")
+            else:
+                drift_magnitude = (drift_score / threshold) if threshold > 0 else float("inf")
+
             result["per_column"][col] = {
                 "drift_score": drift_score,
-                "drifted": drift_score < threshold,  # p-value below threshold = drifted
+                "drifted": drifted,
+                "method": method,
+                "threshold": threshold,
+                "drift_magnitude": drift_magnitude,
             }
 
     logger.info(

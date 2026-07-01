@@ -968,9 +968,11 @@ Resources:
                   - 'cloudwatch:PutMetricData'
                   - 'cloudwatch:PutMetricAlarm'
                   - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:DeleteAlarms'
                   - 'cloudwatch:PutDashboard'
                   - 'cloudwatch:GetDashboard'
                   - 'cloudwatch:ListDashboards'
+                  - 'cloudwatch:DeleteDashboards'
                 Resource: '*'
         # CloudWatch Logs read: the 2A notebook tails the drift-monitor
         # Lambda logs (describe_log_streams / get_log_events) to surface
@@ -1151,6 +1153,33 @@ Resources:
                   - 'quicksight:QueryDashboard'
                   - 'quicksight:GetDashboardEmbedUrl'
                 Resource: '*'
+        # QuickSight service role permission management. The "Lake Formation
+        # & S3 permissions" cell in 4_governance_dashboard.ipynb attaches
+        # two inline policies (QuickSightS3DataLakeAccess and
+        # QuickSightAthenaResultsAccess) to aws-quicksight-service-role-v0
+        # so QuickSight can read the Athena data-plane S3 bucket and write
+        # Athena query results. Without this grant the notebook cell fails
+        # with AccessDenied on iam:PutRolePolicy.
+        #
+        # Scoped to role names matching aws-quicksight-service-role-* under
+        # BOTH the root path AND /service-role/. AWS provisions the default
+        # QuickSight service role at /service-role/ (created when a user
+        # first opens QuickSight → Manage → Security & permissions), so
+        # the second ARN is what matches in practice; the first is defensive
+        # for accounts that may end up with a root-path variant.
+        - PolicyName: !Sub '${ProjectName}-ManageQuickSightServiceRolePolicies'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:PutRolePolicy'
+                  - 'iam:GetRolePolicy'
+                  - 'iam:DeleteRolePolicy'
+                  - 'iam:ListRolePolicies'
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-quicksight-service-role-*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-*'
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-execution-role'
@@ -1248,6 +1277,20 @@ Resources:
                 || echo "git pull --ff-only failed; keeping current local state."
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
+
+            # Repair Kaggle SDK version mismatch. kagglehub 0.4.x and 1.0.x
+            # import from `kagglesdk`, but the kagglesdk build published on
+            # PyPI is missing `kagglesdk.competitions.legacy` — so importing
+            # kagglehub in notebook 1 fails with:
+            #     ModuleNotFoundError: No module named 'kagglesdk.competitions.legacy'
+            # kagglehub 0.3.x uses its own auth backend and doesn't import
+            # kagglesdk at all — pin below 0.4 until the kagglesdk/kagglehub
+            # pair on PyPI is consistent again. --force-reinstall bypasses the
+            # SageMaker Studio image's pre-installed 1.0.x. Idempotent — no-op
+            # if 0.3.x is already the resolved version.
+            pip install --force-reinstall --no-cache-dir --quiet "kagglehub>=0.3,<0.4" 2>&1 \
+              | tail -20 \
+              || echo "⚠ kagglehub pin failed; run manually in notebook if 1_training_pipeline.ipynb hits ModuleNotFoundError."
 
             cat > .env << 'EOF'
             AWS_DEFAULT_REGION=${AWS::Region}
