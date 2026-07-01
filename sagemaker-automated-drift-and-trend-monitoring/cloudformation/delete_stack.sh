@@ -518,11 +518,22 @@ PYEOF
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4b. If we're recovering from DELETE_FAILED, sweep orphaned EFS mount
-#     targets NOW — they're the most common cause and CFN can't drain them.
+# 4b. Proactively sweep orphaned SageMaker side-effect resources BEFORE
+#     delete-stack. SageMaker Studio silently creates EFS mount targets
+#     and NFS security groups when a JupyterLab space runs; CFN doesn't
+#     track them, so during stack delete CFN's subnet/VPC step later
+#     hits "DependencyViolation" and stalls for the CFN timeout before
+#     failing. Sweeping up-front turns a typical delete from ~40 min
+#     (fail → retry cycle) into ~10 min (straight through).
+#
+#     The retry logic in step 6 stays as a safety net for the rare case
+#     where SageMaker's async domain tear-down recreates orphans after
+#     this sweep ran.
 # ────────────────────────────────────────────────────────────────────────────
 if $IS_RETRY_FROM_DELETE_FAILED; then
     sweep_all_orphans "DELETE_FAILED recovery"
+else
+    sweep_all_orphans "pre-delete cleanup"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
