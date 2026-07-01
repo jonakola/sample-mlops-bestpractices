@@ -35,7 +35,7 @@ See [`cloudformation/README.md`](cloudformation/README.md) for parameter referen
 2. Select the user profile → **Spaces** → click **Run Space** on the JupyterLab space
 3. Once JupyterLab starts, verify the lifecycle script completed:
    - `sample-mlops-bestpractices/` directory is present
-   - `.env` file has region, role, MLflow ARN, and S3 bucket populated
+   - `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/.env` file has region, role, MLflow ARN, and S3 bucket populated
 
 To pick up new commits without redeploying: **Stop Space**, then **Run Space** (the lifecycle script runs `git pull --ff-only` on every start). Uncommitted local edits are preserved.
 

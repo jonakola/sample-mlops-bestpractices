@@ -528,7 +528,7 @@ class AthenaClient:
             """
 
             logger.info(f"Getting version distribution for {endpoint_name} (last {hours} hours)")
-            df = self.run_query(query)
+            df = self.execute_query(query)
 
             if df.empty:
                 logger.warning(f"No inferences found for {endpoint_name} in last {hours} hours")
@@ -634,7 +634,7 @@ class AthenaClient:
             """
 
             logger.info(f"Getting latest inference version for {endpoint_name}")
-            df = self.run_query(query)
+            df = self.execute_query(query)
 
             if df.empty:
                 logger.warning(f"No inferences found for {endpoint_name}")
@@ -706,7 +706,7 @@ class AthenaClient:
             """
 
             logger.info(f"Getting version performance comparison for {endpoint_name} (last {days} days)")
-            df = self.run_query(query)
+            df = self.execute_query(query)
 
             if not df.empty:
                 # Calculate derived metrics

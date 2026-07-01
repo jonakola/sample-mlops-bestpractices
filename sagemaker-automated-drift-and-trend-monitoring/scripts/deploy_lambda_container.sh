@@ -212,6 +212,22 @@ echo "  ✓ Repository: $REPO_NAME (Lambda pull policy attached)"
 # third-party sm-docker package because sm-docker calls v2-only SageMaker
 # SDK APIs (sagemaker.get_execution_role, sagemaker.session) that were
 # removed in v3 — and our project requires v3.
+# Sanity-check the Lambda source before the (slow) container build. If the
+# categorical-encoding fix for customer_gender is missing from the file, the
+# built image will silently ship the pre-fix code and every drift run will
+# fail with "empty column 'customer_gender'". Abort before CodeBuild.
+echo ""
+echo "[3.5/7] Verifying lambda_drift_monitor.py contents..."
+TARGET_FILE="src/drift_monitoring/lambda_drift_monitor.py"
+echo "  File: $TARGET_FILE"
+echo "  Size: $(wc -c < "$TARGET_FILE") bytes, $(wc -l < "$TARGET_FILE") lines"
+if grep -q "categorical_cols" "$TARGET_FILE"; then
+    echo "  ✓ Found 'categorical_cols' — gender encoding fix is in place"
+else
+    echo "  ✗ 'categorical_cols' NOT found — fix was not saved. Aborting."
+    exit 1
+fi
+
 echo ""
 echo "[4/7] Building Docker image..."
 

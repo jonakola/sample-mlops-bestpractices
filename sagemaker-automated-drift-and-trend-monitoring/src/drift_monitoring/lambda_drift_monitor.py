@@ -433,9 +433,23 @@ def check_data_drift():
     print(f"✓ Loaded {len(baseline_data)} baseline samples from {baseline_table} ({snapshot_log})")
 
     baseline_df = pd.DataFrame(baseline_data)
-    # Ensure numeric types
+    # customer_gender is stored as STRING in the Athena training_data table
+    # ('Male'/'Female') because the raw table is pre-preprocessing. Mirror
+    # the label-encoding that preprocessing_pyspark.py:298-318 does at train
+    # time (sorted lowercased categories -> 0..N-1) so the encoded value here
+    # matches what the model was trained on. current_df is already numeric
+    # because inference inputs are post-preprocessing (parsed via
+    # float(features[feat]) above), so no transform on that side.
+    categorical_cols = {'customer_gender'}
     for col in baseline_df.columns:
-        baseline_df[col] = pd.to_numeric(baseline_df[col], errors='coerce')
+        if col in categorical_cols:
+            cats = sorted(baseline_df[col].dropna().astype(str).str.lower().unique())
+            mapping = {c: i for i, c in enumerate(cats)}
+            baseline_df[col] = (
+                baseline_df[col].astype(str).str.lower().map(mapping).fillna(-1)
+            )
+        else:
+            baseline_df[col] = pd.to_numeric(baseline_df[col], errors='coerce')
 
     # Use only columns present in both DataFrames
     common_cols = sorted(set(baseline_df.columns) & set(current_df.columns))
