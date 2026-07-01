@@ -28,7 +28,15 @@ dependencies = [
     "llvmlite>=0.42.0",        # Same — avoid the 0.36 backtrack which has python_requires<3.10
     "ipykernel>=6.29.0",       # Jupyter kernel for notebook execution
     "ipywidgets>=8.1.0",       # Silences tqdm IProgress warning; required by Evidently HTML reports
-    "kagglehub>=0.2.0",        # Download Kaggle datasets for training data
+    "kagglehub>=0.3,<0.4",     # Download Kaggle datasets for training data. Capped
+                               # below 0.4 because 0.4.x/1.0.x depend on `kagglesdk`
+                               # (a separate PyPI package), which as-published on
+                               # PyPI is missing `kagglesdk.competitions.legacy`
+                               # that those kagglehub versions import at load time.
+                               # 0.3.x uses its own auth backend and doesn't touch
+                               # kagglesdk at all. Bump this ceiling once the
+                               # kagglesdk / kagglehub pair on PyPI is consistent
+                               # again.
     # Container image builds in SageMaker Studio JupyterLab (which has no
     # Docker daemon) go through src/setup/codebuild_image.py — a plain
     # boto3 wrapper around AWS CodeBuild. We deliberately do NOT use

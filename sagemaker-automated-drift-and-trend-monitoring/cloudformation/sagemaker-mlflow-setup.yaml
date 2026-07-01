@@ -1278,6 +1278,20 @@ Resources:
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
 
+            # Repair Kaggle SDK version mismatch. kagglehub 0.4.x and 1.0.x
+            # import from `kagglesdk`, but the kagglesdk build published on
+            # PyPI is missing `kagglesdk.competitions.legacy` — so importing
+            # kagglehub in notebook 1 fails with:
+            #     ModuleNotFoundError: No module named 'kagglesdk.competitions.legacy'
+            # kagglehub 0.3.x uses its own auth backend and doesn't import
+            # kagglesdk at all — pin below 0.4 until the kagglesdk/kagglehub
+            # pair on PyPI is consistent again. --force-reinstall bypasses the
+            # SageMaker Studio image's pre-installed 1.0.x. Idempotent — no-op
+            # if 0.3.x is already the resolved version.
+            pip install --force-reinstall --no-cache-dir --quiet "kagglehub>=0.3,<0.4" 2>&1 \
+              | tail -20 \
+              || echo "⚠ kagglehub pin failed; run manually in notebook if 1_training_pipeline.ipynb hits ModuleNotFoundError."
+
             cat > .env << 'EOF'
             AWS_DEFAULT_REGION=${AWS::Region}
             SAGEMAKER_EXEC_ROLE=arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole
