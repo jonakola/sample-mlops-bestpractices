@@ -58,10 +58,14 @@ TEMPLATE_KEY="$(basename "$TEMPLATE").$(date +%s)"
 PROJECT_NAME="$PROJECT_NAME_FROM_CONFIG"
 DATA_BUCKET="${PROJECT_NAME}-data-${ACCOUNT_ID}"
 ATHENA_DATABASE="$(get_config ATHENA_DATABASE)"
-# S3 prefix used by the CFN lifecycle script for Athena table data.
-# Kept as-is here because the prefix is a CFN-template constant (line 1278
-# of sagemaker-mlflow-setup.yaml) — not a config.py knob.
-S3_TABLE_PREFIX="fraud-detection"
+# S3 prefix used by create_athena_tables.py (invoked from the CFN lifecycle
+# script). Single source of truth: config.yaml `s3.prefix` / DATA_S3_PREFIX
+# env var — resolved here via get_config so a BYO deployment that overrides
+# the prefix has --recreate-database wipe the correct S3 paths. Strip
+# trailing slash so the `${TBL}/` join below produces well-formed s3:// URIs
+# regardless of how the config value is written.
+S3_TABLE_PREFIX="$(get_config DATA_S3_PREFIX)"
+S3_TABLE_PREFIX="${S3_TABLE_PREFIX%/}"
 # KEEP IN SYNC: mirrors src/setup/create_athena_tables.py's ALL_TABLE_NAMES
 # list. This script only drops the database and clears these tables' S3
 # data/Glue catalog entries — it never creates any table itself and does
