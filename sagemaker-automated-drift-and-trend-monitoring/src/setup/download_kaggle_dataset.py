@@ -42,6 +42,7 @@ from src.config.config import (  # noqa: E402
     DATA_S3_BUCKET,
     DATA_S3_PREFIX,
 )
+from src.config import schema  # noqa: E402
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -102,29 +103,12 @@ KAGGLE_COLUMN_MAP = {
     "Class": "is_fraud",
 }
 
-FEATURE_COLUMNS = [
-    "transaction_hour", "transaction_day_of_week", "customer_age",
-    "account_age_days", "merchant_category_code", "distance_from_home_km",
-    "distance_from_last_transaction_km", "online_transaction",
-    "chip_transaction", "pin_used", "recurring_transaction",
-    "international_transaction", "high_risk_country", "num_transactions_24h",
-    "num_transactions_7days", "avg_transaction_amount_30days",
-    "max_transaction_amount_30days", "card_present",
-    "address_verification_match", "cvv_match", "velocity_score",
-    "merchant_reputation_score", "time_since_last_transaction_min",
-    "transaction_type_code", "customer_tenure_months", "credit_limit",
-    "available_credit_ratio", "previous_fraud_incidents",
-]
-
-# Order of columns in creditcard_predictions_final.csv after this script
-# writes it. The pipeline seed step uses this exact order to declare its
-# staging table.
-CSV_COLUMN_ORDER = (
-    ["transaction_id", "transaction_timestamp"]
-    + FEATURE_COLUMNS
-    + ["transaction_amount", "fraud_prediction", "fraud_probability",
-       "customer_gender", "is_fraud"]
-)
+# Canonical column order for creditcard_predictions_final.csv, driven by
+# dataset_schema.yaml via src.config.schema. The pipeline seed step
+# (seed_athena_tables.py) uses this exact same order to declare its
+# staging table — both derive it from the same source, so they can never
+# drift apart.
+CSV_COLUMN_ORDER = schema.csv_column_order()
 
 
 # ---------------------------------------------------------------------------

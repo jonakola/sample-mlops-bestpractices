@@ -29,6 +29,7 @@ import pandas as pd
 
 # Evidently-based reporting (used by check_data_drift / check_model_drift)
 from src.drift_monitoring.evidently_reports import run_data_drift_report, run_classification_report
+from src.config import schema
 
 # MLflow
 try:
@@ -64,20 +65,20 @@ MIN_SAMPLES = int(os.getenv('MIN_SAMPLES', '100'))  # Minimum samples for analys
 DATA_DRIFT_LOOKBACK_DAYS = int(os.getenv('DATA_DRIFT_LOOKBACK_DAYS', '7'))  # Days of data for drift comparison
 MODEL_DRIFT_LOOKBACK_DAYS = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '30'))  # Days of data for model performance
 
-# Training features (30 features)
-TRAINING_FEATURES = [
-    'transaction_hour', 'transaction_day_of_week', 'transaction_amount',
-    'transaction_type_code', 'customer_age', 'customer_gender',
-    'customer_tenure_months', 'account_age_days', 'distance_from_home_km',
-    'distance_from_last_transaction_km', 'time_since_last_transaction_min',
-    'online_transaction', 'international_transaction', 'high_risk_country',
-    'merchant_category_code', 'merchant_reputation_score', 'chip_transaction',
-    'pin_used', 'card_present', 'cvv_match', 'address_verification_match',
-    'num_transactions_24h', 'num_transactions_7days',
-    'avg_transaction_amount_30days', 'max_transaction_amount_30days',
-    'velocity_score', 'recurring_transaction', 'previous_fraud_incidents',
-    'credit_limit', 'available_credit_ratio'
-]
+# Training features — sourced from the configured dataset schema
+# (src/config/dataset_schema.yaml) rather than hardcoded here, so drift
+# monitoring stays correct after a customer changes their feature set.
+TRAINING_FEATURES = schema.feature_names()
+
+# Target and prediction-output column names — schema/config-driven so the
+# baseline SELECT and Evidently model-drift comparison work for BYO datasets
+# without needing to grep the module for hardcoded `is_fraud`/`probability_fraud`.
+# Env-var overrides let scripts/deploy_lambda_container.sh set these from
+# config.py at deploy time; hardcoded fallbacks match the fraud-detection
+# reference implementation.
+TARGET_COLUMN = os.getenv('TARGET_COLUMN', schema.target_column())
+PREDICTION_COLUMN = os.getenv('PREDICTION_COLUMN', 'prediction')
+PROBABILITY_COLUMN = os.getenv('PROBABILITY_COLUMN', 'probability_fraud')
 
 
 def execute_athena_query(sql, wait=True):
@@ -421,10 +422,13 @@ def check_data_drift():
     #
     # ORDER BY RANDOM() is fine at this scale; for tables >10M rows
     # consider TABLESAMPLE BERNOULLI to avoid a full-table sort.
+    # Filter for rows with a valid target label. Using the schema-driven
+    # TARGET_COLUMN instead of a hardcoded `is_fraud` so this Lambda works
+    # against any BYO dataset whose target column has a different name.
     baseline_sql = f"""
     SELECT {', '.join(TRAINING_FEATURES)}
     FROM {from_clause}
-    WHERE is_fraud IS NOT NULL
+    WHERE {TARGET_COLUMN} IS NOT NULL
     ORDER BY RANDOM()
     LIMIT 5000
     """
@@ -522,10 +526,14 @@ def check_model_drift():
     lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
     print(f"  Querying predictions with ground truth from last {MODEL_DRIFT_LOOKBACK_DAYS} days (since {lookback_start})")
 
+    # SELECT the config-driven prediction/probability columns and alias them
+    # to stable in-Python names so the rest of this function keeps using
+    # `prediction` and `probability_fraud` regardless of the actual Athena
+    # column names in a BYO deployment.
     performance_sql = f"""
     SELECT
-        prediction,
-        probability_fraud,
+        {PREDICTION_COLUMN} AS prediction,
+        {PROBABILITY_COLUMN} AS probability_fraud,
         ground_truth
     FROM {ATHENA_DATABASE}.inference_responses
     WHERE ground_truth IS NOT NULL
@@ -586,8 +594,13 @@ def check_model_drift():
     # Build a synthetic baseline DataFrame with the same schema so Evidently
     # can compare reference vs current classification performance.
     # In production you'd load actual baseline predictions from S3/Athena.
+    # Alias config-driven column names to stable in-Python identifiers
+    # (same aliasing pattern as the current-window SELECT above).
     baseline_sql = f"""
-    SELECT prediction, probability_fraud, ground_truth
+    SELECT
+        {PREDICTION_COLUMN} AS prediction,
+        {PROBABILITY_COLUMN} AS probability_fraud,
+        ground_truth
     FROM {ATHENA_DATABASE}.inference_responses
     WHERE ground_truth IS NOT NULL
       AND request_timestamp < TIMESTAMP '{lookback_start}'
@@ -1041,6 +1054,12 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     baseline = load_baseline_from_registry()
     model_package_arn = (baseline or {}).get('model_package_arn')
     evaluation_snapshot_id = (baseline or {}).get('evaluation_snapshot_id')
+    # training_snapshot_id was previously used internally for the FOR VERSION
+    # AS OF baseline pull but NOT persisted per-run. Persisting it makes the
+    # Model Lineage dashboard sheet able to answer "which training-data
+    # snapshot underlay every drift verdict" without joining back to
+    # baseline.json in the model registry.
+    training_snapshot_id = (baseline or {}).get('training_snapshot_id')
 
     record = {
         'monitoring_run_id': run_id,
@@ -1049,6 +1068,7 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
         'model_version': os.getenv('MODEL_VERSION', 'latest'),
         'model_package_arn': model_package_arn,
         'evaluation_snapshot_id': evaluation_snapshot_id,
+        'training_snapshot_id': training_snapshot_id,
         'data_drift_detected': data_detected,
         'drifted_columns_count': data_drift_result.get('drifted_features_count', 0) if data_drift_result else None,
         'drifted_columns_share': data_drift_result.get('drifted_columns_share', 0) if data_drift_result else None,

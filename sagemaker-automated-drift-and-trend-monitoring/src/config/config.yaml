@@ -128,6 +128,24 @@ inference:
   low_confidence_lower: 0.4
   low_confidence_upper: 0.6
 
+  # ------------------------------------------------------------------
+  # Prediction-output column names (BYO-dataset knobs)
+  # ------------------------------------------------------------------
+  # The endpoint's custom inference handler writes each prediction to the
+  # inference_responses Athena table with these column names. Defaults match
+  # the fraud-detection reference implementation. Change these ONLY if you
+  # deploy a custom inference handler that emits differently-named columns.
+  #
+  # `prediction_column` is the discrete output (0/1, class label, or bucket).
+  # `probability_column` is the continuous score/probability the drift monitor
+  # uses for ROC-AUC and Evidently classification drift.
+  # `probability_alt_column` is the "other class" probability in binary
+  # classification (probability_non_fraud in the default). Leave empty for
+  # non-binary targets — nothing downstream requires it.
+  prediction_column: "prediction"
+  probability_column: "probability_fraud"
+  probability_alt_column: "probability_non_fraud"
+
 # ---------------------------------------------------------------------------
 # Lambda configuration
 # ---------------------------------------------------------------------------
@@ -186,9 +204,10 @@ data:
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-# Target column, feature list, and column-rename map live in code, not YAML —
+# Target column, feature list, and column-rename map live in code, not here —
 # changing them requires updating preprocessing + the training pipeline:
-#   - TARGET_COLUMN / TRAINING_FEATURES → src/config/config.py
+#   - target_column / features → src/config/dataset_schema.yaml (read via
+#     src.config.schema.target_column() / schema.feature_names())
 #   - Kaggle-column → project-column rename map → src/setup/download_kaggle_dataset.py
 # Only XGBoost hyperparameters live in this section because they're tunable
 # without re-deriving the dataset.
@@ -210,6 +229,22 @@ training:
     reg_alpha: 0.1
     reg_lambda: 1.0
     eval_metric: "auc"
+
+  # ------------------------------------------------------------------
+  # XGBoost objective override (BYO-dataset knob)
+  # ------------------------------------------------------------------
+  # Leave `objective` empty to auto-derive from schema.target_type():
+  #   boolean → 'binary:logistic' with scale_pos_weight class-imbalance handling
+  #   integer → 'multi:softprob' (also set num_class below)
+  #   double  → 'reg:squarederror' (regression; disables scale_pos_weight)
+  # Explicit override wins — set this if your target's XGBoost objective isn't
+  # covered by the auto-map (e.g. 'reg:logistic', 'multi:softmax',
+  # 'binary:hinge', 'rank:pairwise').
+  objective: ""
+  # Only used when objective is 'multi:softprob' or 'multi:softmax'. Number of
+  # distinct classes in your target column. Required for multi-class; unused
+  # otherwise.
+  num_class: 0
 
 # ---------------------------------------------------------------------------
 # Drift detection thresholds

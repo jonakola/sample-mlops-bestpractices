@@ -28,6 +28,12 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
+# Bundled sibling — pipeline.py's source_dir bundling stages schema.py +
+# dataset_schema.yaml alongside this script (see pipeline.py's
+# _stage_schema_sibling() helper).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import schema
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -586,7 +592,7 @@ def main():
                        help='Row limit for testing (applied to BOTH tables)')
 
     # Target column
-    parser.add_argument('--target-column', type=str, default='is_fraud',
+    parser.add_argument('--target-column', type=str, default=schema.target_column(),
                        help='Target column name')
 
     # Output paths (SageMaker ProcessingStep provides these)

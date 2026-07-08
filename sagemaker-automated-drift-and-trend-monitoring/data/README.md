@@ -30,7 +30,7 @@ The primary training and inference dataset, sourced from the Kaggle credit card 
 
 When to use:
 - Training the XGBoost model via SageMaker Pipelines (`notebooks/1_training_pipeline.ipynb`)
-- Uploading to S3 and migrating into Athena Iceberg tables (`main.py setup --migrate-data`)
+- Uploading to S3 and creating Athena Iceberg tables (`main.py setup`)
 - Baseline data for drift detection comparisons
 - Testing inference endpoints with representative data
 

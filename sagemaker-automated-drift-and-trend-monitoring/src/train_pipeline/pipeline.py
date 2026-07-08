@@ -124,8 +124,9 @@ from src.config.config import (
     ATHENA_EVALUATION_TABLE, ATHENA_DATABASE, ATHENA_OUTPUT_S3,
     SERVERLESS_MEMORY_SIZE, SERVERLESS_MAX_CONCURRENCY, HIGH_CONFIDENCE_THRESHOLD,
     LOW_CONFIDENCE_LOWER, LOW_CONFIDENCE_UPPER, AWS_DEFAULT_REGION, SQS_QUEUE_URL,
-    XGBOOST_PARAMS,
+    XGBOOST_PARAMS, XGBOOST_OBJECTIVE, XGBOOST_NUM_CLASS,
 )
+from src.config import schema
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -243,7 +244,7 @@ class FraudDetectionPipeline:
             ),
             'target_column': ParameterString(
                 name="TargetColumn",
-                default_value="is_fraud"
+                default_value=schema.target_column()
             ),
 
             # Training parameters
@@ -348,6 +349,12 @@ class FraudDetectionPipeline:
         can depend on the table being populated. Idempotent — if the
         integrity check already passes, the script is a few-second no-op.
 
+        seed_athena_tables.py imports ``schema`` (i.e. src/config/schema.py)
+        for the feature list, so its source_dir bundles that file AND its
+        sibling dataset_schema.yaml alongside the entry script. This is the
+        ONE place the dataset schema is packaged into a container — see
+        schema.py's module docstring for why it can't just `import src...`.
+
         Returns:
             ProcessingStep
         """
@@ -361,7 +368,17 @@ class FraudDetectionPipeline:
             version="1.2-1",
         )
 
-        processor = ScriptProcessor(
+        # Bundle seed_athena_tables.py together with schema.py + its YAML
+        # sidecar in a source_dir so the container-side `import schema`
+        # resolves without needing the rest of the `src` package.
+        # FrameworkProcessor (not plain ScriptProcessor) is required here —
+        # ScriptProcessor.run(code=...) only ever uploads a single file;
+        # FrameworkProcessor.run(code=..., source_dir=...) uploads the
+        # whole source_dir as a tarball and unpacks it alongside the entry
+        # script in the container.
+        seed_source_dir = self._build_seed_source_dir()
+
+        processor = FrameworkProcessor(
             image_uri=sklearn_image,
             role=self.role,
             instance_type=self.config['processing_instance_type'],
@@ -371,7 +388,8 @@ class FraudDetectionPipeline:
             command=["python3"],
             env={
                 # seed_athena_tables.py reads all config from env vars so it
-                # has no dependency on src.config inside the container.
+                # has no dependency on src.config.config inside the
+                # container (it DOES import the bundled schema.py sibling).
                 'AWS_DEFAULT_REGION': AWS_DEFAULT_REGION,
                 'ATHENA_DATABASE': ATHENA_DATABASE,
                 'ATHENA_OUTPUT_S3': ATHENA_OUTPUT_S3,
@@ -385,13 +403,55 @@ class FraudDetectionPipeline:
         step = ProcessingStep(
             name="SeedAthenaTrainingData",
             step_args=processor.run(
-                code=str(Path(__file__).parent / "pipeline_steps" / "seed_athena_tables.py"),
+                code="seed_athena_tables.py",
+                source_dir=str(seed_source_dir),
                 wait=False,
             ),
         )
 
         logger.info("✓ Athena seed step created")
         return step
+
+    def _stage_schema_sibling(self, target_dir: Path) -> None:
+        """Copy schema.py + dataset_schema.yaml into ``target_dir`` as
+        sibling files.
+
+        Shared by every bundling call site that needs the dataset schema
+        available as a same-directory import inside a SageMaker container
+        (the seed step today; the training and preprocessing steps use
+        this same helper once their bundling is wired up) — one
+        implementation instead of three divergent copies.
+        """
+        import shutil
+
+        config_dir = Path(__file__).parent.parent / "config"
+
+        shutil.copy(config_dir / "schema.py", target_dir)
+        shutil.copy(config_dir / "dataset_schema.yaml", target_dir)
+
+    def _build_seed_source_dir(self) -> Path:
+        """Stage a temp directory containing seed_athena_tables.py plus its
+        schema.py + dataset_schema.yaml dependencies, so
+        FrameworkProcessor's source_dir packaging uploads all three files
+        together as one tarball.
+
+        Copying into a fresh temp dir (rather than symlinking into
+        pipeline_steps/) keeps the repo's own pipeline_steps/ directory
+        free of duplicated schema files — the copy is a build artifact,
+        not a checked-in one.
+        """
+        import shutil
+        import tempfile
+
+        staging_dir = Path(tempfile.mkdtemp(prefix="seed-athena-source-"))
+        pipeline_steps_dir = Path(__file__).parent / "pipeline_steps"
+
+        shutil.copy(pipeline_steps_dir / "seed_athena_tables.py", staging_dir)
+        self._stage_schema_sibling(staging_dir)
+
+        logger.info("Staged seed-step source dir: %s (seed_athena_tables.py + schema.py + dataset_schema.yaml)",
+                   staging_dir)
+        return staging_dir
 
     def _create_preprocessing_step(
         self,
@@ -555,7 +615,15 @@ class FraudDetectionPipeline:
                 'num-boost-round': Join(on="", values=[params['num_boost_round']]),
                 'min-child-weight': Join(on="", values=[params['min_child_weight']]),
                 'early-stopping-rounds': Join(on="", values=[params['early_stopping_rounds']]),
-                'target-column': 'is_fraud',
+                'target-column': Join(on="", values=[params['target_column']]),
+                # Target type + XGBoost objective override — resolved at pipeline
+                # definition time from schema.target_type() and config constants.
+                # These let the container-side train.py pick the right objective
+                # (binary:logistic / reg:squarederror / multi:softprob) without
+                # hardcoded assumptions about the target being 0/1.
+                'target-type': schema.target_type(),
+                'xgboost-objective': XGBOOST_OBJECTIVE,
+                'xgboost-num-class': str(XGBOOST_NUM_CLASS),
             },
             environment={
                 # MLflow configuration

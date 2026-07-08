@@ -25,6 +25,12 @@ from sklearn.metrics import (
     recall_score, f1_score, confusion_matrix, roc_curve, precision_recall_curve
 )
 
+# Bundled sibling — pipeline.py's source_dir bundling stages schema.py +
+# dataset_schema.yaml alongside this script (see pipeline.py's
+# _stage_schema_sibling() helper).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import schema
+
 # Visualization libraries - try to install if not available
 VISUALIZATION_AVAILABLE = False
 try:
@@ -183,6 +189,106 @@ def calculate_scale_pos_weight(y_train: pd.Series) -> float:
     logger.info(f"  Class ratio: {scale_pos_weight:.1f}:1")
 
     return float(scale_pos_weight)
+
+
+def resolve_xgboost_objective(
+    target_type: str,
+    y_train: pd.Series,
+    objective_override: str = "",
+    num_class_override: int = 0,
+) -> Dict[str, Any]:
+    """Derive XGBoost objective + eval_metric + related params from the
+    dataset's target type. Explicit `objective_override` wins.
+
+    Returns a dict ready to splice into the training params:
+        - objective            (e.g. 'binary:logistic', 'reg:squarederror')
+        - eval_metric          (e.g. 'auc', 'rmse')
+        - num_class            (only for multi:softprob / multi:softmax)
+        - use_scale_pos_weight (bool — True only for binary classification)
+
+    Auto-derivation from schema.target_type():
+        boolean → binary:logistic + auc + scale_pos_weight
+        integer → multi:softprob + mlogloss (needs num_class_override)
+        double  → reg:squarederror + rmse   (no scale_pos_weight)
+        string  → unsupported — raise loudly
+
+    Any explicit `objective_override` bypasses auto-derivation and sets a
+    sensible eval_metric for common cases (unknown objectives keep AUC as a
+    fallback — user can further override via config.yaml training.eval_metric).
+    """
+    # Common defaults used when we can't infer a better eval metric
+    result: Dict[str, Any] = {
+        "objective": "",
+        "eval_metric": "auc",
+        "use_scale_pos_weight": False,
+    }
+
+    if objective_override:
+        result["objective"] = objective_override
+        # Map common overrides to sensible eval metrics
+        if objective_override.startswith("binary:"):
+            result["eval_metric"] = "auc"
+            result["use_scale_pos_weight"] = True
+        elif objective_override.startswith("multi:"):
+            result["eval_metric"] = "mlogloss"
+            if num_class_override <= 1:
+                raise ValueError(
+                    f"objective={objective_override!r} requires num_class > 1 "
+                    f"(set training.num_class in config.yaml or XGBOOST_NUM_CLASS env var)"
+                )
+            result["num_class"] = num_class_override
+        elif objective_override.startswith("reg:"):
+            result["eval_metric"] = "rmse"
+        elif objective_override.startswith("rank:"):
+            result["eval_metric"] = "ndcg"
+        logger.info(f"XGBoost objective (explicit override): {result['objective']}")
+        logger.info(f"XGBoost eval_metric: {result['eval_metric']}")
+        return result
+
+    # Auto-derive from schema
+    tt = (target_type or "boolean").lower()
+    if tt == "boolean":
+        result["objective"] = "binary:logistic"
+        result["eval_metric"] = "auc"
+        result["use_scale_pos_weight"] = True
+    elif tt in ("integer", "int", "bigint"):
+        n = num_class_override if num_class_override > 1 else int(y_train.nunique())
+        if n <= 1:
+            raise ValueError(
+                f"Target column with target_type={tt!r} needs at least 2 distinct "
+                f"classes (found {n}). Set training.num_class in config.yaml."
+            )
+        if n == 2:
+            # Two-class integer target — treat as binary. (E.g. 0/1 stored as int.)
+            result["objective"] = "binary:logistic"
+            result["eval_metric"] = "auc"
+            result["use_scale_pos_weight"] = True
+        else:
+            result["objective"] = "multi:softprob"
+            result["eval_metric"] = "mlogloss"
+            result["num_class"] = n
+    elif tt in ("double", "float", "decimal"):
+        result["objective"] = "reg:squarederror"
+        result["eval_metric"] = "rmse"
+    elif tt == "string":
+        raise ValueError(
+            f"target_type='string' is not supported by the reference training "
+            f"code (XGBoost can't natively fit a string label). Encode the "
+            f"target as integer/boolean in preprocessing, or set training.objective "
+            f"explicitly in config.yaml."
+        )
+    else:
+        raise ValueError(
+            f"Unrecognized target_type={tt!r}. Supported: boolean, integer, "
+            f"double, string (encoded upstream). Or set training.objective "
+            f"in config.yaml to override."
+        )
+
+    logger.info(f"XGBoost objective (derived from target_type={tt!r}): {result['objective']}")
+    logger.info(f"XGBoost eval_metric: {result['eval_metric']}")
+    if result.get("num_class"):
+        logger.info(f"XGBoost num_class: {result['num_class']}")
+    return result
 
 
 def train_model(
@@ -778,8 +884,18 @@ def main():
                        help='Directory containing training data')
     parser.add_argument('--validation-data-dir', type=str, default='/opt/ml/input/data/validation',
                        help='Directory containing validation data')
-    parser.add_argument('--target-column', type=str, default='is_fraud',
+    parser.add_argument('--target-column', type=str, default=schema.target_column(),
                        help='Target column name')
+    parser.add_argument('--target-type', type=str, default=schema.target_type(),
+                       help='Target column type (boolean/integer/double/string) used to '
+                            'auto-derive XGBoost objective; passed by pipeline.py from '
+                            'schema.target_type()')
+    parser.add_argument('--xgboost-objective', type=str, default='',
+                       help='Explicit XGBoost objective override (e.g. reg:squarederror, '
+                            'multi:softprob). Empty string → auto-derive from --target-type.')
+    parser.add_argument('--xgboost-num-class', type=int, default=0,
+                       help='num_class for multi:softprob / multi:softmax objectives. '
+                            'Ignored for other objectives.')
 
     # Model hyperparameters — tuned for severe class imbalance (~580:1).
     # Shallower trees + larger min_child_weight prevent the small positive
@@ -821,22 +937,34 @@ def main():
             args.target_column
         )
 
-        # Step 2: Calculate scale_pos_weight
-        scale_pos_weight = calculate_scale_pos_weight(y_train)
+        # Step 2: Resolve XGBoost objective from target_type (or explicit override)
+        objective_config = resolve_xgboost_objective(
+            target_type=args.target_type,
+            y_train=y_train,
+            objective_override=args.xgboost_objective,
+            num_class_override=args.xgboost_num_class,
+        )
 
         # Step 3: Prepare training parameters
-        params = {
-            'objective': 'binary:logistic',
-            'eval_metric': 'auc',
+        params: Dict[str, Any] = {
+            'objective': objective_config['objective'],
+            'eval_metric': objective_config['eval_metric'],
             'max_depth': args.max_depth,
             'learning_rate': args.learning_rate,
             'min_child_weight': args.min_child_weight,
             'subsample': args.subsample,
             'colsample_bytree': args.colsample_bytree,
-            'scale_pos_weight': scale_pos_weight,
             'num_boost_round': args.num_boost_round,
             'early_stopping_rounds': args.early_stopping_rounds,
         }
+        if objective_config.get('num_class'):
+            params['num_class'] = objective_config['num_class']
+        # scale_pos_weight only applies to binary classification (the model
+        # weights the positive class to counter severe class imbalance —
+        # meaningless for regression / multi-class).
+        if objective_config['use_scale_pos_weight']:
+            scale_pos_weight = calculate_scale_pos_weight(y_train)
+            params['scale_pos_weight'] = scale_pos_weight
 
         # Step 4: Train model
         model = train_model(X_train, y_train, X_test, y_test, params)

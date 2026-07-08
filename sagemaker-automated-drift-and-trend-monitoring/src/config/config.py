@@ -143,6 +143,39 @@ MLFLOW_MODEL_NAME: str = _get(
 )
 
 # ===================================================================
+# Prediction / probability column names (BYO-dataset knobs)
+# ===================================================================
+# The endpoint's custom inference handler writes each prediction to the
+# inference_responses Athena table using these column names. Defaults match
+# the fraud-detection reference implementation. Downstream code
+# (drift Lambda, dashboards, batch transform) reads columns via these
+# constants so BYO users can point them at a differently-named handler
+# output without editing every SQL query.
+PREDICTION_COLUMN: str = _get(
+    "inference", "prediction_column", "PREDICTION_COLUMN", "prediction"
+)
+PROBABILITY_COLUMN: str = _get(
+    "inference", "probability_column", "PROBABILITY_COLUMN", "probability_fraud"
+)
+PROBABILITY_ALT_COLUMN: str = _get(
+    "inference", "probability_alt_column", "PROBABILITY_ALT_COLUMN",
+    "probability_non_fraud",
+)
+
+# ===================================================================
+# Training objective override (BYO-dataset knob)
+# ===================================================================
+# XGBoost objective + num_class overrides. Empty string means "auto-derive
+# from schema.target_type()" (see train.py's resolve_xgboost_objective()).
+# Explicit override wins over auto-derivation.
+XGBOOST_OBJECTIVE: str = _get(
+    "training", "objective", "XGBOOST_OBJECTIVE", ""
+)
+XGBOOST_NUM_CLASS: int = int(
+    _get("training", "num_class", "XGBOOST_NUM_CLASS", "0")
+)
+
+# ===================================================================
 # Athena
 # ===================================================================
 # 🔁 SYNC: lambda_drift_monitor.py:49 — Lambda fallback: 'fraud_detection'.
@@ -355,29 +388,11 @@ S3_CSV_DRIFTED_DATA: str = _get(
 # ===================================================================
 RANDOM_STATE: int = int(_get("training", "random_state", "RANDOM_STATE", "42"))
 
-# Target column name in the Kaggle dataset post-rename. Not in config.yaml
-# because it's a fixed property of data/download_kaggle_dataset.py — exposed
-# here so notebooks/3_inference_monitoring.ipynb can reference it.
-TARGET_COLUMN: str = os.environ.get("TARGET_COLUMN", "is_fraud")
-
-# The 30 feature columns (PCA components V1-V28 + transaction_amount-style
-# names from data/download_kaggle_dataset.py KAGGLE_COLUMN_MAP). Listed here
-# so monitoring code can parse the inference_responses.input_features JSON
-# without rediscovering the schema on every call. Order matches the staging
-# table created during the Athena seed.
-TRAINING_FEATURES: list[str] = [
-    "transaction_hour", "transaction_day_of_week", "transaction_amount",
-    "transaction_type_code", "customer_age", "customer_gender",
-    "customer_tenure_months", "account_age_days", "distance_from_home_km",
-    "distance_from_last_transaction_km", "time_since_last_transaction_min",
-    "online_transaction", "international_transaction", "high_risk_country",
-    "merchant_category_code", "merchant_reputation_score", "chip_transaction",
-    "pin_used", "card_present", "cvv_match", "address_verification_match",
-    "num_transactions_24h", "num_transactions_7days",
-    "avg_transaction_amount_30days", "max_transaction_amount_30days",
-    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
-    "credit_limit", "available_credit_ratio",
-]
+# Target column name and feature list are dataset-shape concerns, not
+# infrastructure config — they live in src/config/dataset_schema.yaml and
+# are read via src.config.schema.target_column() / schema.feature_names().
+# config.py deliberately does not re-export them, to keep exactly one
+# source of truth per concept.
 
 _training_cfg = _yaml_cfg.get("training", {}) if isinstance(
     _yaml_cfg.get("training"), dict
@@ -556,6 +571,15 @@ QUICKSIGHT_DRIFT_DATASET_ID: str = "fraud-governance-drift-dataset"
 QUICKSIGHT_DRIFT_DATASET_NAME: str = "Fraud Governance - Drift Monitoring"
 QUICKSIGHT_FEATURE_DRIFT_DATASET_ID: str = "fraud-governance-feature-drift-dataset"
 QUICKSIGHT_FEATURE_DRIFT_DATASET_NAME: str = "Fraud Governance - Feature Drift Analysis"
+# Feature-level (per-feature) drift dataset, backed by the Athena view
+# `feature_drift_detail` (created at dashboard-build time — see
+# create_governance_dashboard.create_feature_drift_detail_view()).
+QUICKSIGHT_FEATURE_LEVEL_DATASET_ID: str = "fraud-governance-feature-level-dataset"
+QUICKSIGHT_FEATURE_LEVEL_DATASET_NAME: str = "Fraud Governance - Feature Level Drift"
+# Prediction-accuracy timeline dataset (CustomSql join of inference_responses
+# + ground_truth_updates).
+QUICKSIGHT_ACCURACY_DATASET_ID: str = "fraud-governance-inference-dataset-accuracy"
+QUICKSIGHT_ACCURACY_DATASET_NAME: str = "Prediction Accuracy Timeline"
 QUICKSIGHT_ANALYSIS_ID: str = "fraud-governance-analysis"
 QUICKSIGHT_ANALYSIS_NAME: str = "Fraud Detection Governance Analysis"
 QUICKSIGHT_DASHBOARD_ID: str = "fraud-governance-dashboard"
