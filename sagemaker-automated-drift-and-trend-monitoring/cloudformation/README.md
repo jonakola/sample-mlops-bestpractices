@@ -21,7 +21,7 @@ Single-stack deployment of a ready-to-use SageMaker Studio environment. Provisio
 - **SageMaker Domain** (`PublicInternetOnly` mode) with an IAM execution role
 - **User Profile** and a **JupyterLab Space** wired to the lifecycle script
 - **Lifecycle configuration** — clones the GitHub repo, writes a populated `.env` on first launch
-- **SageMaker MLflow App** (serverless) for experiment tracking. Provisioned via a Lambda-backed custom resource because AWS doesn't publish `AWS::SageMaker::MlflowApp` as a native CFN type yet. The template invokes `sagemaker:CreateMlflowApp` under the hood; the output `MLflowAppArn` is written to `.env` as `MLFLOW_TRACKING_URI`.
+- **SageMaker MLflow App** (serverless) for experiment tracking. Provisioned via the native `AWS::SageMaker::MlflowApp` CloudFormation resource type; the output `MLflowAppArn` is written to `.env` as `MLFLOW_TRACKING_URI`.
 - **S3 data bucket** with versioning, encryption, and lifecycle rules
 - **Athena tables** created by the lifecycle script from `dataset_schema.yaml`
 - **SQS queue** + **inference-logger Lambda** — endpoint predictions are batched (10 msgs or 30 s) and INSERTed into `inference_responses`

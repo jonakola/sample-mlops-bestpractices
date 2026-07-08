@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Simplified SageMaker Domain setup for Automated Drift and Trend Monitoring.
-  Creates: SageMaker Domain (PublicInternetOnly), MLflow Tracking Server,
+  Creates: SageMaker Domain (PublicInternetOnly), MLflow App (serverless),
   JupyterLab Space with repo clone, S3 bucket, and IAM execution role.
 
 Parameters:
@@ -1319,7 +1319,7 @@ Resources:
             AWS_DEFAULT_REGION=${AWS::Region}
             SAGEMAKER_EXEC_ROLE=arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole
             SAGEMAKER_DOMAIN_ID=${SageMakerDomain}
-            MLFLOW_TRACKING_URI=${MLflowAppResource.MLflowAppArn}
+            MLFLOW_TRACKING_URI=${MLflowApp.Arn}
             DATA_S3_BUCKET=${ProjectName}-data-${AWS::AccountId}
             PROJECT_NAME=${ProjectName}
             # 🚨 IMPORTANT: replace nobody@example.com with a real email to receive
@@ -1358,7 +1358,7 @@ Resources:
     UpdateReplacePolicy: Delete
     DependsOn:
       - UserProfile
-      - MLflowAppResource
+      - MLflowApp
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
@@ -1382,161 +1382,27 @@ Resources:
   # ====================================================================
   # MLflow App (Serverless) — replaces MLflow Tracking Server
   # ====================================================================
-  # There is no native CloudFormation resource type for MLflow Apps yet
-  # (AWS::SageMaker::MlflowApp does not exist). We provision it with a
-  # Lambda-backed custom resource that calls the sagemaker:CreateMlflowApp /
-  # DeleteMlflowApp control-plane APIs directly via boto3, following the
-  # pattern published in:
-  # https://github.com/aws-samples/genai-ml-platform-examples/blob/main/platform/genai-ml-stdzn-on-smai/sagemaker-domain-with-vpc.yaml
-  #
-  # NOTE: the MLflow Apps API is newer than the boto3 bundled with the
-  # Lambda Python 3.12 runtime, so the function pip-installs a pinned
-  # boto3 version into /tmp at invoke time before importing it. This is
-  # a known fragility point (adds cold-start latency, depends on PyPI
-  # reachability) — revisit once boto3-in-Lambda-runtime catches up.
+  # Provisioned via the native AWS::SageMaker::MlflowApp resource type.
+  # The SDK uses this App's ARN as MLFLOW_TRACKING_URI (written to .env by
+  # the lifecycle script); open the UI from SageMaker Studio ->
+  # Partner AI Apps -> MLflow.
   # ====================================================================
-  MLflowAppLambdaRole:
-    Type: AWS::IAM::Role
+  MLflowApp:
+    Type: AWS::SageMaker::MlflowApp
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      RoleName: !Sub '${ProjectName}-mlflow-app-lambda-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: MLflowAppManagement
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'sagemaker:CreateMlflowApp'
-                  - 'sagemaker:DeleteMlflowApp'
-                  - 'sagemaker:DescribeMlflowApp'
-                  - 'sagemaker:ListMlflowApps'
-                  - 'iam:PassRole'
-                Resource: '*'
-
-  CreateMLflowAppLambda:
-    Type: AWS::Lambda::Function
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
-    DependsOn:
-      - MLflowAppLambdaRole
-    Properties:
-      FunctionName: !Sub '${ProjectName}-create-mlflow-app'
-      Description: Create/delete the serverless MLflow App for experiment tracking
-      Handler: index.lambda_handler
-      Role: !GetAtt MLflowAppLambdaRole.Arn
-      Runtime: python3.12
-      Timeout: 600
-      Code:
-        ZipFile: |
-          import subprocess
-          import sys
-
-          # Install a boto3 version with MLflow Apps API support — the
-          # Lambda Python 3.12 runtime's bundled boto3 predates this API.
-          subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                 "--target", "/tmp", "boto3==1.42.54"])
-          sys.path.insert(0, '/tmp')
-
-          import boto3
-          import cfnresponse
-
-          client = boto3.client('sagemaker')
-
-          def lambda_handler(event, context):
-              print(f"Event: {event}")
-              try:
-                  request_type = event.get('RequestType', 'Create')
-                  mlflow_app_name = event['ResourceProperties']['MLflowAppName']
-                  artifact_store_uri = event['ResourceProperties']['ArtifactStoreUri']
-                  role_arn = event['ResourceProperties']['RoleArn']
-
-                  if request_type == 'Create':
-                      # Idempotency: reuse if an app with this name already exists
-                      try:
-                          resp = client.list_mlflow_apps(MaxResults=100)
-                          for app in resp.get('Summaries', []):
-                              if app['Name'] == mlflow_app_name:
-                                  print(f"MLflow App {mlflow_app_name} already exists")
-                                  response_data = {
-                                      'MLflowAppArn': app['Arn'],
-                                      'MLflowAppName': app['Name'],
-                                  }
-                                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                                    response_data, app['Arn'])
-                                  return
-                      except Exception as e:
-                          print(f"Error checking existing apps: {e}")
-
-                      print(f"Creating MLflow App: {mlflow_app_name}")
-                      response = client.create_mlflow_app(
-                          Name=mlflow_app_name,
-                          ArtifactStoreUri=artifact_store_uri,
-                          RoleArn=role_arn,
-                      )
-                      mlflow_app_arn = response['Arn']
-                      print(f"Created MLflow App: {mlflow_app_arn}")
-
-                      response_data = {
-                          'MLflowAppArn': mlflow_app_arn,
-                          'MLflowAppName': mlflow_app_name,
-                      }
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                        response_data, mlflow_app_arn)
-                      return
-
-                  elif request_type == 'Delete':
-                      try:
-                          print(f"Deleting MLflow App: {mlflow_app_name}")
-                          client.delete_mlflow_app(Arn=event['PhysicalResourceId'])
-                          print(f"Deleted MLflow App: {mlflow_app_name}")
-                      except client.exceptions.ResourceNotFound:
-                          print(f"MLflow App {mlflow_app_name} not found, skipping deletion")
-                      except Exception as e:
-                          print(f"Error deleting MLflow App (continuing): {e}")
-
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                      return
-
-                  else:  # Update — MLflow Apps don't support in-place update
-                      response_data = {
-                          'MLflowAppArn': event['PhysicalResourceId'],
-                          'MLflowAppName': mlflow_app_name,
-                      }
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
-                                        response_data, event['PhysicalResourceId'])
-                      return
-
-              except Exception as e:
-                  print(f"Error: {e}")
-                  import traceback
-                  traceback.print_exc()
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
-
-  MLflowAppResource:
-    Type: Custom::MLflowApp
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
-    DependsOn:
-      - CreateMLflowAppLambda
-    Properties:
-      ServiceToken: !GetAtt CreateMLflowAppLambda.Arn
-      MLflowAppName: !Sub '${ProjectName}-mlflow-app'
+      Name: !Sub '${ProjectName}-mlflow-app'
       ArtifactStoreUri: !Sub 's3://${ProjectName}-data-${AWS::AccountId}/mlflow-artifacts'
       RoleArn: !If
         - CreateNewRole
         - !GetAtt SageMakerExecutionRole.Arn
         - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole'
+      ModelRegistrationMode: AutoModelRegistrationEnabled
+      WeeklyMaintenanceWindowStart: 'Sun:03:00'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mlflow-app'
 
   # ====================================================================
   # SQS Queue + Lambda for Inference Logging
@@ -1702,7 +1568,7 @@ Outputs:
 
   MLflowAppArn:
     Description: MLflow App ARN (serverless)
-    Value: !GetAtt MLflowAppResource.MLflowAppArn
+    Value: !GetAtt MLflowApp.Arn
     Export:
       Name: !Sub '${AWS::StackName}-MLflowArn'
 
@@ -1712,9 +1578,15 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-MLflowName'
 
+  MLflowAppId:
+    Description: MLflow App ID (server-generated identifier)
+    Value: !GetAtt MLflowApp.MlflowAppId
+    Export:
+      Name: !Sub '${AWS::StackName}-MLflowAppId'
+
   GetMLflowUrlCommand:
     Description: Command to get MLflow App details (URL is opened via the SageMaker Studio/Unified Studio UI — no direct-URL API for MLflow Apps)
-    Value: !Sub 'aws sagemaker describe-mlflow-app --arn ${MLflowAppResource.MLflowAppArn} --region ${AWS::Region}'
+    Value: !Sub 'aws sagemaker describe-mlflow-app --arn ${MLflowApp.Arn} --region ${AWS::Region}'
 
   InferenceLoggingQueueUrl:
     Description: SQS Queue URL for inference logging

@@ -776,7 +776,7 @@ This solution uses the **serverless SageMaker MLflow App** (not the older MLflow
 MLFLOW_TRACKING_URI=arn:aws:sagemaker:<region>:<account>:mlflow-app/<app-name>
 ```
 
-To open the MLflow UI: SageMaker Studio → Partner AI Apps → MLflow. The App is provisioned by the base stack via a Lambda-backed custom resource (there's no native `AWS::SageMaker::MlflowApp` CloudFormation type yet, so the template invokes `sagemaker:CreateMlflowApp` from a helper Lambda); if `MLFLOW_TRACKING_URI` is missing from `.env` after a fresh deploy, check that stack's `MLflowAppArn` output.
+To open the MLflow UI: SageMaker Studio → Partner AI Apps → MLflow. The App is provisioned by the base stack via the native `AWS::SageMaker::MlflowApp` CloudFormation resource type; if `MLFLOW_TRACKING_URI` is missing from `.env` after a fresh deploy, check that stack's `MLflowAppArn` output.
 
 ### Pipeline fails with permission errors
 
