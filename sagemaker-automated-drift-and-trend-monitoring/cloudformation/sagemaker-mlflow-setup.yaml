@@ -38,9 +38,14 @@ Parameters:
     Default: 'https://github.com/aws-samples/sample-mlops-bestpractices.git'
     Description: GitHub repository URL to clone
 
+  GitHubBranch:
+    Type: String
+    Default: 'testing'
+    Description: Git branch to check out after cloning (must exist on the remote)
+
   LifecycleConfigVersion:
     Type: String
-    Default: 'v21'
+    Default: 'v22'
     Description: 'Version suffix for lifecycle config and space names (change to trigger replacement)'
 
   UseExistingBucket:
@@ -1292,12 +1297,16 @@ Resources:
             sleep 10
             cd /home/sagemaker-user || exit 1
             if [ ! -d "sample-mlops-bestpractices" ]; then
-              git clone ${GitHubRepo} || exit 1
+              git clone -b ${GitHubBranch} ${GitHubRepo} || exit 1
             else
-              # Existing clone — pull latest so stack updates pick up new code.
-              # --ff-only keeps the user's uncommitted edits safe.
-              (cd sample-mlops-bestpractices && git fetch origin && git pull --ff-only) \
-                || echo "git pull --ff-only failed; keeping current local state."
+              # Existing clone — check out the target branch and pull latest so
+              # stack updates pick up new code. --ff-only keeps the user's
+              # uncommitted edits safe.
+              (cd sample-mlops-bestpractices \
+                && git fetch origin \
+                && git checkout ${GitHubBranch} \
+                && git pull --ff-only) \
+                || echo "git checkout/pull of ${GitHubBranch} failed; keeping current local state."
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
 
