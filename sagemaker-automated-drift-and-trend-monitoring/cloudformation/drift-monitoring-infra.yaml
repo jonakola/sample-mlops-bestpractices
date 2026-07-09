@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Drift-monitoring plane for the fraud-detection endpoint. Provisions the
+  infrastructure that notebook 3 used to create imperatively (SQS results
+  queue, monitoring-results writer Lambda, SNS alert topic, CloudWatch
+  dashboard + alarms, and the IAM role the scheduled drift-monitor Lambda
+  assumes). Deploy this ONCE so the data-scientist notebook
+  (3_inference_monitoring_quickstart.ipynb) can focus on drift detection
+  instead of plumbing.
+
+  NOT created here (by design): the scheduled drift-monitor Lambda itself is
+  a container image that must be built with `docker build`, which CloudFormation
+  cannot do. Deploy it with scripts/deploy_lambda_container.sh AFTER this stack
+  is live — that script reuses the IAM role and SNS topic created here.
+
+# ===========================================================================
+# Parameters
+# ===========================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'fraud-detection'
+    Description: 'Prefix for resource names/tags (lowercase letters, numbers, hyphens).'
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  DataBucketName:
+    Type: String
+    Description: >-
+      Name of the existing S3 data-lake bucket (the DataBucket output of the
+      domain stack). Used for Athena query results and Evidently report storage.
+
+  AthenaDatabase:
+    Type: String
+    Default: 'fraud_detection'
+    Description: 'Glue/Athena database that holds the Iceberg tables.'
+
+  MonitoringTableName:
+    Type: String
+    Default: 'monitoring_responses'
+    Description: 'Athena Iceberg table the writer Lambda INSERTs monitoring runs into.'
+
+  EndpointName:
+    Type: String
+    Default: 'fraud-detector-endpoint'
+    Description: 'SageMaker endpoint being monitored (CloudWatch metric dimension).'
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Email address to subscribe to drift alerts. Leave blank to skip the
+      subscription (you can add one later in the SNS console). A confirmation
+      email is sent on stack create when set.
+
+  DataDriftThreshold:
+    Type: Number
+    Default: 0.2
+    Description: 'PSI value above which the data-drift CloudWatch alarm fires.'
+
+  ModelDriftThreshold:
+    Type: Number
+    Default: 0.05
+    Description: 'Relative degradation (0.05 = 5%) above which model-drift alarms fire.'
+
+  MonitoringQueueName:
+    Type: String
+    Default: 'fraud-monitoring-results'
+    Description: 'SQS queue the drift-monitor Lambda writes results to.'
+
+  MonitoringWriterLambdaName:
+    Type: String
+    Default: 'fraud-monitoring-results-writer'
+    Description: 'Name of the SQS->Athena monitoring-results writer Lambda.'
+
+  SnsTopicName:
+    Type: String
+    Default: 'fraud-detection-drift-alerts'
+    Description: 'SNS topic name for drift alerts.'
+
+  DriftMonitorRoleName:
+    Type: String
+    Default: 'fraud-detection-drift-monitor-role'
+    Description: >-
+      IAM role name assumed by the scheduled (container) drift-monitor Lambda.
+      scripts/deploy_lambda_container.sh reuses this exact role when it creates
+      the function.
+
+  MetricNamespace:
+    Type: String
+    Default: 'FraudDetection/DriftMonitoring'
+    Description: 'CloudWatch namespace for drift metrics.'
+
+  DashboardName:
+    Type: String
+    Default: 'FraudDetection-DriftMonitoring'
+    Description: 'CloudWatch dashboard name.'
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # =========================================================================
+  # SNS — drift alert topic (+ optional email subscription)
+  # =========================================================================
+  DriftAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SnsTopicName
+      DisplayName: 'Fraud Detection Drift Alerts'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DriftAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref DriftAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # SQS — monitoring results queue
+  # The drift-monitor Lambda emits one message per run; the writer Lambda
+  # below drains it into the monitoring_responses Athena table.
+  # =========================================================================
+  MonitoringResultsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Ref MonitoringQueueName
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # Monitoring-results writer Lambda (SQS -> Athena monitoring_responses)
+  # Ported verbatim from src/drift_monitoring/deploy_monitoring_writer.py so
+  # the notebook no longer needs to build/deploy it at runtime.
+  # =========================================================================
+  MonitoringWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${MonitoringWriterLambdaName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonAthenaFullAccess'
+      Policies:
+        - PolicyName: DataBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+
+  MonitoringWriterFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Ref MonitoringWriterLambdaName
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt MonitoringWriterRole.Arn
+      Description: 'Drains the monitoring-results SQS queue into the monitoring_responses Athena table.'
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Ref AthenaDatabase
+          ATHENA_TABLE: !Ref MonitoringTableName
+          ATHENA_OUTPUT: !Sub 's3://${DataBucketName}/athena-query-results/'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+
+          athena = boto3.client('athena')
+
+          ATHENA_DATABASE = os.environ['ATHENA_DATABASE']
+          ATHENA_TABLE = os.environ['ATHENA_TABLE']
+          ATHENA_OUTPUT = os.environ['ATHENA_OUTPUT']
+
+          def lambda_handler(event, context):
+              """Process SQS messages and write monitoring results to Athena."""
+              print(f"Processing {len(event['Records'])} messages")
+              for record in event['Records']:
+                  try:
+                      body = json.loads(record['body'])
+                      write_to_athena(body)
+                  except Exception as e:
+                      print(f"Error processing message: {e}")
+                      raise
+              return {'statusCode': 200, 'processed': len(event['Records'])}
+
+          def write_to_athena(data):
+              """Write one monitoring result row to the Iceberg table.
+
+              Column list MUST match the monitoring_responses DDL exactly and
+              the INSERT built by notebook 3 Section 6.4. Adding/reordering
+              columns requires updating all three in lockstep.
+              """
+              columns = [
+                  'monitoring_run_id', 'monitoring_timestamp',
+                  'endpoint_name', 'model_version', 'model_package_arn',
+                  'evaluation_snapshot_id',
+                  'data_drift_detected', 'drifted_columns_count', 'drifted_columns_share',
+                  'features_analyzed', 'data_sample_size', 'model_drift_detected',
+                  'baseline_roc_auc', 'current_roc_auc',
+                  'roc_auc_degradation', 'roc_auc_degradation_pct',
+                  'accuracy', 'precision', 'recall', 'f1_score',
+                  'model_sample_size', 'per_feature_drift_scores',
+                  'evidently_report_s3_path', 'mlflow_run_id',
+                  'alert_sent', 'detection_engine', 'created_at',
+              ]
+              timestamp_cols = {'monitoring_timestamp', 'created_at'}
+
+              values = []
+              for col in columns:
+                  val = data.get(col)
+                  if val is None:
+                      values.append('NULL')
+                  elif isinstance(val, bool):
+                      values.append('TRUE' if val else 'FALSE')
+                  elif isinstance(val, (int, float)):
+                      values.append(str(val))
+                  elif col in timestamp_cols:
+                      val_str = str(val).replace("'", "''")
+                      values.append(f"TIMESTAMP '{val_str}'")
+                  else:
+                      val_str = str(val).replace("'", "''")
+                      values.append(f"'{val_str}'")
+
+              col_list = ', '.join(columns)
+              val_list = ', '.join(values)
+              query = f"INSERT INTO {ATHENA_DATABASE}.{ATHENA_TABLE} ({col_list}) VALUES ({val_list})"
+
+              response = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': ATHENA_DATABASE},
+                  ResultConfiguration={'OutputLocation': ATHENA_OUTPUT},
+              )
+              execution_id = response['QueryExecutionId']
+              print(f"Athena query started: {execution_id}")
+
+              while True:
+                  status = athena.get_query_execution(QueryExecutionId=execution_id)
+                  state = status['QueryExecution']['Status']['State']
+                  if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                      break
+                  time.sleep(0.5)
+
+              if state == 'SUCCEEDED':
+                  print(f"Written to {ATHENA_DATABASE}.{ATHENA_TABLE}")
+              else:
+                  reason = status['QueryExecution']['Status'].get('StateChangeReason', 'Unknown')
+                  raise Exception(f"Athena query failed: {reason}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MonitoringWriterEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt MonitoringResultsQueue.Arn
+      FunctionName: !Ref MonitoringWriterFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+
+  # =========================================================================
+  # IAM role for the SCHEDULED (container) drift-monitor Lambda.
+  # The function is created out-of-band by scripts/deploy_lambda_container.sh
+  # (container image), but its role is deterministic, so we own it here.
+  # Permissions mirror deploy_lambda_container.sh + notebook cell 29.
+  # =========================================================================
+  DriftMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref DriftMonitorRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonAthenaFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+      Policies:
+        - PolicyName: DriftMonitorRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Producer to the monitoring-results queue.
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                  - 'sqs:GetQueueAttributes'
+                  - 'sqs:GetQueueUrl'
+                Resource: !GetAtt MonitoringResultsQueue.Arn
+              # Publish drift alerts.
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref DriftAlertsTopic
+              # Write Athena query results + Evidently HTML reports.
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+              # Resolve baseline.json from the model package serving the endpoint.
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:ListModelPackages'
+                  - 'sagemaker:DescribeModelPackage'
+                  - 'sagemaker:DescribeEndpoint'
+                  - 'sagemaker:DescribeEndpointConfig'
+                  - 'sagemaker:DescribeModel'
+                Resource: '*'
+
+  # =========================================================================
+  # CloudWatch alarms — fire on the metrics the drift-monitor Lambda publishes.
+  # AlarmActions notify the SNS topic (the imperative script left this unwired).
+  # =========================================================================
+  DataDriftPsiAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'FraudDetection-DataDrift-PSI'
+      AlarmDescription: !Sub 'Data drift: average PSI exceeds ${DataDriftThreshold} (distribution shift).'
+      Namespace: !Ref MetricNamespace
+      MetricName: 'DataDriftPSI'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DataDriftThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Endpoint
+          Value: !Ref EndpointName
+      AlarmActions:
+        - !Ref DriftAlertsTopic
+
+  ModelDriftRocAucAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'FraudDetection-ModelDrift-ROCAUCDEGRADATION'
+      AlarmDescription: !Sub 'Model drift: ROC-AUC degradation exceeds ${ModelDriftThreshold}.'
+      Namespace: !Ref MetricNamespace
+      MetricName: 'ROCAUCDegradation'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ModelDriftThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Endpoint
+          Value: !Ref EndpointName
+      AlarmActions:
+        - !Ref DriftAlertsTopic
+
+  ModelDriftAccuracyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'FraudDetection-ModelDrift-ACCURACY'
+      AlarmDescription: !Sub 'Model drift: accuracy degradation exceeds ${ModelDriftThreshold}.'
+      Namespace: !Ref MetricNamespace
+      MetricName: 'Accuracy'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ModelDriftThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Endpoint
+          Value: !Ref EndpointName
+      AlarmActions:
+        - !Ref DriftAlertsTopic
+
+  ModelDriftPrecisionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'FraudDetection-ModelDrift-PRECISION'
+      AlarmDescription: !Sub 'Model drift: precision degradation exceeds ${ModelDriftThreshold}.'
+      Namespace: !Ref MetricNamespace
+      MetricName: 'Precision'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ModelDriftThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Endpoint
+          Value: !Ref EndpointName
+      AlarmActions:
+        - !Ref DriftAlertsTopic
+
+  ModelDriftRecallAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: 'FraudDetection-ModelDrift-RECALL'
+      AlarmDescription: !Sub 'Model drift: recall degradation exceeds ${ModelDriftThreshold}.'
+      Namespace: !Ref MetricNamespace
+      MetricName: 'Recall'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ModelDriftThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Endpoint
+          Value: !Ref EndpointName
+      AlarmActions:
+        - !Ref DriftAlertsTopic
+
+  # =========================================================================
+  # CloudWatch dashboard — data-drift PSI + model-drift degradation trends
+  # plus a live alarm-status strip. Mirrors create_cloudwatch_monitoring.py.
+  # =========================================================================
+  DriftDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# Fraud Detection - Drift Monitoring Dashboard\n**Endpoint:** `${EndpointName}` | **Data-drift PSI alarm:** ${DataDriftThreshold} | **Model-drift alarm:** ${ModelDriftThreshold}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "DataDriftPSI", "Endpoint", "${EndpointName}", {"stat": "Average"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Data Drift - Population Stability Index (PSI)",
+                "period": 300,
+                "yAxis": {"left": {"min": 0, "max": 1}},
+                "annotations": {
+                  "horizontal": [
+                    {"label": "Alarm Threshold", "value": ${DataDriftThreshold}, "fill": "above", "color": "#d62728"}
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "ROCAUCDegradation", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "ROC-AUC Degradation"}],
+                  ["${MetricNamespace}", "Accuracy", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Accuracy Degradation"}],
+                  ["${MetricNamespace}", "Precision", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Precision Degradation"}],
+                  ["${MetricNamespace}", "Recall", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Recall Degradation"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Model Drift - Degradation from Baseline",
+                "period": 300,
+                "yAxis": {"left": {"min": 0, "max": 0.5}},
+                "annotations": {
+                  "horizontal": [
+                    {"label": "Alarm Threshold", "value": ${ModelDriftThreshold}, "color": "#d62728"}
+                  ]
+                }
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 8, "width": 24, "height": 4,
+              "properties": {
+                "title": "Drift Alarms Status",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-DataDrift-PSI",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-ROCAUCDEGRADATION",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-ACCURACY",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-PRECISION",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-RECALL"
+                ]
+              }
+            }
+          ]
+        }
+
+# ===========================================================================
+# Outputs — consumed by the notebook (read-only confirmation) and by
+# scripts/deploy_lambda_container.sh.
+# ===========================================================================
+Outputs:
+  DriftAlertsTopicArn:
+    Description: 'SNS topic ARN for drift alerts.'
+    Value: !Ref DriftAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-DriftAlertsTopicArn'
+
+  MonitoringResultsQueueUrl:
+    Description: 'SQS queue URL the drift-monitor Lambda writes results to.'
+    Value: !Ref MonitoringResultsQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringQueueUrl'
+
+  MonitoringResultsQueueArn:
+    Description: 'SQS queue ARN.'
+    Value: !GetAtt MonitoringResultsQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringQueueArn'
+
+  MonitoringWriterFunctionArn:
+    Description: 'Monitoring-results writer Lambda ARN.'
+    Value: !GetAtt MonitoringWriterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringWriterArn'
+
+  DriftMonitorRoleArn:
+    Description: 'IAM role ARN for the scheduled (container) drift-monitor Lambda.'
+    Value: !GetAtt DriftMonitorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DriftMonitorRoleArn'
+
+  DashboardName:
+    Description: 'CloudWatch dashboard name.'
+    Value: !Ref DashboardName
+
+  DashboardURL:
+    Description: 'CloudWatch dashboard console URL.'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DashboardName}'

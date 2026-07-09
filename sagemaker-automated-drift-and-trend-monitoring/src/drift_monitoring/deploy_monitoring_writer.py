@@ -156,7 +156,7 @@ def write_to_athena(data):
     columns = [
         'monitoring_run_id', 'monitoring_timestamp',
         'endpoint_name', 'model_version', 'model_package_arn',
-        'evaluation_snapshot_id',
+        'evaluation_snapshot_id', 'training_snapshot_id',
         'data_drift_detected', 'drifted_columns_count', 'drifted_columns_share',
         'features_analyzed', 'data_sample_size', 'model_drift_detected',
         'baseline_roc_auc', 'current_roc_auc',

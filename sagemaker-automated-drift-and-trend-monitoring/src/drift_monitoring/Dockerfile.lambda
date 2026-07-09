@@ -12,5 +12,11 @@ COPY src/drift_monitoring/__init__.py ${LAMBDA_TASK_ROOT}/src/drift_monitoring/_
 COPY src/drift_monitoring/evidently_reports.py ${LAMBDA_TASK_ROOT}/src/drift_monitoring/evidently_reports.py
 COPY src/drift_monitoring/lambda_drift_monitor.py ${LAMBDA_TASK_ROOT}/lambda_drift_monitor.py
 
+# Copy the dataset schema loader so lambda_drift_monitor.py's
+# `from src.config import schema` import resolves at runtime.
+COPY src/config/__init__.py ${LAMBDA_TASK_ROOT}/src/config/__init__.py
+COPY src/config/schema.py ${LAMBDA_TASK_ROOT}/src/config/schema.py
+COPY src/config/dataset_schema.yaml ${LAMBDA_TASK_ROOT}/src/config/dataset_schema.yaml
+
 # Set the CMD to your handler
 CMD [ "lambda_drift_monitor.lambda_handler" ]

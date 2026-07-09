@@ -42,6 +42,12 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
 
+# Make `src.*` importable when run as a script.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+from src.config import schema  # noqa: E402
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -49,8 +55,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Generated at setup-script run time from dataset_schema.yaml, then spliced
+# into LAMBDA_CODE below as a plain Python literal. The deployed Lambda
+# itself never imports schema.py — see Requirement 15.4 / design Change 8.
+FEATURE_COLUMNS_LITERAL = repr(schema.feature_names())
+
 # Lambda function code for batch transform
-LAMBDA_CODE = '''
+LAMBDA_CODE_TEMPLATE = '''
 import json
 import logging
 import os
@@ -171,21 +182,9 @@ def lambda_handler(event, context):
         # Step 1: Export data from Athena to S3
         logger.info(f"Exporting data from {INPUT_TABLE} to S3...")
         
-        # Feature columns for the model
-        feature_columns = [
-            'transaction_amount', 'transaction_type_code', 'customer_age',
-            'customer_gender', 'customer_tenure_months', 'account_age_days',
-            'distance_from_home_km', 'distance_from_last_transaction_km',
-            'time_since_last_transaction_min', 'online_transaction',
-            'international_transaction', 'high_risk_country',
-            'merchant_category_code', 'merchant_reputation_score',
-            'chip_transaction', 'pin_used', 'card_present',
-            'cvv_match', 'address_verification_match',
-            'num_transactions_24h', 'num_transactions_7days',
-            'avg_transaction_amount_30days', 'max_transaction_amount_30days',
-            'velocity_score', 'recurring_transaction', 'previous_fraud_incidents',
-            'credit_limit', 'available_credit_ratio'
-        ]
+        # Feature columns for the model (generated from dataset_schema.yaml
+        # at setup-script run time — see FEATURE_COLUMNS_LITERAL above)
+        feature_columns = __FEATURE_COLUMNS_PLACEHOLDER__
         
         # CTAS query to export data
         export_table = f'batch_export_{job_id.replace("-", "_")}'
@@ -286,6 +285,10 @@ def lambda_handler(event, context):
             'error': str(e)
         }
 '''
+
+LAMBDA_CODE = LAMBDA_CODE_TEMPLATE.replace(
+    '__FEATURE_COLUMNS_PLACEHOLDER__', FEATURE_COLUMNS_LITERAL
+)
 
 
 def create_lambda_deployment_package() -> bytes:

@@ -28,6 +28,16 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
+# Note: this script previously imported a local `schema` sibling module for
+# reading dataset_schema.yaml. That import fought with the PyPI `schema`
+# validation package pre-installed in the PySpark container image, and
+# SageMaker SDK v3's PySparkProcessor.submit_py_files path has a pydantic
+# bug that prevents shipping the local module cleanly. Since the pipeline
+# always passes --target-column explicitly (see pipeline.py:513), the
+# module isn't actually needed here — the target column default below is
+# a hardcoded fallback for standalone / debug runs only, mirroring the
+# `target_column` value in src/config/dataset_schema.yaml.
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -585,9 +595,16 @@ def main():
     parser.add_argument('--limit', type=int, default=None,
                        help='Row limit for testing (applied to BOTH tables)')
 
-    # Target column
-    parser.add_argument('--target-column', type=str, default='is_fraud',
-                       help='Target column name')
+    # Target column. Always passed by the pipeline via --target-column
+    # (see pipeline.py:513). The value is sourced from dataset_schema.yaml
+    # on the notebook host (pipeline.py:247's `default_value=
+    # schema.target_column()`) and baked into the pipeline parameter, so
+    # by the time this container runs, the value is already resolved.
+    # required=True: fail loudly if a standalone / debug run forgets to
+    # pass it, rather than silently drifting from the schema YAML.
+    parser.add_argument('--target-column', type=str, required=True,
+                       help='Target column name (required — value comes from '
+                            'dataset_schema.yaml via the pipeline parameter)')
 
     # Output paths (SageMaker ProcessingStep provides these)
     parser.add_argument('--train-output-dir', type=str,

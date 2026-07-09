@@ -453,7 +453,7 @@ ORDER BY hour DESC;
 - **Inference**: `src/train_pipeline/inference_handler.py`
 - **Testing**: `src/train_pipeline/test_endpoint.py`
 - **Analytics**: `src/train_pipeline/athena/athena_client.py`
-- **Schema**: `src/train_pipeline/athena/schema_definitions.py`
+- **Schema**: `src/config/schema.py`
 
 ## Support
 

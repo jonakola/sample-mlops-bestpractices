@@ -35,6 +35,12 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
 
+# Make `src.*` importable when run as a script.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+from src.config import schema  # noqa: E402
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -42,8 +48,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Lambda function code for real-time inference
-LAMBDA_CODE = '''
+# Schema-derived values spliced into LAMBDA_CODE_TEMPLATE below. These are
+# generated HERE, at setup-script run time (where `src.config.schema` is
+# importable) rather than inside the deployed Lambda, which must stay
+# dependency-free — it is zipped and uploaded as an isolated function with
+# no `source_dir` and no access to the rest of `src` (Requirement 15.4).
+#
+# Athena SELECT column list: identifier + timestamp + every feature.
+# `timestamp_column()` is intentionally NOT part of `feature_names()` (see
+# dataset_schema.yaml), so there is no duplicate column here.
+_SELECT_COLUMNS = ',\n        '.join(
+    [schema.identifier_column(), schema.timestamp_column()] + schema.feature_names()
+)
+
+# Python list literal used for feature-vector assembly before invoking the
+# endpoint. Baked into the deployed Lambda source as a plain literal.
+FEATURE_COLUMNS_LITERAL = repr(schema.feature_names())
+
+# Lambda function code template for real-time inference. Kept as a plain
+# (non-f-string) triple-quoted string because the Lambda's own source
+# contains many single-brace f-strings of its own (e.g. `{BATCH_SIZE}`,
+# `{lookback_time...}`) that must survive untouched into the deployed
+# Lambda. The two schema-derived placeholders below are spliced in via
+# `.replace()` after this literal, using tokens that can't collide with
+# Python string-formatting syntax.
+LAMBDA_CODE_TEMPLATE = '''
 import json
 import logging
 import os
@@ -138,36 +167,7 @@ def lambda_handler(event, context):
     # Adjust this query based on your actual table schema
     query = f"""
     SELECT 
-        transaction_id,
-        transaction_timestamp,
-        transaction_amount,
-        transaction_type_code,
-        customer_age,
-        customer_gender,
-        customer_tenure_months,
-        account_age_days,
-        distance_from_home_km,
-        distance_from_last_transaction_km,
-        time_since_last_transaction_min,
-        online_transaction,
-        international_transaction,
-        high_risk_country,
-        merchant_category_code,
-        merchant_reputation_score,
-        chip_transaction,
-        pin_used,
-        card_present,
-        cvv_match,
-        address_verification_match,
-        num_transactions_24h,
-        num_transactions_7days,
-        avg_transaction_amount_30days,
-        max_transaction_amount_30days,
-        velocity_score,
-        recurring_transaction,
-        previous_fraud_incidents,
-        credit_limit,
-        available_credit_ratio
+        __SELECT_COLUMNS_PLACEHOLDER__
     FROM training_data
     WHERE transaction_timestamp >= timestamp '{lookback_time.strftime("%Y-%m-%d %H:%M:%S")}'
     LIMIT {BATCH_SIZE}
@@ -193,20 +193,7 @@ def lambda_handler(event, context):
             }
         
         # Prepare features for inference
-        feature_columns = [
-            'transaction_amount', 'transaction_type_code', 'customer_age',
-            'customer_gender', 'customer_tenure_months', 'account_age_days',
-            'distance_from_home_km', 'distance_from_last_transaction_km',
-            'time_since_last_transaction_min', 'online_transaction',
-            'international_transaction', 'high_risk_country',
-            'merchant_category_code', 'merchant_reputation_score',
-            'chip_transaction', 'pin_used', 'card_present',
-            'cvv_match', 'address_verification_match',
-            'num_transactions_24h', 'num_transactions_7days',
-            'avg_transaction_amount_30days', 'max_transaction_amount_30days',
-            'velocity_score', 'recurring_transaction', 'previous_fraud_incidents',
-            'credit_limit', 'available_credit_ratio'
-        ]
+        feature_columns = __FEATURE_COLUMNS_PLACEHOLDER__
         
         features = []
         transaction_ids = []
@@ -259,6 +246,16 @@ def lambda_handler(event, context):
             'error': str(e)
         }
 '''
+
+# Splice the schema-derived values into the template as plain Python
+# literals/text. `.replace()` (not `.format()`/f-string) is used because
+# LAMBDA_CODE_TEMPLATE contains many single-brace f-strings of its own that
+# must be preserved verbatim in the deployed Lambda source.
+LAMBDA_CODE = LAMBDA_CODE_TEMPLATE.replace(
+    '__SELECT_COLUMNS_PLACEHOLDER__', _SELECT_COLUMNS
+).replace(
+    '__FEATURE_COLUMNS_PLACEHOLDER__', FEATURE_COLUMNS_LITERAL
+)
 
 
 def create_lambda_deployment_package() -> bytes:

@@ -1,0 +1,125 @@
+# =============================================================================
+# Dataset Schema — Single Source of Truth
+# =============================================================================
+# Every column name, type, and role (feature / target / identifier / aux)
+# used anywhere in this project — Athena DDL, the training pipeline, the
+# drift monitor, scheduled inference/batch-transform — is derived from THIS
+# file via src/config/schema.py. Nothing else in the codebase hardcodes a
+# feature list.
+#
+# To bring your own dataset:
+#   1. Edit this file: identifier_column, target_column, and the full
+#      `features` list (name + type) for YOUR data.
+#   2. Point your own loader (replacing src/setup/download_kaggle_dataset.py)
+#      at your source CSV/table so it emits rows in schema.csv_column_order().
+#   3. Recreate the Athena tables against the new schema:
+#         ./cloudformation/deploy-stack.sh --recreate-database
+#      (this drops and recreates all 7 tables — destructive, see the script's
+#      --help for details)
+#   4. Validate before spending SageMaker $$:
+#         python -m src.setup.validate_dataset_schema
+#   5. Run the training pipeline. No other file needs to change.
+#
+# Supported `type` values: double, string, boolean, int, timestamp
+# (must map onto Athena/Iceberg SQL types — see schema.py ATHENA_TYPE_MAP).
+# =============================================================================
+
+dataset:
+  # Unique row identifier. STRING in Athena regardless of source type.
+  identifier_column: transaction_id
+
+  # Primary event timestamp. This names one entry in `features:` below —
+  # it IS a model feature (DOUBLE, matching the Kaggle "seconds since
+  # first transaction" encoding), not a separate excluded column. Some
+  # downstream tables (ground_truth, inference_responses) additionally
+  # have their own real TIMESTAMP partition columns (prediction_timestamp,
+  # request_timestamp) that are unrelated to this value.
+  timestamp_column: transaction_timestamp
+
+  # Binary classification target. BOOLEAN in Athena; the training script
+  # casts to 0/1 internally.
+  target_column: is_fraud
+  target_type: boolean
+
+  # Columns present in the source predictions CSV that are NOT model
+  # features — carried through to training_data/evaluation_data/drifted_data
+  # for auditability, but never passed to the model.
+  auxiliary_columns:
+    - name: fraud_prediction
+      type: boolean
+    - name: fraud_probability
+      type: double
+
+  # Full feature list, in the order the pipeline expects them. Do not
+  # reorder existing entries when adding new features — appending is safe;
+  # reordering forces a full re-seed via --recreate-database.
+  features:
+    - name: transaction_hour
+      type: double
+    - name: transaction_day_of_week
+      type: double
+    - name: transaction_amount
+      type: double
+    - name: transaction_type_code
+      type: double
+    - name: customer_age
+      type: double
+    - name: customer_gender
+      type: string
+    - name: customer_tenure_months
+      type: double
+    - name: account_age_days
+      type: double
+    - name: distance_from_home_km
+      type: double
+    - name: distance_from_last_transaction_km
+      type: double
+    - name: time_since_last_transaction_min
+      type: double
+    - name: online_transaction
+      type: double
+    - name: international_transaction
+      type: double
+    - name: high_risk_country
+      type: double
+    - name: merchant_category_code
+      type: double
+    - name: merchant_reputation_score
+      type: double
+    - name: chip_transaction
+      type: double
+    - name: pin_used
+      type: double
+    - name: card_present
+      type: double
+    - name: cvv_match
+      type: double
+    - name: address_verification_match
+      type: double
+    - name: num_transactions_24h
+      type: double
+    - name: num_transactions_7days
+      type: double
+    - name: avg_transaction_amount_30days
+      type: double
+    - name: max_transaction_amount_30days
+      type: double
+    - name: velocity_score
+      type: double
+    - name: recurring_transaction
+      type: double
+    - name: previous_fraud_incidents
+      type: double
+    - name: credit_limit
+      type: double
+    - name: available_credit_ratio
+      type: double
+
+  # Deterministic 80/20 train/eval split. `hash_column` is hashed
+  # (xxhash64 mod 10) so re-running the seed produces the identical split —
+  # required for the evaluation_data table to be a stable model-drift
+  # baseline across retrains.
+  split:
+    strategy: deterministic_hash
+    train_ratio: 0.8
+    hash_column: transaction_id

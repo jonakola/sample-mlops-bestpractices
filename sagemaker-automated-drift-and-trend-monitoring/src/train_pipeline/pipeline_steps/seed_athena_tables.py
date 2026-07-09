@@ -4,10 +4,11 @@ Seed the Athena ``training_data`` and ``evaluation_data`` tables from the
 predictions CSV in S3.
 
 This runs as the first step of the SageMaker training pipeline. The two
-tables are populated with a deterministic 80/20 split keyed on
-``transaction_id`` so the evaluation slice is stable across model versions
-— that stability is what makes ``evaluation_data`` a valid baseline for
-the drift monitor.
+tables are populated with a deterministic split (default 80/20, see
+``dataset_schema.yaml``'s ``dataset.split`` section) keyed on the
+configured identifier column so the evaluation slice is stable across
+model versions — that stability is what makes ``evaluation_data`` a valid
+baseline for the drift monitor.
 
 Both tables are idempotent — if both pass the integrity check, the step
 is a no-op.
@@ -17,8 +18,14 @@ fills them. The downstream preprocessing step reads training_data for
 the train channel and evaluation_data for the validation/test channel.
 
 Configuration is read from environment variables (set by the pipeline
-ProcessingStep) so this script has no dependency on src.config — it must
-run inside a vanilla SageMaker Processing container with only boto3.
+ProcessingStep) so this script has no dependency on ``src.config.config``
+— it must run inside a vanilla SageMaker Processing container.
+
+It DOES depend on ``src.config.schema`` for the feature list — the
+ProcessingStep's ``source_dir`` bundles ``src/config/schema.py`` and its
+sibling ``dataset_schema.yaml`` alongside this script (see
+``pipeline.py::_create_seed_athena_step``), so the import below resolves
+inside the container without needing the rest of the ``src`` package.
 
 Required env vars:
     AWS_DEFAULT_REGION
@@ -36,74 +43,54 @@ Usage (local debug):
 import argparse
 import logging
 import os
+import sys
 import time
+from pathlib import Path
 
 import boto3
+
+# When this script ships standalone (bundled via ProcessingStep source_dir),
+# `src/config/schema.py` and `dataset_schema.yaml` land as siblings in the
+# same directory. Add that directory to sys.path so `from src.config import
+# schema` style absolute imports aren't required — import schema directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import schema  # noqa: E402  (bundled sibling module — see source_dir wiring)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Canonical column order for the staging external table AND the source
+# predictions CSV — both driven by dataset_schema.yaml via schema.py.
+# There is exactly one order; see schema.csv_column_order()'s docstring.
+CSV_COLUMN_ORDER = schema.csv_column_order()
 
-# NOTE: Column order is duplicated here because this script ships standalone
-# into the SageMaker ScriptProcessor container — src/setup is not on
-# PYTHONPATH there, so we cannot import. KEEP THESE TWO LISTS IN SYNC WITH
-# src/setup/download_kaggle_dataset.py:
-#   - CSV_COLUMN_ORDER   <-> download_kaggle_dataset.CSV_COLUMN_ORDER
-#   - ATHENA_COLUMN_ORDER must also match the Iceberg DDL in
-#     cloudformation/sagemaker-mlflow-setup.yaml.
+# Feature columns (+ their declared types) the INSERT casts and projects
+# into the Iceberg target, in the same order the Iceberg DDL declares them
+# (both generated from schema.py — see src/setup/create_athena_tables.py).
+FEATURES = schema.features()
 
-# Order of columns the staging external table declares. MUST match exactly the
-# header order in data/creditcard_predictions_final.csv that
-# download_kaggle_dataset.py writes (column names bind to CSV positions in
-# the order declared).
-CSV_COLUMN_ORDER = [
-    "transaction_id", "transaction_timestamp",
-    "transaction_hour", "transaction_day_of_week", "customer_age",
-    "account_age_days", "merchant_category_code", "distance_from_home_km",
-    "distance_from_last_transaction_km", "online_transaction",
-    "chip_transaction", "pin_used", "recurring_transaction",
-    "international_transaction", "high_risk_country", "num_transactions_24h",
-    "num_transactions_7days", "avg_transaction_amount_30days",
-    "max_transaction_amount_30days", "card_present",
-    "address_verification_match", "cvv_match", "velocity_score",
-    "merchant_reputation_score", "time_since_last_transaction_min",
-    "transaction_type_code", "customer_tenure_months", "credit_limit",
-    "available_credit_ratio", "previous_fraud_incidents",
-    "transaction_amount", "fraud_prediction", "fraud_probability",
-    "customer_gender", "is_fraud",
-]
+ID_COLUMN = schema.identifier_column()
+TARGET_COLUMN = schema.target_column()
 
-# Order of columns the INSERT projects into the Iceberg target. MUST match the
-# Iceberg DDL in cloudformation/sagemaker-mlflow-setup.yaml (excludes
-# transaction_id and the trailing fraud_prediction/fraud_probability/is_fraud,
-# which the seed script handles with explicit casts).
-ATHENA_COLUMN_ORDER = [
-    "transaction_timestamp", "transaction_hour", "transaction_day_of_week",
-    "transaction_amount", "transaction_type_code", "customer_age", "customer_gender",
-    "customer_tenure_months", "account_age_days", "distance_from_home_km",
-    "distance_from_last_transaction_km", "time_since_last_transaction_min",
-    "online_transaction", "international_transaction", "high_risk_country",
-    "merchant_category_code", "merchant_reputation_score", "chip_transaction",
-    "pin_used", "card_present", "cvv_match", "address_verification_match",
-    "num_transactions_24h", "num_transactions_7days",
-    "avg_transaction_amount_30days", "max_transaction_amount_30days",
-    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
-    "credit_limit", "available_credit_ratio",
-]
+# Generic corruption check: both classes must be non-empty. This deliberately
+# does NOT rely on any dataset-specific statistical signature (e.g. a known
+# feature's fraud-class mean) so it works for any dataset_schema.yaml, not
+# just the Kaggle sample data.
+MIN_ROWS_PER_CLASS = 1
 
-# V14 (renamed num_transactions_24h) has a fraud-class mean around -7 on the
-# Kaggle dataset. If the table is correctly seeded the AVG over fraud rows is
-# strongly negative. If it returns ~0 the table is corrupted — re-seed.
-INTEGRITY_THRESHOLD = -3.0
-
-# Deterministic hash-based 80/20 split on transaction_id. The same predicate
-# is used for both inserts so the partitioning is reproducible: re-running
-# the seed produces the same rows in each table.
+# Deterministic hash-based split on the configured identifier column
+# (schema.split_config()). The same predicate is used for both inserts so
+# the partitioning is reproducible: re-running the seed produces the same
+# rows in each table.
 # xxhash64 returns VARBINARY (8 bytes); convert to BIGINT with
 # from_big_endian_64 before ABS/MOD or Athena errors with
 # "Unexpected parameters (varbinary) for function abs".
-TRAIN_PREDICATE = "MOD(ABS(from_big_endian_64(xxhash64(CAST(transaction_id AS VARBINARY)))), 10) < 8"
-EVAL_PREDICATE = "MOD(ABS(from_big_endian_64(xxhash64(CAST(transaction_id AS VARBINARY)))), 10) >= 8"
+_split_cfg = schema.split_config()
+_hash_col = _split_cfg.get("hash_column", ID_COLUMN)
+_train_pct = int(round(_split_cfg.get("train_ratio", 0.8) * 10))
+_HASH_EXPR = f"MOD(ABS(from_big_endian_64(xxhash64(CAST({_hash_col} AS VARBINARY)))), 10)"
+TRAIN_PREDICATE = f"{_HASH_EXPR} < {_train_pct}"
+EVAL_PREDICATE = f"{_HASH_EXPR} >= {_train_pct}"
 
 
 class Config:
@@ -163,30 +150,33 @@ def _run_athena_query(cfg: Config, query: str, *, expect_results: bool = False,
 
 
 def _check_one_table(cfg: Config, table: str) -> dict:
-    """Returns ``{passed, fraud_count, non_fraud_count, fraud_v14_mean}`` for one table."""
+    """Returns ``{passed, fraud_count, non_fraud_count}`` for one table.
+
+    "Passed" means both classes are present with at least MIN_ROWS_PER_CLASS
+    rows — a generic corruption check that works for any target column
+    declared in dataset_schema.yaml, not a dataset-specific statistical
+    signature.
+    """
     try:
         rows = _run_athena_query(
             cfg,
-            f"SELECT is_fraud, COUNT(*) AS n, AVG(num_transactions_24h) AS v14_mean "
-            f"FROM {cfg.database}.{table} GROUP BY is_fraud",
+            f"SELECT {TARGET_COLUMN}, COUNT(*) AS n "
+            f"FROM {cfg.database}.{table} GROUP BY {TARGET_COLUMN}",
             expect_results=True,
         )
     except Exception as e:
         logger.info("Integrity check on %s skipped (not queryable yet): %s", table, e)
-        return {"passed": False, "fraud_count": 0, "non_fraud_count": 0,
-                "fraud_v14_mean": 0.0}
+        return {"passed": False, "fraud_count": 0, "non_fraud_count": 0}
 
-    by_class = {r["is_fraud"].lower(): r for r in rows if r.get("is_fraud")}
+    by_class = {r[TARGET_COLUMN].lower(): r for r in rows if r.get(TARGET_COLUMN)}
     f = by_class.get("true", {})
     n = by_class.get("false", {})
-    fraud_mean = float(f.get("v14_mean") or 0)
     fraud_n = int(f.get("n") or 0)
     non_fraud_n = int(n.get("n") or 0)
     return {
-        "passed": fraud_n > 0 and non_fraud_n > 0 and fraud_mean < INTEGRITY_THRESHOLD,
+        "passed": fraud_n >= MIN_ROWS_PER_CLASS and non_fraud_n >= MIN_ROWS_PER_CLASS,
         "fraud_count": fraud_n,
         "non_fraud_count": non_fraud_n,
-        "fraud_v14_mean": fraud_mean,
     }
 
 
@@ -209,8 +199,9 @@ def seed_tables(cfg: Config) -> None:
     predictions_loc = f"s3://{cfg.bucket}/{cfg.prefix}data/predictions/"
 
     logger.info("=" * 80)
-    logger.info("SEEDING training_data (80%%) + evaluation_data (20%%) FROM %s", predictions_loc)
-    logger.info("Split: deterministic on transaction_id (xxhash64 MOD 10)")
+    logger.info("SEEDING training_data (%d%%) + evaluation_data (%d%%) FROM %s",
+                _train_pct * 10, 100 - _train_pct * 10, predictions_loc)
+    logger.info("Split: deterministic on %s (xxhash64 MOD 10)", _hash_col)
     logger.info("=" * 80)
 
     # Verify both target tables exist (CloudFormation should have created them).
@@ -239,17 +230,22 @@ def seed_tables(cfg: Config) -> None:
         "TBLPROPERTIES ('skip.header.line.count'='1')"
     )
 
-    def cast(c: str) -> str:
-        return c if c == "customer_gender" else f"CAST({c} AS DOUBLE) AS {c}"
-
-    select_features = ", ".join(cast(c) for c in ATHENA_COLUMN_ORDER)
+    # Cast rule per feature/auxiliary/target column comes from its declared
+    # type in dataset_schema.yaml (schema.cast_expr) — no hardcoded
+    # per-column exception. A dataset with different auxiliary columns or
+    # a differently-typed target works here without any code change.
+    select_features = ", ".join(schema.cast_expr(f) for f in FEATURES)
+    aux_columns = schema.auxiliary_columns()
+    select_aux = ", ".join(schema.cast_expr(c) for c in aux_columns)
+    select_aux_fragment = f"{select_aux}, " if select_aux else ""
+    target_cast = schema.cast_expr(
+        schema.Feature(TARGET_COLUMN, schema.target_type())
+    )
 
     insert_template = (
         "INSERT INTO {target} "
-        f"SELECT transaction_id, {select_features}, "
-        "CAST(lower(fraud_prediction) AS BOOLEAN), "
-        "CAST(fraud_probability AS DOUBLE), "
-        "CAST(lower(is_fraud) AS BOOLEAN), "
+        f"SELECT {ID_COLUMN}, {select_features}, "
+        f"{select_aux_fragment}{target_cast}, "
         "'v1', current_timestamp, current_timestamp "
         f"FROM {stage} WHERE {{predicate}}"
     )
@@ -271,8 +267,8 @@ def seed_tables(cfg: Config) -> None:
 
 def _log_check(label: str, c: dict) -> None:
     logger.info(
-        "  %s: %d fraud / %d non-fraud, fraud_v14_mean=%.4f → %s",
-        label, c["fraud_count"], c["non_fraud_count"], c["fraud_v14_mean"],
+        "  %s: %d positive-class / %d negative-class rows → %s",
+        label, c["fraud_count"], c["non_fraud_count"],
         "PASS" if c["passed"] else "FAIL",
     )
 

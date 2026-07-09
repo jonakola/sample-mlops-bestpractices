@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Simplified SageMaker Domain setup for Automated Drift and Trend Monitoring.
-  Creates: SageMaker Domain (PublicInternetOnly), MLflow Tracking Server,
+  Creates: SageMaker Domain (PublicInternetOnly), MLflow App (serverless),
   JupyterLab Space with repo clone, S3 bucket, and IAM execution role.
 
 Parameters:
@@ -38,9 +38,14 @@ Parameters:
     Default: 'https://github.com/aws-samples/sample-mlops-bestpractices.git'
     Description: GitHub repository URL to clone
 
+  GitHubBranch:
+    Type: String
+    Default: 'main'
+    Description: Git branch to check out after cloning (must exist on the remote)
+
   LifecycleConfigVersion:
     Type: String
-    Default: 'v21'
+    Default: 'v22'
     Description: 'Version suffix for lifecycle config and space names (change to trigger replacement)'
 
   UseExistingBucket:
@@ -828,29 +833,24 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Control-plane: manage the tracking-server resource itself.
+              # Control-plane: manage the MLflow App resource itself.
               - Effect: Allow
                 Action:
-                  - 'sagemaker:CreateMlflowTrackingServer'
-                  - 'sagemaker:UpdateMlflowTrackingServer'
-                  - 'sagemaker:DeleteMlflowTrackingServer'
-                  - 'sagemaker:DescribeMlflowTrackingServer'
-                  - 'sagemaker:ListMlflowTrackingServers'
-                  - 'sagemaker:StartMlflowTrackingServer'
-                  - 'sagemaker:StopMlflowTrackingServer'
-                  # Needed by the Studio console to mint the signed URL
-                  # that opens the MLflow UI in a new tab.
-                  - 'sagemaker:CreatePresignedMlflowTrackingServerUrl'
+                  - 'sagemaker:CreateMlflowApp'
+                  - 'sagemaker:UpdateMlflowApp'
+                  - 'sagemaker:DeleteMlflowApp'
+                  - 'sagemaker:DescribeMlflowApp'
+                  - 'sagemaker:ListMlflowApps'
                 Resource: '*'
               # Data-plane: open the MLflow UI and read/write experiments,
               # runs, metrics, params, tags, and registered models. This is
               # the `sagemaker-mlflow:AccessUI` action surfaced in the
               # "not authorized to perform" error, plus the REST actions
-              # mlflow-client calls against the server from notebooks.
+              # mlflow-client calls against the app from notebooks.
               - Effect: Allow
                 Action:
                   - 'sagemaker-mlflow:*'
-                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:mlflow-tracking-server/*'
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:mlflow-app/*'
         - PolicyName: !Sub '${ProjectName}-EventBridgeAccess'
           PolicyDocument:
             Version: '2012-10-17'
@@ -941,6 +941,9 @@ Resources:
                   - 'lambda:RemovePermission'
                   - 'lambda:GetFunctionConfiguration'
                   - 'lambda:GetPolicy'
+                  - 'lambda:TagResource'
+                  - 'lambda:UntagResource'
+                  - 'lambda:ListTags'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-SQSAccess'
           PolicyDocument:
@@ -958,6 +961,9 @@ Resources:
                   - 'sqs:DeleteMessage'
                   - 'sqs:PurgeQueue'
                   - 'sqs:ListQueues'
+                  - 'sqs:TagQueue'
+                  - 'sqs:UntagQueue'
+                  - 'sqs:ListQueueTags'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-CloudWatchMetricsAccess'
           PolicyDocument:
@@ -1005,6 +1011,9 @@ Resources:
                   - 'sns:SetTopicAttributes'
                   - 'sns:ListTopics'
                   - 'sns:ListSubscriptionsByTopic'
+                  - 'sns:TagResource'
+                  - 'sns:UntagResource'
+                  - 'sns:ListTagsForResource'
                 Resource: '*'
         # IAM role management for the drift-monitor / monitoring-writer
         # Lambda roles. The notebook (cell-33) and deploy_monitoring_writer
@@ -1052,7 +1061,35 @@ Resources:
                   - 'iam:ListRolePolicies'
                   - 'iam:UpdateAssumeRolePolicy'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole'
-        # Lake Formation: the setup script grants DB/table permissions to this
+        # CloudFormation stack deployment: notebook 3 (drift-monitoring) and
+        # notebook 4 (governance/QuickSight) use `aws cloudformation deploy`
+        # from the SageMaker Studio kernel to deploy dependent stacks. The
+        # role already has permissions for the resources inside those stacks
+        # (Lambda, SQS, SNS, CloudWatch, IAM under fraud-*); this grants the
+        # meta-level stack-management actions so CreateChangeSet /
+        # ExecuteChangeSet can succeed.
+        - PolicyName: !Sub '${ProjectName}-CloudFormationStackDeployment'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:DescribeStackEvents'
+                  - 'cloudformation:DescribeStackResource'
+                  - 'cloudformation:DescribeStackResources'
+                  - 'cloudformation:ListStackResources'
+                  - 'cloudformation:GetTemplate'
+                  - 'cloudformation:GetTemplateSummary'
+                  - 'cloudformation:ValidateTemplate'
+                Resource: '*'
         # role at runtime (lf_client.grant_permissions). Allow the LF grant/
         # admin actions so that self-grant succeeds in any account.
         - PolicyName: !Sub '${ProjectName}-LakeFormationAccess'
@@ -1269,12 +1306,16 @@ Resources:
             sleep 10
             cd /home/sagemaker-user || exit 1
             if [ ! -d "sample-mlops-bestpractices" ]; then
-              git clone ${GitHubRepo} || exit 1
+              git clone -b ${GitHubBranch} ${GitHubRepo} || exit 1
             else
-              # Existing clone — pull latest so stack updates pick up new code.
-              # --ff-only keeps the user's uncommitted edits safe.
-              (cd sample-mlops-bestpractices && git fetch origin && git pull --ff-only) \
-                || echo "git pull --ff-only failed; keeping current local state."
+              # Existing clone — check out the target branch and pull latest so
+              # stack updates pick up new code. --ff-only keeps the user's
+              # uncommitted edits safe.
+              (cd sample-mlops-bestpractices \
+                && git fetch origin \
+                && git checkout ${GitHubBranch} \
+                && git pull --ff-only) \
+                || echo "git checkout/pull of ${GitHubBranch} failed; keeping current local state."
             fi
             cd sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring || exit 1
 
@@ -1296,7 +1337,7 @@ Resources:
             AWS_DEFAULT_REGION=${AWS::Region}
             SAGEMAKER_EXEC_ROLE=arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole
             SAGEMAKER_DOMAIN_ID=${SageMakerDomain}
-            MLFLOW_TRACKING_URI=${MLflowTrackingServer.TrackingServerArn}
+            MLFLOW_TRACKING_URI=${MLflowApp.Arn}
             DATA_S3_BUCKET=${ProjectName}-data-${AWS::AccountId}
             PROJECT_NAME=${ProjectName}
             # 🚨 IMPORTANT: replace nobody@example.com with a real email to receive
@@ -1309,173 +1350,16 @@ Resources:
             chown sagemaker-user:sagemaker-user .env
             chmod 600 .env
 
-            # Create Athena database + all 7 Iceberg tables (empty, idempotent).
+            # Create Athena database + all 7 Iceberg tables (empty, idempotent),
+            # driven by src/config/dataset_schema.yaml via create_athena_tables.py.
             # For destructive resets (schema changes), use deploy-stack.sh
-            # --drop-database — that wipes the catalog and S3 prefixes ONCE,
+            # --recreate-database — that wipes the catalog and S3 prefixes ONCE,
             # before this CFN update runs.
-            python3 << 'CREATEEOF'
-            import boto3, time
-
-            DATABASE = "fraud_detection"
-            BUCKET = "${ProjectName}-data-${AWS::AccountId}"
-            PREFIX = "fraud-detection"
-            OUTPUT_S3 = f"s3://{BUCKET}/athena-results/"
-
-            athena = boto3.client("athena")
-
-            def run_query(sql):
-                qid = athena.start_query_execution(
-                    QueryString=sql,
-                    QueryExecutionContext={"Database": DATABASE},
-                    ResultConfiguration={"OutputLocation": OUTPUT_S3},
-                )["QueryExecutionId"]
-                for _ in range(90):
-                    st = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
-                    if st["State"] == "SUCCEEDED":
-                        return True
-                    if st["State"] in ("FAILED", "CANCELLED"):
-                        print(f"  Query {st['State']}: {st.get('StateChangeReason', '')}")
-                        return False
-                    time.sleep(2)
-                print("  Query timed out")
-                return False
-
-            run_query(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
-
-            TF = ("transaction_timestamp transaction_hour transaction_day_of_week transaction_amount "
-                  "transaction_type_code customer_age customer_gender customer_tenure_months "
-                  "account_age_days distance_from_home_km distance_from_last_transaction_km "
-                  "time_since_last_transaction_min online_transaction international_transaction "
-                  "high_risk_country merchant_category_code merchant_reputation_score chip_transaction "
-                  "pin_used card_present cvv_match address_verification_match num_transactions_24h "
-                  "num_transactions_7days avg_transaction_amount_30days max_transaction_amount_30days "
-                  "velocity_score recurring_transaction previous_fraud_incidents credit_limit "
-                  "available_credit_ratio").split()
-            FEAT = ", ".join(c + (" STRING" if c == "customer_gender" else " DOUBLE") for c in TF)
-
-            # Table inventory (5 active + 2 reserved): see README "Athena Data Lake".
-            TABLES = {
-                "training_data": f"""
-            CREATE TABLE IF NOT EXISTS {DATABASE}.training_data (
-                transaction_id STRING,
-                {FEAT},
-                fraud_prediction BOOLEAN, fraud_probability DOUBLE, is_fraud BOOLEAN,
-                data_version STRING, created_at TIMESTAMP, updated_at TIMESTAMP
-            )
-            LOCATION 's3://{BUCKET}/{PREFIX}/training_data/'
-            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
-            """,
-
-                "evaluation_data": f"""
-            CREATE TABLE IF NOT EXISTS {DATABASE}.evaluation_data (
-                transaction_id STRING,
-                {FEAT},
-                fraud_prediction BOOLEAN, fraud_probability DOUBLE, is_fraud BOOLEAN,
-                data_version STRING, created_at TIMESTAMP, updated_at TIMESTAMP
-            )
-            LOCATION 's3://{BUCKET}/{PREFIX}/evaluation_data/'
-            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
-            """,
-
-                "ground_truth": f"""
-            CREATE TABLE IF NOT EXISTS {DATABASE}.ground_truth (
-                transaction_id STRING, prediction_timestamp TIMESTAMP, window_id INT,
-                {FEAT},
-                ground_truth_fraud BOOLEAN, observed_fraud BOOLEAN, fraud_probability DOUBLE,
-                data_source STRING, ingestion_timestamp TIMESTAMP, batch_id STRING
-            )
-            PARTITIONED BY (day(prediction_timestamp))
-            LOCATION 's3://{BUCKET}/{PREFIX}/ground_truth/'
-            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
-            """,
-
-                "inference_responses": f"""
-            CREATE TABLE IF NOT EXISTS {DATABASE}.inference_responses (
-                inference_id STRING, request_timestamp TIMESTAMP, endpoint_name STRING,
-                model_version STRING, mlflow_run_id STRING,
-                input_features STRING,
-                prediction INT, probability_fraud DOUBLE, probability_non_fraud DOUBLE, confidence_score DOUBLE,
-                ground_truth INT, ground_truth_timestamp TIMESTAMP, ground_truth_source STRING, days_to_ground_truth DOUBLE,
-                inference_latency_ms DOUBLE, model_load_time_ms DOUBLE, preprocessing_time_ms DOUBLE,
-                transaction_id STRING, transaction_amount DOUBLE, customer_id STRING,
-                is_high_confidence BOOLEAN, is_low_confidence BOOLEAN, prediction_bucket STRING,
-                request_id STRING, response_time TIMESTAMP, error_message STRING, inference_mode STRING,
-                monitoring_run_id STRING
-            )
-            PARTITIONED BY (day(request_timestamp), endpoint_name)
-            LOCATION 's3://{BUCKET}/{PREFIX}/inference_responses/'
-            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
-            """,
-
-                "drifted_data": f"""
-            CREATE EXTERNAL TABLE IF NOT EXISTS {DATABASE}.drifted_data (
-                transaction_id STRING,
-                {FEAT},
-                is_fraud BOOLEAN
-            )
-            STORED AS PARQUET
-            LOCATION 's3://{BUCKET}/{PREFIX}/drifted_data/'
-            TBLPROPERTIES ('parquet.compression'='SNAPPY')
-            """,
-
-                "ground_truth_updates": f"""
-            CREATE TABLE IF NOT EXISTS {DATABASE}.ground_truth_updates (
-                transaction_id STRING, inference_id STRING,
-                actual_fraud BOOLEAN, confirmation_timestamp TIMESTAMP, confirmation_source STRING,
-                transaction_timestamp TIMESTAMP, prediction_timestamp TIMESTAMP,
-                days_since_transaction DOUBLE, days_since_prediction DOUBLE,
-                investigation_notes STRING, investigation_priority STRING,
-                false_positive BOOLEAN, false_negative BOOLEAN,
-                window_id INT,
-                batch_id STRING, created_at TIMESTAMP, updated_at TIMESTAMP
-            )
-            PARTITIONED BY (day(confirmation_timestamp))
-            LOCATION 's3://{BUCKET}/{PREFIX}/ground_truth_updates/'
-            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
-            """,
-
-                # model_package_arn is the join key for "is this drift
-                # record about the currently-deployed model, or about a
-                # previous version we rolled back from?" It's the
-                # immutable reference that pairs with the human-readable
-                # model_version label.
-                # evaluation_snapshot_id pins the Iceberg snapshot the
-                # drift Lambda sampled the baseline from (per-version
-                # reproducibility).
-                #
-                # ⚠️ KEEP IN SYNC: src/drift_monitoring/deploy_monitoring_writer.py
-                # has a hardcoded `columns = [...]` list in its embedded Lambda
-                # code that MUST mirror this DDL. Adding/removing columns
-                # requires editing BOTH places. Order matters in the writer's
-                # parameterized INSERT.
-                "monitoring_responses": f"""
-            CREATE TABLE IF NOT EXISTS {DATABASE}.monitoring_responses (
-                monitoring_run_id STRING, monitoring_timestamp TIMESTAMP,
-                endpoint_name STRING, model_version STRING, model_package_arn STRING,
-                evaluation_snapshot_id STRING,
-                data_drift_detected BOOLEAN, drifted_columns_count INT, drifted_columns_share DOUBLE,
-                features_analyzed INT, data_sample_size INT, model_drift_detected BOOLEAN,
-                baseline_roc_auc DOUBLE, current_roc_auc DOUBLE,
-                roc_auc_degradation DOUBLE, roc_auc_degradation_pct DOUBLE,
-                accuracy DOUBLE, precision DOUBLE, recall DOUBLE, f1_score DOUBLE,
-                model_sample_size INT, per_feature_drift_scores STRING,
-                evidently_report_s3_path STRING, mlflow_run_id STRING,
-                alert_sent BOOLEAN, detection_engine STRING, created_at TIMESTAMP
-            )
-            PARTITIONED BY (day(monitoring_timestamp))
-            LOCATION 's3://{BUCKET}/{PREFIX}/monitoring_responses/'
-            TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
-            """,
-            }
-
-            success_count = 0
-            for name, ddl in TABLES.items():
-                if run_query(ddl):
-                    success_count += 1
-            print(f"Created {success_count}/{len(TABLES)} Athena tables (empty).")
-            if success_count < len(TABLES):
-                raise SystemExit(1)
-            CREATEEOF
+            python3 -m src.setup.create_athena_tables
+            if [ $? -ne 0 ]; then
+              echo "❌ create_athena_tables.py failed — aborting lifecycle setup."
+              exit 1
+            fi
 
             echo "Setup complete. Open notebooks/1_training_pipeline.ipynb to load Kaggle data into training_data."
             exit 0
@@ -1492,7 +1376,7 @@ Resources:
     UpdateReplacePolicy: Delete
     DependsOn:
       - UserProfile
-      - MLflowTrackingServer
+      - MLflowApp
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
@@ -1514,24 +1398,29 @@ Resources:
           Value: CloudFormation
 
   # ====================================================================
-  # MLflow Tracking Server
+  # MLflow App (Serverless) — replaces MLflow Tracking Server
   # ====================================================================
-  MLflowTrackingServer:
-    Type: AWS::SageMaker::MlflowTrackingServer
+  # Provisioned via the native AWS::SageMaker::MlflowApp resource type.
+  # The SDK uses this App's ARN as MLFLOW_TRACKING_URI (written to .env by
+  # the lifecycle script); open the UI from SageMaker Studio ->
+  # Partner AI Apps -> MLflow.
+  # ====================================================================
+  MLflowApp:
+    Type: AWS::SageMaker::MlflowApp
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      TrackingServerName: !Sub '${ProjectName}-mlflow'
+      Name: !Sub '${ProjectName}-mlflow-app'
       ArtifactStoreUri: !Sub 's3://${ProjectName}-data-${AWS::AccountId}/mlflow-artifacts'
       RoleArn: !If
         - CreateNewRole
         - !GetAtt SageMakerExecutionRole.Arn
         - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole'
-      AutomaticModelRegistration: true
+      ModelRegistrationMode: AutoModelRegistrationEnabled
       WeeklyMaintenanceWindowStart: 'Sun:03:00'
       Tags:
         - Key: Name
-          Value: !Sub '${ProjectName}-mlflow'
+          Value: !Sub '${ProjectName}-mlflow-app'
 
   # ====================================================================
   # SQS Queue + Lambda for Inference Logging
@@ -1695,21 +1584,27 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
 
-  MLflowTrackingServerArn:
-    Description: MLflow Tracking Server ARN
-    Value: !GetAtt MLflowTrackingServer.TrackingServerArn
+  MLflowAppArn:
+    Description: MLflow App ARN (serverless)
+    Value: !GetAtt MLflowApp.Arn
     Export:
       Name: !Sub '${AWS::StackName}-MLflowArn'
 
-  MLflowTrackingServerName:
-    Description: MLflow Tracking Server Name (use with describe-mlflow-tracking-server to get URL)
-    Value: !Sub '${ProjectName}-mlflow'
+  MLflowAppName:
+    Description: MLflow App Name (use with describe-mlflow-app to get details)
+    Value: !Sub '${ProjectName}-mlflow-app'
     Export:
       Name: !Sub '${AWS::StackName}-MLflowName'
 
+  MLflowAppId:
+    Description: MLflow App ID (server-generated identifier)
+    Value: !GetAtt MLflowApp.MlflowAppId
+    Export:
+      Name: !Sub '${AWS::StackName}-MLflowAppId'
+
   GetMLflowUrlCommand:
-    Description: Command to get MLflow UI URL
-    Value: !Sub 'aws sagemaker describe-mlflow-tracking-server --tracking-server-name ${ProjectName}-mlflow --query TrackingServerUrl --output text --region ${AWS::Region}'
+    Description: Command to get MLflow App details (URL is opened via the SageMaker Studio/Unified Studio UI — no direct-URL API for MLflow Apps)
+    Value: !Sub 'aws sagemaker describe-mlflow-app --arn ${MLflowApp.Arn} --region ${AWS::Region}'
 
   InferenceLoggingQueueUrl:
     Description: SQS Queue URL for inference logging
@@ -1738,5 +1633,6 @@ Outputs:
       6. Click "Run Space" to start JupyterLab
       7. Once JupyterLab loads, check CLOUDFORMATION_SETUP_COMPLETE.md for next steps
 
-      Get MLflow UI URL:
-      aws sagemaker describe-mlflow-tracking-server --tracking-server-name ${ProjectName}-mlflow --query TrackingServerUrl --output text --region ${AWS::Region}
+      Get MLflow App details:
+      aws sagemaker describe-mlflow-app --arn <MLflowAppArn-from-outputs> --region ${AWS::Region}
+      (Open the MLflow UI itself from within SageMaker Studio / Unified Studio — MLflow Apps do not expose a describe-time UI URL the way Tracking Servers do.)
