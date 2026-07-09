@@ -449,7 +449,14 @@ class FraudDetectionPipeline:
         shutil.copy(pipeline_steps_dir / "seed_athena_tables.py", staging_dir)
         self._stage_schema_sibling(staging_dir)
 
-        logger.info("Staged seed-step source dir: %s (seed_athena_tables.py + schema.py + dataset_schema.yaml)",
+        # Write a requirements.txt so FrameworkProcessor's install_requirements.py
+        # installs pyyaml before running seed_athena_tables.py. schema.py imports
+        # yaml at module load; the base Processing Job image doesn't ship pyyaml,
+        # so without this the step crashes on `import yaml` with
+        # ModuleNotFoundError.
+        (staging_dir / "requirements.txt").write_text("pyyaml\n")
+
+        logger.info("Staged seed-step source dir: %s (seed_athena_tables.py + schema.py + dataset_schema.yaml + requirements.txt)",
                    staging_dir)
         return staging_dir
 

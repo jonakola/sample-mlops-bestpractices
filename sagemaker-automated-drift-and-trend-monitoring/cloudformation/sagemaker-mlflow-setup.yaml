@@ -1047,7 +1047,35 @@ Resources:
                   - 'iam:ListRolePolicies'
                   - 'iam:UpdateAssumeRolePolicy'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole'
-        # Lake Formation: the setup script grants DB/table permissions to this
+        # CloudFormation stack deployment: notebook 3 (drift-monitoring) and
+        # notebook 4 (governance/QuickSight) use `aws cloudformation deploy`
+        # from the SageMaker Studio kernel to deploy dependent stacks. The
+        # role already has permissions for the resources inside those stacks
+        # (Lambda, SQS, SNS, CloudWatch, IAM under fraud-*); this grants the
+        # meta-level stack-management actions so CreateChangeSet /
+        # ExecuteChangeSet can succeed.
+        - PolicyName: !Sub '${ProjectName}-CloudFormationStackDeployment'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:DescribeStackEvents'
+                  - 'cloudformation:DescribeStackResource'
+                  - 'cloudformation:DescribeStackResources'
+                  - 'cloudformation:ListStackResources'
+                  - 'cloudformation:GetTemplate'
+                  - 'cloudformation:GetTemplateSummary'
+                  - 'cloudformation:ValidateTemplate'
+                Resource: '*'
         # role at runtime (lf_client.grant_permissions). Allow the LF grant/
         # admin actions so that self-grant succeeds in any account.
         - PolicyName: !Sub '${ProjectName}-LakeFormationAccess'
