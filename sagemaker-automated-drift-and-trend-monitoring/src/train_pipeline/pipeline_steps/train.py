@@ -29,7 +29,14 @@ from sklearn.metrics import (
 # dataset_schema.yaml alongside this script (see pipeline.py's
 # _stage_schema_sibling() helper).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import schema
+# Note: this script previously imported a local `schema` sibling module for
+# reading dataset_schema.yaml. That import failed in the XGBoost training
+# container (no schema module shipped). Since the pipeline always passes
+# --target-column and --target-type explicitly (see pipeline.py — the values
+# come from schema.target_column() / schema.target_type() evaluated on the
+# notebook host and threaded through pipeline parameters), the module isn't
+# needed here. Argparse args are `required=True` so standalone/debug runs
+# fail loudly if they forget to pass the values.
 
 # Visualization libraries - try to install if not available
 VISUALIZATION_AVAILABLE = False
@@ -884,12 +891,13 @@ def main():
                        help='Directory containing training data')
     parser.add_argument('--validation-data-dir', type=str, default='/opt/ml/input/data/validation',
                        help='Directory containing validation data')
-    parser.add_argument('--target-column', type=str, default=schema.target_column(),
-                       help='Target column name')
-    parser.add_argument('--target-type', type=str, default=schema.target_type(),
+    parser.add_argument('--target-column', type=str, required=True,
+                       help='Target column name (required — passed by the pipeline '
+                            'from schema.target_column() evaluated on the notebook host)')
+    parser.add_argument('--target-type', type=str, required=True,
                        help='Target column type (boolean/integer/double/string) used to '
-                            'auto-derive XGBoost objective; passed by pipeline.py from '
-                            'schema.target_type()')
+                            'auto-derive XGBoost objective; required — passed by '
+                            'pipeline.py from schema.target_type()')
     parser.add_argument('--xgboost-objective', type=str, default='',
                        help='Explicit XGBoost objective override (e.g. reg:squarederror, '
                             'multi:softprob). Empty string → auto-derive from --target-type.')
