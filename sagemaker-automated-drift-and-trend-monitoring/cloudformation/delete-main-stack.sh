@@ -572,6 +572,7 @@ fi
 
 LAST_STATUS=""
 AUTO_RETRIED_EFS=false   # one-shot guard so we don't loop infinitely
+ADAPTIVE_SWEEP_DONE=false # one-shot guard for the mid-flight sweep below
 while true; do
     STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
         --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DELETE_COMPLETE")
@@ -579,6 +580,37 @@ while true; do
         echo "  ✓ Stack deleted"
         break
     fi
+
+    # ────────────────────────────────────────────────────────────────────
+    # Adaptive mid-flight sweep. SageMaker's async domain tear-down can
+    # recreate NFS security groups and EFS mount targets AFTER the pre-
+    # delete sweep ran but BEFORE CFN reaches the VPC delete. Waiting for
+    # CFN's dependency timeout (typically 30-40 min) is wasteful — as soon
+    # as the SageMakerDomain resource is DELETE_COMPLETE and the VPC is
+    # still DELETE_IN_PROGRESS, we know the async cleanup window is open.
+    # Sweep now so CFN's next VPC-delete attempt succeeds.
+    # ────────────────────────────────────────────────────────────────────
+    if [ "$STATUS" = "DELETE_IN_PROGRESS" ] && ! $ADAPTIVE_SWEEP_DONE; then
+        DOMAIN_GONE=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
+            --query "StackEvents[?LogicalResourceId=='SageMakerDomain' && ResourceStatus=='DELETE_COMPLETE'] | length(@)" \
+            --output text 2>/dev/null || echo "0")
+        VPC_STUCK=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
+            --query "StackEvents[?LogicalResourceId=='VPC' && ResourceStatus=='DELETE_IN_PROGRESS'] | length(@)" \
+            --output text 2>/dev/null || echo "0")
+        if [ "$DOMAIN_GONE" != "0" ] && [ "$VPC_STUCK" != "0" ]; then
+            echo ""
+            echo "  ⚡ Adaptive sweep: SageMakerDomain deleted, VPC delete pending."
+            echo "    Sweeping async-created orphans now (skips CFN's ~30-40 min"
+            echo "    dependency timeout so the next VPC-delete attempt succeeds)..."
+            sweep_all_orphans "adaptive mid-flight (Domain gone, VPC pending)"
+            ADAPTIVE_SWEEP_DONE=true
+            echo "  Continuing to poll for DELETE_COMPLETE..."
+            LAST_STATUS=""
+            sleep 20
+            continue
+        fi
+    fi
+
     if [ "$STATUS" = "DELETE_FAILED" ]; then
         # Check whether the failure is the known "has dependencies" pattern
         # on a subnet (EFS mount target orphan) or VPC (SageMaker SG orphan).
