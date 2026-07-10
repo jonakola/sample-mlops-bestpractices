@@ -31,7 +31,7 @@ project:
 # env var if your account was activated elsewhere.
 aws:
   region: us-west-2
-  quicksight_identity_region: us-east-1
+  quicksight_identity_region: us-west-2
 
 # ---------------------------------------------------------------------------
 # SageMaker
