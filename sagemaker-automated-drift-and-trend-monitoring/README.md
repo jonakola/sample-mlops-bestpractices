@@ -50,7 +50,7 @@ Open `sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring/
 | 1 | `1_training_pipeline.ipynb` | Builds and executes the SageMaker training pipeline: preprocessing → XGBoost training → evaluation (quality gate at ROC-AUC ≥ 0.70) → MLflow registration. Does NOT deploy endpoint — see notebook 2 for deployment. | ~20 min |
 | 2 | `2_deployment.ipynb` | Deploys the trained model to a SageMaker serverless endpoint with custom Athena-logging inference handler. Select model from registry, configure resources, test deployment. | ~10 min |
 | 3 | `3_inference_monitoring.ipynb` | Deploys the drift-monitoring infrastructure stack (SNS/SQS/writer Lambda/CloudWatch), tests the endpoint, simulates ground truth, runs Evidently data + model drift detection, and sets up the daily-scheduled drift Lambda. Writes to `monitoring_responses` (Athena) and optionally MLflow. | ~30 min |
-| 4 | `4_governance_dashboard.ipynb` | Creates a QuickSight governance dashboard (datasource, datasets, analysis, published dashboard) with auto-refresh via EventBridge + Lambda. Requires QuickSight Enterprise subscription. | ~15 min |
+| 4 | `4_governance_dashboard.ipynb` | Creates a QuickSight governance dashboard (datasource, datasets, analysis, published dashboard) with auto-refresh via EventBridge + Lambda. Requires QuickSight Enterprise subscription. See [QuickSight Setup Guide](docs/screenshots/quicksight/README.md) for first-time setup. | ~15 min |
 
 **Optional notebooks** (run as needed):
 
@@ -170,6 +170,8 @@ python main.py dashboard delete --confirm
 #### QuickSight prerequisites (one-time per account)
 
 `main.py dashboard create` calls the QuickSight Definition API to build datasets, an analysis, and a published dashboard. That API requires QuickSight to already exist in the account with Enterprise edition and at least one user who can own the assets. **Do this once, then dashboard create/delete become reproducible from the CLI.**
+
+> 📖 **For detailed setup instructions with screenshots**, see the [QuickSight Setup Guide for New Accounts](docs/screenshots/quicksight/README.md). This guide includes troubleshooting, region configuration, and security best practices.
 
 **Step-by-step from a brand-new AWS account:**
 

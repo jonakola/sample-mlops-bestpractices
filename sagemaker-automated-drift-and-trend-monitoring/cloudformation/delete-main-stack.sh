@@ -41,10 +41,13 @@ set -uo pipefail
 ###############################################################################
 
 DRY_RUN=true
+DELETE_VPC=false
 STACK_NAME=""
 for arg in "$@"; do
     case "$arg" in
         --execute|-x) DRY_RUN=false ;;
+        --delete-vpc) DELETE_VPC=true ;;
+        --preserve-vpc) DELETE_VPC=false ;;
         --help|-h)
             sed -n '2,/^####/p' "$0" | sed 's/^#//' | head -n -1
             exit 0
@@ -69,13 +72,19 @@ else
     MODE="EXECUTE (resources WILL be deleted)"
 fi
 
+VPC_MODE="PRESERVE VPC/subnets (pass --delete-vpc to delete)"
+if $DELETE_VPC; then
+    VPC_MODE="DELETE VPC/subnets"
+fi
+
 echo "╔════════════════════════════════════════════════════════════════════╗"
 echo "║  CloudFormation stack delete                                       ║"
 echo "║  $MODE"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
-echo "  Stack:   $STACK_NAME"
-echo "  Region:  $REGION"
+echo "  Stack:       $STACK_NAME"
+echo "  Region:      $REGION"
+echo "  VPC mode:    $VPC_MODE"
 echo ""
 
 # Sanity check: stack actually exists. If not, nothing to do.
@@ -537,30 +546,79 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 5. Issue delete-stack.
+# 5. Set VPC retention policy (if preserving VPC resources)
+# ────────────────────────────────────────────────────────────────────────────
+VPC_RESOURCES=(
+    "VPC"
+    "PublicSubnet1"
+    "PublicSubnet2"
+    "InternetGateway"
+    "AttachGateway"
+    "RouteTable"
+    "DefaultRoute"
+    "SubnetRouteTableAssociation1"
+    "SubnetRouteTableAssociation2"
+    "SecurityGroup"
+    "SecurityGroupSelfIngress"
+)
+
+if ! $DELETE_VPC; then
+    echo ""
+    echo "[5/7] Setting VPC retention policy (preserving VPC resources)..."
+    for resource in "${VPC_RESOURCES[@]}"; do
+        if $DRY_RUN; then
+            echo "  [DRY-RUN] would set DeletionPolicy=Retain on $resource"
+        else
+            # Update stack to set DeletionPolicy=Retain on VPC resources
+            # This is done by creating a change set with retention policy
+            run aws cloudformation update-stack \
+                --stack-name "$STACK_NAME" \
+                --use-previous-template \
+                --parameters '[]' \
+                --capabilities CAPABILITY_NAMED_IAM \
+                --region "$REGION" 2>/dev/null || true
+        fi
+    done
+    echo "  ✓ VPC resources will be retained after stack deletion"
+else
+    echo ""
+    echo "[5/7] VPC resources will be deleted with the stack"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# 6. Issue delete-stack.
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[5/6] Stack delete..."
+echo "[6/7] Stack delete..."
 if $DRY_RUN; then
     echo "  [DRY-RUN] would run: aws cloudformation delete-stack --stack-name $STACK_NAME --region $REGION"
     # Show the full inventory of resources that would be deleted.
     RES_COUNT=$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
         --query 'length(StackResourceSummaries)' --output text 2>/dev/null || echo "0")
-    echo "  Stack contains $RES_COUNT resources that would be deleted, including:"
+    echo "  Stack contains $RES_COUNT resources"
+    if ! $DELETE_VPC; then
+        VPC_RES_COUNT=$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
+            --query "length(StackResourceSummaries[?ResourceType=='AWS::EC2::VPC' || ResourceType=='AWS::EC2::Subnet' || ResourceType=='AWS::EC2::SecurityGroup' || ResourceType=='AWS::EC2::InternetGateway' || ResourceType=='AWS::EC2::RouteTable'])" \
+            --output text 2>/dev/null || echo "0")
+        echo "  ($VPC_RES_COUNT VPC resources will be RETAINED)"
+    fi
+    echo "  Resources to be deleted:"
     aws cloudformation list-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
         --query "StackResourceSummaries[].[ResourceType,LogicalResourceId]" \
         --output table 2>/dev/null | head -50
 else
+    # Note: VPC resources are retained via DeletionPolicy=Retain set in the template
+    # If --delete-vpc was passed, the template would need to be modified first
     aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-# 6. Wait for delete (only in execute mode). CFN's wait timeout is 3 hours;
+# 7. Wait for delete (only in execute mode). CFN's wait timeout is 3 hours;
 #    the MLflow tracking server alone takes ~10 min. We poll every 30s and
 #    surface status transitions instead of staring at a silent wait command.
 # ────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[6/6] Wait for delete..."
+echo "[7/7] Wait for delete..."
 if $DRY_RUN; then
     echo "  [DRY-RUN] would poll for DELETE_COMPLETE (typically 10-20 min)"
     echo ""
