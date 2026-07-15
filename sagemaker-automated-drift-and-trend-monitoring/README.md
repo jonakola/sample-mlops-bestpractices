@@ -286,6 +286,104 @@ Configuration values differ between notebook testing, Lambda code defaults, and 
 - **1 day (deployed default)**: Daily monitoring of yesterday's predictions, fast alerts for sudden drift
 - **7/30 days (code default)**: Smoothed trends, better statistical significance, tolerates low daily volume
 - **Incremental (notebook)**: Interactive testing without re-processing already-analyzed predictions
+
+### Configuring Shorter Drift Windows (Minutes Instead of Days)
+
+For high-volume real-time applications, you may want drift detection to run every 15 minutes instead of daily. This requires converting the lookback windows from days to minutes:
+
+**Use case:** Detect drift within the hour on high-throughput endpoints (100s-1000s predictions/minute) rather than waiting for daily batch checks.
+
+**Step-by-step conversion:**
+
+1. **Update deployment script** (`scripts/deploy_lambda_container.sh` lines 315-316):
+   
+   Replace:
+   ```bash
+   "DATA_DRIFT_LOOKBACK_DAYS": "1",
+   "MODEL_DRIFT_LOOKBACK_DAYS": "1",
+   ```
+   
+   With:
+   ```bash
+   "DATA_DRIFT_LOOKBACK_MINUTES": "60",
+   "MODEL_DRIFT_LOOKBACK_MINUTES": "120",
+   ```
+
+2. **Update Lambda code** (`src/drift_monitoring/lambda_drift_monitor.py` lines 64-65):
+   
+   Replace:
+   ```python
+   DATA_DRIFT_LOOKBACK_DAYS = int(os.getenv('DATA_DRIFT_LOOKBACK_DAYS', '7'))
+   MODEL_DRIFT_LOOKBACK_DAYS = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '30'))
+   ```
+   
+   With:
+   ```python
+   DATA_DRIFT_LOOKBACK_MINUTES = int(os.getenv('DATA_DRIFT_LOOKBACK_MINUTES', '60'))
+   MODEL_DRIFT_LOOKBACK_MINUTES = int(os.getenv('MODEL_DRIFT_LOOKBACK_MINUTES', '120'))
+   ```
+
+3. **Update drift functions** (same file):
+   
+   In `check_data_drift()` function (around line 431), replace:
+   ```python
+   lookback_start = (datetime.now() - timedelta(days=DATA_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+   
+   With:
+   ```python
+   lookback_start = (datetime.now() - timedelta(minutes=DATA_DRIFT_LOOKBACK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+   
+   In `check_model_drift()` function (around line 526), replace:
+   ```python
+   lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+   
+   With:
+   ```python
+   lookback_start = (datetime.now() - timedelta(minutes=MODEL_DRIFT_LOOKBACK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+
+4. **Update EventBridge schedule** (in `scripts/deploy_lambda_container.sh` line 64 or `src/config/config.yaml`):
+   
+   In deployment script, the schedule is read from config. Update `config.yaml`:
+   ```yaml
+   drift_monitor:
+     schedule: "rate(15 minutes)"  # Was: "cron(0 2 * * ? *)"
+   ```
+
+5. **Optional: Update notebook constants** (`src/config/config.py`):
+   
+   For consistency with notebook 3, rename:
+   ```python
+   # Old:
+   MONITORING_DATA_DRIFT_LOOKBACK_DAYS = config_yaml.get('monitoring', {}).get('data_drift_lookback_days', 7)
+   MONITORING_MODEL_DRIFT_LOOKBACK_DAYS = config_yaml.get('monitoring', {}).get('model_drift_lookback_days', 30)
+   
+   # New:
+   MONITORING_DATA_DRIFT_LOOKBACK_MINUTES = config_yaml.get('monitoring', {}).get('data_drift_lookback_minutes', 60)
+   MONITORING_MODEL_DRIFT_LOOKBACK_MINUTES = config_yaml.get('monitoring', {}).get('model_drift_lookback_minutes', 120)
+   ```
+
+6. **Redeploy:**
+   ```bash
+   cd scripts
+   ./deploy_lambda_container.sh your-email@example.com
+   ```
+
+**Expected behavior after conversion:**
+- Lambda runs every 15 minutes (vs. daily at 2 AM)
+- Data drift: analyzes last 60 minutes of predictions
+- Model drift: analyzes last 120 minutes of predictions with ground truth
+- Faster drift detection but higher Lambda invocation costs
+- More sensitive to short-term anomalies (weekday vs. weekend patterns, lunch-hour spikes)
+
+**Cost considerations:**
+- Daily schedule: ~30 Lambda invocations/month
+- 15-minute schedule: ~2,880 Lambda invocations/month (96x more)
+- With 512 MB memory and 60s avg runtime: ~$3-5/month → ~$200-300/month
+- Use minute-based windows only when real-time drift detection justifies the cost
 - **Per-run traceability** — Each drift run gets a `monitoring_run_id` (`notebook-drift-*` from the notebook, `drift-*` from the Lambda). Both writers (a) record one row in `monitoring_responses` keyed on this id, and (b) backfill the same id onto the `inference_responses` rows the run scored — `WHERE monitoring_run_id IS NULL` makes this naturally delta-shaped, so each run only tags predictions never measured before. QuickSight can join the two tables on `monitoring_run_id` to show "what predictions did this run measure?". The **notebook additionally** scopes the *drift compute window itself* to `request_timestamp > MAX(monitoring_timestamp)`, letting you re-run drift detection on just the new predictions since the last run.
 - **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Writes summary to `monitoring_responses` (Athena is the durable source of truth — QuickSight reads directly from here), optionally logs metrics + Evidently HTML reports to MLflow, sends SNS alert if drift exceeds thresholds. Lambda scopes its drift compute to fixed 7/30-day rolling windows (data drift / model drift respectively); the `monitoring_run_id` backfill runs after every Lambda invocation.
 
