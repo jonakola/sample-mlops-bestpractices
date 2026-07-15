@@ -255,6 +255,37 @@ Full command reference: `python main.py --help` and `python main.py <command> --
 - **Inference logging** — Every prediction → SQS → Lambda batches (10 msgs or 30s) → `inference_responses` Iceberg table
 - **Ground truth integration** — Simulated (dev) or fed from fraud investigation systems (prod) → `ground_truth_updates` table → MERGE into `inference_responses`
 - **Drift detection** — Evidently `DataDriftPreset` against the frozen `training_data` baseline (KS for numerics, chi-square for categoricals, PSI per feature) + `ClassificationPreset` against the frozen `evaluation_data` baseline (ROC, PR, confusion matrix). Thresholds configurable via `src/config/config.yaml`.
+  - **⚠️ Important:** In MLflow, you may initially see **only data drift metrics** (not model drift). This is expected! **Data drift** runs on any predictions immediately (compares input feature distributions), while **model drift** requires ground truth labels to measure performance degradation (ROC-AUC, precision, recall). In fraud detection, ground truth arrives 1-30 days after transactions when fraud investigations complete. Until the `ground_truth_updates` table is populated and MERGE'd into `inference_responses`, the drift Lambda skips model drift checks (prints "⚠️ Not enough samples with ground truth"). Once ground truth is available (run notebook 3 Section 6 to simulate, or wait for real fraud confirmations in production), subsequent drift runs will log both data and model drift metrics to MLflow.
+
+### Drift Detection Configuration: Three Sources
+
+Configuration values differ between notebook testing, Lambda code defaults, and actual deployed values. Understanding these differences is critical for tuning the system:
+
+| Variable | Notebook 3 | Lambda Code Default<br/>(if not deployed) | Deployed via Script<br/>(`deploy_lambda_container.sh`) | Where to Change |
+|----------|------------|-------------------------------------------|--------------------------------------------------------|-----------------|
+| `MIN_SAMPLES` | **50** | **100** | **100** (inherits code default) | Notebook: line 1027<br/>Lambda: env var or code line 61 |
+| `DATA_DRIFT_LOOKBACK_DAYS` | incremental* | **7 days** | **1 day** ⚠️ | **Script line 315**<br/>Or pass as Lambda env var |
+| `MODEL_DRIFT_LOOKBACK_DAYS` | **30 days** | **30 days** | **1 day** ⚠️ | **Script line 316**<br/>Or pass as Lambda env var |
+| `DATA_DRIFT_THRESHOLD` | **0.20** (20%) | **0.2** | **0.2** (script arg 2) | Script argument<br/>`config.yaml` drift_thresholds.data_drift<br/>Lambda env var |
+| `MODEL_DRIFT_THRESHOLD` | **0.05** (5%) | **0.05** | **0.05** (script arg 3) | Script argument<br/>`config.yaml` drift_thresholds.model_drift<br/>Lambda env var |
+| `KS_PVALUE_THRESHOLD` | (not set) | **0.05** | **0.05** (inherits code default) | Lambda env var or code line 59 |
+
+**\*Notebook incremental mode:** Notebook 3 queries `MAX(monitoring_timestamp)` from the last drift run and only analyzes predictions since that timestamp. This avoids re-analyzing the same data on each notebook re-run. The Lambda uses fixed rolling windows instead.
+
+**⚠️ Critical:** The deployment script **hardcodes 1-day lookback windows** (lines 315-316), overriding the Lambda code defaults of 7/30 days. This means:
+- **As deployed**: Lambda analyzes last 1 day of predictions for both data and model drift
+- **Lambda code says**: 7 days for data drift, 30 days for model drift (ignored when deployed via script)
+- **Why 1 day?** Designed for daily scheduled runs where you want to detect drift in yesterday's predictions, not a rolling multi-day window
+
+**To use longer lookback windows in production:**
+1. Edit `scripts/deploy_lambda_container.sh` lines 315-316 to desired values (e.g., `"7"` and `"30"`)
+2. Redeploy: `cd scripts && ./deploy_lambda_container.sh your-email@example.com`
+3. Or update Lambda environment variables directly via AWS console / CLI after deployment
+
+**When to use each:**
+- **1 day (deployed default)**: Daily monitoring of yesterday's predictions, fast alerts for sudden drift
+- **7/30 days (code default)**: Smoothed trends, better statistical significance, tolerates low daily volume
+- **Incremental (notebook)**: Interactive testing without re-processing already-analyzed predictions
 - **Per-run traceability** — Each drift run gets a `monitoring_run_id` (`notebook-drift-*` from the notebook, `drift-*` from the Lambda). Both writers (a) record one row in `monitoring_responses` keyed on this id, and (b) backfill the same id onto the `inference_responses` rows the run scored — `WHERE monitoring_run_id IS NULL` makes this naturally delta-shaped, so each run only tags predictions never measured before. QuickSight can join the two tables on `monitoring_run_id` to show "what predictions did this run measure?". The **notebook additionally** scopes the *drift compute window itself* to `request_timestamp > MAX(monitoring_timestamp)`, letting you re-run drift detection on just the new predictions since the last run.
 - **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Writes summary to `monitoring_responses` (Athena is the durable source of truth — QuickSight reads directly from here), optionally logs metrics + Evidently HTML reports to MLflow, sends SNS alert if drift exceeds thresholds. Lambda scopes its drift compute to fixed 7/30-day rolling windows (data drift / model drift respectively); the `monitoring_run_id` backfill runs after every Lambda invocation.
 
@@ -347,6 +378,8 @@ sagemaker-automated-drift-and-trend-monitoring/
 ## MLOps Lineage & Reproducibility
 
 > The principle: **anything that participates in a model's lineage must be addressable by an immutable reference. Names are pointers. Pointers are fine for humans, fatal for joins.**
+
+**Production ML drift detection is only meaningful if the baseline is frozen per model version.** The training pipeline writes a `baseline.json` artifact alongside every model — recording the evaluation metrics, the Iceberg snapshot ID of the `evaluation_data` slice the model was scored on, the code commit SHA that produced the pipeline, and the feature schema version. This file is registered as the ModelPackage's `ModelStatistics` URI in the SageMaker AI Model Registry. On every run, the drift Lambda resolves what is currently serving production by walking `describe_endpoint` → `endpoint_config` → `model` → `ModelPackageName`, then loads that package's `baseline.json`. For data drift it reads `evaluation_data FOR VERSION AS OF` the pinned snapshot ID (Iceberg time travel) — so re-seeding the table later cannot retroactively corrupt the historical baseline. For model drift it compares current ROC-AUC against the metric in `baseline.json` — no hardcoded thresholds, no stale env vars. Every result is written to `monitoring_responses` stamped with the ModelPackage ARN and snapshot ID, and to MLflow with the same fields as tags. QuickSight can then slice ROC-AUC trends per model version without silently mixing baselines.
 
 Five immutable references anchor every model in this system:
 
