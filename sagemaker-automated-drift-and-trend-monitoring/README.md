@@ -252,6 +252,86 @@ Full command reference: `python main.py --help` and `python main.py <command> --
 - **Testing** — Verify endpoint responds correctly to test predictions
 
 ### Monitoring (Notebook 3)
+
+The monitoring system captures every prediction, integrates delayed ground truth, and runs automated drift analysis. All defaults are configurable via `src/config/config.yaml`.
+
+#### Real-Time Inference Capture
+
+Applications send transactions with **30 features** to the SageMaker AI endpoint. The **custom inference handler** runs the XGBoost model (solution works with any model framework) and returns the prediction immediately. In the background, the handler **asynchronously sends** the full prediction record to an Amazon SQS queue, adding **minimal latency** (~10-50ms) to the response path.
+
+**Logged fields per prediction:**
+- Input features (30 feature values as JSON)
+- Prediction (0/1 fraud classification)
+- Confidence score (probability_fraud, probability_non_fraud)
+- Model version, MLflow run ID, model package ARN
+- Endpoint name, request timestamp
+- Latency metrics (inference time, preprocessing time)
+- Transaction metadata (transaction_id, customer_id, amount)
+
+#### Buffered Batch Writes to Data Lake
+
+A **Lambda consumer** (`{ProjectName}-inference-logger`, deployed via CloudFormation) reads from the SQS queue in **configurable batches**:
+- **Batch size**: 10 messages (default)
+- **Batch window**: 30 seconds (max wait time)
+- Whichever threshold is hit first triggers a write
+
+Each batch is written to the **`inference_responses` Athena Iceberg table**, partitioned by date for efficient querying. This creates a complete, queryable audit trail of every prediction with:
+- Zero inference latency impact (async SQS)
+- 10-300x file count reduction vs. per-request logging
+- 62% faster Athena queries vs. SageMaker DataCaptureConfig
+
+#### Ground Truth Integration
+
+As fraud investigations complete (days or weeks later), confirmed labels flow into the **`ground_truth_updates`** table. Athena **MERGE statements** join confirmed labels back to the original inference records:
+
+```sql
+MERGE INTO inference_responses AS target
+USING ground_truth_updates AS source
+ON target.inference_id = source.inference_id
+WHEN MATCHED AND target.ground_truth IS NULL THEN
+  UPDATE SET 
+    target.ground_truth = source.actual_fraud,
+    target.ground_truth_timestamp = source.confirmation_timestamp,
+    target.days_to_ground_truth = date_diff('day', target.request_timestamp, source.confirmation_timestamp)
+```
+
+This tracking of **`days_since_prediction`** for each label makes accurate model performance calculation possible despite real-world label delays (1-30 days typical in fraud detection).
+
+#### Automated Daily Drift Analysis
+
+At **2 AM UTC daily** (configurable via EventBridge schedule - adjust based on volumes and monitoring granularity needed), EventBridge triggers a Lambda function (`{ProjectName}-drift-monitor`) that:
+
+1. **Queries recent inference data** from Athena
+   - Last N days configurable in `config.yaml` (deployed default: 1 day for both data/model drift)
+   - Filters: `WHERE ground_truth IS NOT NULL` for model drift (skipped if insufficient samples)
+
+2. **Loads frozen baseline distributions**
+   - Reads registered `baseline.json` from the deployed ModelPackage (via SageMaker Model Registry)
+   - **Time-travels** to exact Iceberg snapshots:
+     - `training_data FOR VERSION AS OF <training_snapshot_id>` (baseline for **data drift**)
+     - `evaluation_data FOR VERSION AS OF <evaluation_snapshot_id>` (baseline for **model drift**)
+   - No hardcoded baselines, no stale env vars - always monitors against the exact data the deployed model was trained/scored on
+
+3. **Runs Evidently AI drift detection**
+   - **DataDriftPreset**: Generates PSI (Population Stability Index) scores for every feature
+     - Uses `evidently>=0.4.22,<1` (see `pyproject.toml`)
+     - Statistical tests: Kolmogorov-Smirnov (numerical), Chi-square (categorical), Wasserstein distance
+   - **ClassificationPreset**: Generates ROC-AUC, precision, recall, F1, confusion matrix
+     - Only runs when ground truth is available
+     - Requires minimum sample size (default: 100 predictions with labels)
+
+4. **Compares against configurable thresholds**
+   - **Data drift threshold**: 0.2 (20% of features drifted = alert)
+   - **Model drift threshold**: 0.05 (5% ROC-AUC degradation = alert)
+   - Separate sensitivity levels for data vs. model drift
+   - All thresholds in `config.yaml` or Lambda environment variables
+
+5. **Writes results to multiple destinations**
+   - `monitoring_responses` Athena table (durable source of truth, read by QuickSight)
+   - MLflow artifacts (HTML Evidently reports) + metrics
+   - SNS topic (email/SMS alerts when thresholds exceeded)
+   - Backfills `monitoring_run_id` onto analyzed `inference_responses` rows for traceability
+
 - **Inference logging** — Every prediction → SQS → Lambda batches (10 msgs or 30s) → `inference_responses` Iceberg table
 - **Ground truth integration** — Simulated (dev) or fed from fraud investigation systems (prod) → `ground_truth_updates` table → MERGE into `inference_responses`
 - **Drift detection** — Evidently `DataDriftPreset` against the frozen `training_data` baseline (KS for numerics, chi-square for categoricals, PSI per feature) + `ClassificationPreset` against the frozen `evaluation_data` baseline (ROC, PR, confusion matrix). Thresholds configurable via `src/config/config.yaml`.
@@ -388,7 +468,9 @@ For high-volume real-time applications, you may want drift detection to run ever
 - **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Writes summary to `monitoring_responses` (Athena is the durable source of truth — QuickSight reads directly from here), optionally logs metrics + Evidently HTML reports to MLflow, sends SNS alert if drift exceeds thresholds. Lambda scopes its drift compute to fixed 7/30-day rolling windows (data drift / model drift respectively); the `monitoring_run_id` backfill runs after every Lambda invocation.
 
 ### Governance (Notebook 4)
-QuickSight dashboard with three tabs and **30 visuals** — each visual answers a specific "how is X drifting at Y granularity?" question. Every tab ends with a raw source-data table so you can inspect the exact `monitoring_responses` / `inference_responses` / `feature_drift_detail` rows powering the charts.
+QuickSight dashboard with four sheets and **30 visuals** — each visual answers a specific "how is X drifting at Y granularity?" question. Every sheet ends with a raw source-data table so you can inspect the exact `monitoring_responses` / `inference_responses` / `feature_drift_detail` rows powering the charts.
+
+> 📊 **Creating Custom Visualizations**: Beyond the pre-built 30 visuals, QuickSight Q allows you to create custom charts using natural language queries. See the [QuickSight Natural Language Query Guide](docs/screenshots/quicksight/README.md#creating-custom-visualizations-with-natural-language) for sample queries like "Show me top 5 drifted features over the last 30 days with a threshold line" or "Create a Sankey diagram showing prediction distribution shifts".
 
 **Tab 1 — Model Drift Trends (11 visuals):**
 
