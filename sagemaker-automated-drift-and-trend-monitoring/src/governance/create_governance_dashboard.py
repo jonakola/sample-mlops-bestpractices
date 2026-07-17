@@ -1070,6 +1070,21 @@ def create_feature_drift_detail_view(
 
     logger.info("Creating feature_drift_detail view...")
 
+    # Severity thresholds use `drift_magnitude` (test-agnostic × past
+    # threshold) rather than raw `drift_score` because Evidently auto-picks
+    # p-value tests (KS/Chi-square, lower=drift) for small samples and
+    # distance tests (Wasserstein/Jensen-Shannon, higher=drift) for large
+    # samples — raw score has opposite drift directions across features in
+    # the same run. drift_magnitude normalizes: 1.0 = at threshold,
+    # >1.0 = drifted, higher = more drifted, regardless of test.
+    #
+    # `per_feature_drift_scores` may hold two schemas depending on when the
+    # row was written:
+    #   * Legacy (pre-fix):  MAP<VARCHAR, DOUBLE>  → value is raw drift_score
+    #   * Current:           MAP<VARCHAR, JSON>    → value is
+    #                          {score, magnitude, method, threshold}
+    # We parse as JSON and use TRY_CAST so legacy scalar rows produce
+    # NULL magnitudes rather than failing the whole view.
     create_view_sql = f"""
 CREATE OR REPLACE VIEW {resolved_database}.{FEATURE_DRIFT_DETAIL_VIEW} AS
 SELECT
@@ -1084,18 +1099,26 @@ SELECT
     drifted_columns_share,
     baseline_roc_auc,
     current_roc_auc,
-    feature_name,                    -- Unpacked from JSON
-    drift_score,                     -- Unpacked from JSON
+    feature_name,
+    COALESCE(
+        TRY_CAST(json_extract_scalar(drift_data, '$.score') AS DOUBLE),
+        TRY_CAST(drift_data AS DOUBLE)
+    ) as drift_score,
+    TRY_CAST(json_extract_scalar(drift_data, '$.magnitude') AS DOUBLE) as drift_magnitude,
+    json_extract_scalar(drift_data, '$.method') as drift_method,
     CASE
-        WHEN drift_score > 0.25 THEN 'Significant'
-        WHEN drift_score > 0.1 THEN 'Moderate'
+        WHEN TRY_CAST(json_extract_scalar(drift_data, '$.magnitude') AS DOUBLE) >= 3.0 THEN 'Significant'
+        WHEN TRY_CAST(json_extract_scalar(drift_data, '$.magnitude') AS DOUBLE) >= 1.0 THEN 'Moderate'
         ELSE 'Low'
-    END as drift_severity,           -- Computed severity
-    CASE WHEN drift_score > 0.1 THEN true ELSE false END as drift_detected
+    END as drift_severity,
+    CASE
+        WHEN TRY_CAST(json_extract_scalar(drift_data, '$.magnitude') AS DOUBLE) >= 1.0 THEN true
+        ELSE false
+    END as drift_detected
 FROM {resolved_database}.monitoring_responses
 CROSS JOIN UNNEST(
-    CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, DOUBLE))
-) AS t(feature_name, drift_score)
+    CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, JSON))
+) AS t(feature_name, drift_data)
 WHERE per_feature_drift_scores IS NOT NULL
     AND per_feature_drift_scores != 'null'
     AND per_feature_drift_scores != '{{}}'
@@ -1262,6 +1285,8 @@ def create_feature_level_dataset(
                     {'Name': 'current_roc_auc', 'Type': 'DECIMAL'},
                     {'Name': 'feature_name', 'Type': 'STRING'},
                     {'Name': 'drift_score', 'Type': 'DECIMAL'},
+                    {'Name': 'drift_magnitude', 'Type': 'DECIMAL'},
+                    {'Name': 'drift_method', 'Type': 'STRING'},
                     {'Name': 'drift_severity', 'Type': 'STRING'},
                     {'Name': 'drift_detected', 'Type': 'BIT'},
                 ],

@@ -136,17 +136,18 @@ WHEN MATCHED AND target.ground_truth IS NULL THEN
 
 ### Step 9: Scheduled Drift Detection
 **Component:** EventBridge (2 AM) → Lambda (Drift Monitor) → Evidently AI  
-**Description:** EventBridge triggers Lambda daily at 2 AM UTC. Lambda queries recent inference data (last 7 days) and baseline training data, then runs Evidently AI drift analysis. Detects distribution shifts in input features using statistical tests (Kolmogorov-Smirnov, PSI).
+**Description:** EventBridge triggers Lambda daily at 2 AM UTC. Lambda queries recent inference data (last 7 days) and baseline training data, then runs Evidently AI drift analysis. Evidently auto-selects a statistical test per column based on column type and sample size: Kolmogorov-Smirnov / Chi-square (p-value tests) for small samples; Wasserstein / Jensen-Shannon (distance tests) for n ≥ 1000.
 
 **Key Details:**
 - Schedule: 2 AM UTC daily (configurable in config.yaml)
 - Trigger: EventBridge rule
-- Baseline: Random sample from `training_data` (5000 rows)
+- Baseline: Random sample from `training_data` (5000 rows, Iceberg-pinned via `training_snapshot_id`)
 - Current: Recent predictions from `inference_responses` (last 7 days)
 - Tests: Data drift (feature distributions) + Classification drift (model performance)
+- Per-feature verdict: `drift_magnitude ≥ 1.0` = drifted (test-agnostic; normalizes p-value and distance tests onto a single scale)
 - Thresholds: Configured in `config.yaml`
-  - `data_drift_share`: 0.3 (30% features drifted = alert)
-  - `model_drift_threshold`: 0.05 (5% accuracy drop = alert)
+  - `data_drift`: 0.20 (share of drifted features ≥ 20% = overall drift alert)
+  - `model_drift`: 0.05 (5% ROC-AUC degradation = alert)
 
 ---
 
@@ -161,27 +162,53 @@ WHEN MATCHED AND target.ground_truth IS NULL THEN
   - `drift_detected` (boolean)
   - `drifted_columns_count` (int)
   - `drifted_columns_share` (float, e.g., 0.35 = 35%)
-  - Per-feature drift scores (PSI values)
+  - `per_feature_drift_scores` (JSON: `{feature: {score, magnitude, method, threshold}}` — see below)
 - Table: `fraud_detection.monitoring_responses`
 - Partitioned by: day(check_timestamp)
 
 **Sample monitoring_responses record:**
 ```json
 {
-  "check_id": "drift_check_20260504_0200",
-  "check_timestamp": "2026-05-04T02:00:00Z",
-  "drift_detected": true,
+  "monitoring_run_id": "drift-20260504-020000",
+  "monitoring_timestamp": "2026-05-04T02:00:00Z",
+  "data_drift_detected": true,
   "drifted_columns_count": 12,
   "drifted_columns_share": 0.36,
-  "feature_drift_scores": {
-    "credit_limit": 74.47,
-    "merchant_category_code": 28.25,
-    "transaction_amount": 12.34
+  "per_feature_drift_scores": {
+    "credit_limit": {
+      "score": 0.4662,
+      "magnitude": 4.66,
+      "method": "Wasserstein distance (normed)",
+      "threshold": 0.1
+    },
+    "merchant_category_code": {
+      "score": 0.0099,
+      "magnitude": 5.06,
+      "method": "K-S p_value",
+      "threshold": 0.05
+    },
+    "transaction_amount": {
+      "score": 0.2562,
+      "magnitude": 2.56,
+      "method": "Jensen-Shannon distance",
+      "threshold": 0.1
+    }
   },
   "mlflow_run_id": "abc123...",
   "alert_sent": true
 }
 ```
+
+**Reading the record above:** Each feature carries four fields.
+- `score` is the raw statistic from whichever test Evidently ran — a p-value
+  (0-1) for KS/Chi-square, a distance (0-∞) for Wasserstein/Jensen-Shannon.
+  **Its drift direction depends on `method`** — do not compare across features.
+- `magnitude` is the test-agnostic "× past threshold" number.
+  **≥ 1.0 = drifted, higher = more drifted** — use this for dashboards, alerts,
+  and cross-feature comparison.
+- In this example all three features drifted; `merchant_category_code` is
+  the most drifted (magnitude 5.06 ≈ 5× past threshold) despite having the
+  smallest raw score (a p-value of 0.0099).
 
 ---
 
@@ -200,12 +227,12 @@ WHEN MATCHED AND target.ground_truth IS NULL THEN
   4. **Alert History**: Drift events and notifications
 
 **Key Visualizations:**
-- **Drift Score Trendlines**: Time-series of PSI scores per feature
-  - Identify sudden spikes (e.g., credit_limit = 74.47)
+- **Drift Magnitude Trendlines**: Time-series of `drift_magnitude` per feature (test-agnostic; 1.0 = at threshold, higher = more drifted)
+  - Identify sudden spikes (e.g., credit_limit magnitude jumps from 1.2 to 4.66)
   - Distinguish temporary anomalies from permanent shifts
-- **Feature Ranking**: Top drifting features by score
+- **Feature Ranking**: Top drifting features by magnitude (descending)
 - **Coverage Metrics**: % predictions with ground truth
-- **Performance Degradation**: Accuracy over time
+- **Performance Degradation**: ROC-AUC over time
 
 **Sample Queries:**
 ```sql
@@ -245,13 +272,28 @@ GROUP BY DATE_TRUNC('day', request_timestamp);
   "check_timestamp": "2026-05-04T02:00:00Z",
   "drift_share": 0.36,
   "drifted_features": [
-    {"feature": "credit_limit", "score": 74.47},
-    {"feature": "merchant_category_code", "score": 28.25}
+    {
+      "feature": "credit_limit",
+      "drift_magnitude": 4.66,
+      "drift_score": 0.4662,
+      "method": "Wasserstein distance (normed)"
+    },
+    {
+      "feature": "merchant_category_code",
+      "drift_magnitude": 5.06,
+      "drift_score": 0.0099,
+      "method": "K-S p_value"
+    }
   ],
   "mlflow_report_url": "https://mlflow.../artifacts/drift_report.html",
   "recommended_action": "Investigate data pipeline or consider model retraining"
 }
 ```
+
+`drift_magnitude` is the test-agnostic drift severity — sort/threshold on this
+field. `drift_score` and `method` are the raw statistic and the test that produced
+it, kept for audit. A p-value score of `0.0099` and a Wasserstein score of `0.4662`
+both correspond to ~5× past threshold; only `drift_magnitude` makes them comparable.
 
 ---
 

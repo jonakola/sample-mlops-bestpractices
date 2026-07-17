@@ -707,14 +707,33 @@ This project's **custom inference handler + SQS + Lambda** approach solves all t
 
 ### Statistical tests
 
-Drift detection uses Evidently's `DataDriftPreset`, which auto-selects a test **per column** based on column type and sample size — you don't pin one test globally. Common picks in this deployment:
+Drift detection uses Evidently's `DataDriftPreset`, which auto-selects a test **per column** based on column type and sample size — you don't pin one test globally. Verified picks from Evidently 0.7.21:
 
-- **Numerical features, small sample (< 1000 rows):** Kolmogorov–Smirnov p-value — flagged if p < 0.05. Sensitive to tail changes.
-- **Numerical features, large sample:** Wasserstein distance — flagged if distance > 0.1. More robust than KS at scale.
-- **Categorical features:** Chi-square p-value — flagged if p < 0.05.
-- **Population Stability Index (PSI):** Evidently reports PSI in the metadata but doesn't use it as the primary per-column flag anymore. The `data_drift_threshold` in `config.yaml` (default 0.2) is applied at the *aggregate* level (`drifted_columns_share`) to decide whether the overall drift verdict is "detected", not per-column.
+| Column type | Sample size | Test | Drift direction |
+|---|---|---|---|
+| Numeric | n < 1000 | Kolmogorov–Smirnov p-value | Lower = drift (p < 0.05) |
+| Numeric | n ≥ 1000 | Wasserstein distance (normed) | Higher = drift (> 0.1) |
+| Categorical | n < 1000 | Chi-square p-value | Lower = drift (p < 0.05) |
+| Categorical | n ≥ 1000 | Jensen-Shannon distance | Higher = drift (> 0.1) |
 
-Evidently exposes each column's chosen test in the report metadata; `evidently_reports.py` records both the raw `drift_score` (whatever the chosen test outputs — a p-value for tests, a distance for divergence metrics) and a normalized `drift_magnitude` field that means "how far past the threshold, ×1.0 = at threshold, higher = more drifted" regardless of which test was used. Dashboards sort/compare by magnitude to stay test-agnostic.
+**Read this twice** — the raw `drift_score` field means *opposite things* on different features in the same run. A KS-tested feature at `0.001` is severely drifted; a Wasserstein-tested feature at `0.001` is not drifted at all. That's why every downstream consumer (dashboards, alerts, sorts) uses `drift_magnitude` instead.
+
+### drift_score vs drift_magnitude — the two fields, and which one to trust
+
+Every per-feature record in `monitoring_responses.per_feature_drift_scores` is a JSON object with four fields:
+
+| Field | What it is | Range | Direction |
+|---|---|---|---|
+| `score` | Raw output from whichever test Evidently ran | 0–1 for p-values, 0–∞ for distances | Test-dependent (see table above) |
+| `magnitude` | Normalized "× past threshold" | 0–∞ | **Higher = more drift, always** |
+| `method` | Which test Evidently picked | e.g. `"K-S p_value"`, `"Wasserstein distance (normed)"` | — |
+| `threshold` | Evidently's per-column threshold (usually 0.05 or 0.1) | — | — |
+
+`magnitude` is `threshold / score` for p-value tests and `score / threshold` for distance tests, so `1.0` = right at the threshold, `>1.0` = drifted, higher = more drifted, regardless of test.
+
+**Use `magnitude` for anything you compare, sort, or threshold.** Only reach for raw `score` when you're debugging a specific feature and need to know what the underlying statistic actually said.
+
+Population Stability Index (PSI): Evidently sometimes reports PSI in report metadata, but it isn't the primary per-column flag. The `data_drift_threshold` in `config.yaml` (default 0.2) is applied at the *aggregate* level (`drifted_columns_share`) to decide whether the overall drift verdict is "detected" — not per-column.
 
 ### Thresholds (configurable in `src/config/config.yaml`)
 
@@ -747,12 +766,18 @@ For QuickSight consumers, the same content is available as time-series visuals d
 
 ### Reading drift scores in the dashboards
 
-Two aggregations of the same `drift_score` column tell you different things — the current dashboard has both, and switching between them in QuickSight (the aggregation dropdown on any drift-score visual) is a first-class debugging tool:
+The `feature_drift_detail` Athena view (backing every QuickSight drift visual) exposes three related numbers per feature — pick the one that matches your question:
 
-- **Average drift score per feature** (dashboard default) — the standard "how bad is this feature on average" view. `credit_limit` at 5.8 for a month means it's chronically slightly-drifted. Best for prioritizing which feature to investigate first.
-- **Variance (population) of drift score per feature** — how *unstable* the drift is. Same feature with average 30 and variance 0.4 means "consistently drifts at ~30" (systematic shift, retraining candidate). Same feature with average 30 and variance 1090 means "some runs 0, some runs 95" (sporadic — likely a data-quality issue on specific days). QuickSight computes this natively: click the value field on the visual → **Aggregate** → **Variance (Population)**.
+- **`drift_magnitude`** — the primary metric. Higher = more drift, `≥ 1.0` = past threshold, `≥ 3.0` = severe. Test-agnostic (same interpretation whether the underlying test was KS or Wasserstein). Use this for sort, filter, alert, and comparison.
+- **`drift_severity`** — a categorical roll-up of `drift_magnitude` (`Low` / `Moderate` / `Significant`). Use this for stacked bars and traffic-light colors.
+- **`drift_score`** — the raw test statistic (a p-value for KS/Chi-square, a distance for Wasserstein/JS). Kept for audit trail. **Not comparable across features** — do not sort or threshold on this column.
 
-For a systematic drift, Average is high AND Variance is low. For sporadic data-quality issues, Average is low AND Variance is high relative to it. Use both together when triaging.
+Two aggregations of `drift_magnitude` tell you different things — switching between them in QuickSight (the aggregation dropdown on any drift visual) is a first-class debugging tool:
+
+- **Average drift magnitude per feature** (dashboard default) — "how bad is this feature on average". `credit_limit` at `5.8` for a month means it's chronically ~6× past threshold. Best for prioritizing which feature to investigate first.
+- **Variance (population) of drift magnitude per feature** — how *unstable* the drift is. Same feature with average 30 and variance 0.4 = consistent systematic drift at ~30 (retraining candidate). Average 30 and variance 1090 = "some runs 0, some runs 95" (sporadic — likely a data-quality issue on specific days). QuickSight computes this natively: click the value field on the visual → **Aggregate** → **Variance (Population)**.
+
+For systematic drift: Average is high AND Variance is low. For sporadic data-quality issues: Average is low AND Variance is high relative to it. Use both together when triaging.
 
 ### PSI math, briefly
 
@@ -762,7 +787,17 @@ Evidently reports PSI in report metadata even when it uses a different test for 
 PSI = Σ over bins:  (actual% - expected%) × ln(actual% / expected%)
 ```
 
-Where `expected%` is the training distribution binned into deciles, and `actual%` is the current window binned the same way. A single bin where the current data has ×20 more mass than training contributes ≈ ln(20) ≈ 3 to the sum — that's how a single-bin explosion drives PSI to double digits. Values < 0.1 = no shift, 0.1–0.25 = moderate, > 0.25 = significant.
+Where `expected%` is the training distribution binned into deciles, and `actual%` is the current window binned the same way. A single bin where the current data has ×20 more mass than training contributes ≈ ln(20) ≈ 3 to the sum — that's how a single-bin explosion drives PSI to double digits.
+
+Industry-conventional PSI bands (only apply when the test actually is PSI — not to KS or Wasserstein scores):
+
+| PSI value | Interpretation |
+|---|---|
+| < 0.1 | No shift |
+| 0.1 – 0.25 | Moderate shift |
+| > 0.25 | Significant shift |
+
+To avoid confusing these test-specific numbers with universal thresholds, use `drift_magnitude` for comparison — it normalizes PSI, KS, and Wasserstein onto the same "× past threshold" scale.
 
 ### Tracing a drift verdict back to its predictions
 
