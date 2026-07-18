@@ -18,7 +18,6 @@ data within a configurable time window, rather than all historical data.
 """
 
 import json
-import math
 import os
 import boto3
 import time
@@ -57,8 +56,8 @@ MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
 MONITORING_SQS_QUEUE_URL = os.getenv('MONITORING_SQS_QUEUE_URL', '')
 
 # Thresholds
-DATA_DRIFT_THRESHOLD = float(os.getenv('DATA_DRIFT_THRESHOLD', '0.2'))  # Legacy PSI threshold — only used in the legacy matplotlib chart at line ~800
-KS_PVALUE_THRESHOLD = float(os.getenv('KS_PVALUE_THRESHOLD', '0.05'))  # Reserved — Evidently uses its own per-column threshold (0.05 by default)
+DATA_DRIFT_THRESHOLD = float(os.getenv('DATA_DRIFT_THRESHOLD', '0.2'))  # PSI threshold
+KS_PVALUE_THRESHOLD = float(os.getenv('KS_PVALUE_THRESHOLD', '0.05'))  # KS p-value threshold
 MODEL_DRIFT_THRESHOLD = float(os.getenv('MODEL_DRIFT_THRESHOLD', '0.05'))  # 5% degradation
 MIN_SAMPLES = int(os.getenv('MIN_SAMPLES', '100'))  # Minimum samples for analysis
 
@@ -485,16 +484,10 @@ def check_data_drift():
             drifted_features.append({
                 'feature': col,
                 'drift_score': info.get('drift_score', 0),
-                'drift_magnitude': info.get('drift_magnitude', 0),
-                'method': info.get('method', ''),
-                'threshold': info.get('threshold', 0),
             })
 
-    # Sort by magnitude descending (higher = more drifted, test-agnostic).
-    # Raw drift_score direction depends on the test Evidently picked
-    # (p-value tests → lower=drift; distance tests → higher=drift), so we
-    # sort on drift_magnitude which normalizes both directions.
-    drifted_features.sort(key=lambda x: x['drift_magnitude'], reverse=True)
+    # Sort by drift score ascending (lower p-value = more drifted)
+    drifted_features.sort(key=lambda x: x['drift_score'])
 
     features_analyzed = len(per_column)
     drifted_count = drift_result['drifted_columns_count']
@@ -720,15 +713,13 @@ def send_sns_alert(data_drift_result, model_drift_result):
             f"({data_drift_result['drift_percentage']:.1f}%)",
             f"Drifted Columns Share: {data_drift_result['drifted_columns_share']:.1%}",
             "",
-            "Top Drifted Features (by drift magnitude — ×past threshold):",
+            "Top Drifted Features (by drift score):",
         ])
 
         for feat_info in data_drift_result.get('drifted_features', []):
             message_lines.append(
                 f"  - {feat_info['feature']}: "
-                f"magnitude={feat_info.get('drift_magnitude', 0):.2f}× "
-                f"(score={feat_info['drift_score']:.4f}, "
-                f"method={feat_info.get('method', 'unknown')})"
+                f"drift_score={feat_info['drift_score']:.4f}"
             )
 
         message_lines.append("")
@@ -944,20 +935,11 @@ def log_to_mlflow(data_drift_result, model_drift_result):
                 mlflow.log_metric("drifted_columns_share", data_drift_result['drifted_columns_share'])
                 mlflow.log_metric("data_sample_size", data_drift_result['sample_size'])
 
-                # Log per-feature drift scores. We log both raw score (for
-                # audit) and magnitude (test-agnostic, higher = more drifted).
-                # Clamp inf → 1e6 because MLflow rejects non-finite metrics.
+                # Log per-feature drift scores
                 for feat_info in data_drift_result.get('drifted_features', []):
                     mlflow.log_metric(
                         f"drift_score_{feat_info['feature']}",
                         feat_info['drift_score'],
-                    )
-                    mag = feat_info.get('drift_magnitude', 0)
-                    if not math.isfinite(mag):
-                        mag = 1e6
-                    mlflow.log_metric(
-                        f"drift_magnitude_{feat_info['feature']}",
-                        mag,
                     )
 
                 # Log Evidently HTML report as artifact
@@ -1048,34 +1030,11 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     now = datetime.now()
     run_id = f"drift-{now.strftime('%Y%m%d-%H%M%S')}"
 
-    # Build per-feature drift details JSON.
-    #
-    # We store an object per feature — not just the raw score — because
-    # Evidently auto-selects the test per column (KS/Chi-square for small
-    # samples, Wasserstein/Jensen-Shannon for large samples). The raw score
-    # has opposite drift directions depending on which test ran:
-    #   * p-value tests (KS, Chi-square)      → lower score = more drift
-    #   * distance tests (Wasserstein, JS)    → higher score = more drift
-    # `magnitude` is the test-agnostic "× past threshold" number
-    # (1.0 = at threshold, higher = more drifted) — this is what downstream
-    # dashboards and severity thresholds should compare against. `score` and
-    # `method` are retained for audit / debugging.
-    # Clamp any inf magnitudes (from drift_score=0 edge cases in evidently_reports.py)
-    # to a large finite value — json.dumps emits `Infinity`, which Athena's
-    # json_parse then rejects when the SQL view reads the column back.
-    MAGNITUDE_CAP = 1e6
+    # Build per-feature drift scores JSON
     per_feature = {}
     if data_drift_result:
         for feat_info in data_drift_result.get('drifted_features', []):
-            mag = feat_info.get('drift_magnitude', 0)
-            if not math.isfinite(mag):
-                mag = MAGNITUDE_CAP
-            per_feature[feat_info['feature']] = {
-                'score': feat_info.get('drift_score', 0),
-                'magnitude': mag,
-                'method': feat_info.get('method', ''),
-                'threshold': feat_info.get('threshold', 0),
-            }
+            per_feature[feat_info['feature']] = feat_info.get('drift_score', 0)
 
     # Compute F1 from precision and recall if model drift available
     f1 = None
