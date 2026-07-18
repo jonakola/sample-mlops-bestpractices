@@ -114,23 +114,14 @@ def log_monitoring_to_mlflow(
                 mlflow.log_metric('drifted_columns_count', drift_results.get('drifted_columns_count', 0))
                 mlflow.log_metric('drifted_columns_share', drift_results.get('drifted_columns_share', 0))
 
-                # Log per-column drift scores. We log both raw score (for audit)
-                # and magnitude (test-agnostic, higher = more drifted). Compare
-                # magnitude across features; score is only meaningful in context
-                # of its own test method. MLflow rejects non-finite values, so
-                # clamp inf magnitudes to a large finite sentinel.
-                import math
+                # Log per-column drift scores
                 per_column_count = 0
                 for col, info in drift_results.get('per_column', {}).items():
                     mlflow.log_metric(f'drift_score_{col}', info.get('drift_score', 0))
-                    mag = info.get('drift_magnitude', 0)
-                    if not math.isfinite(mag):
-                        mag = 1e6
-                    mlflow.log_metric(f'drift_magnitude_{col}', mag)
                     per_column_count += 1
 
                 print(f"  ✓ Logged drift metrics (drifted: {drift_results.get('drifted_columns_count', 0)})")
-                print(f"  ✓ Logged {per_column_count} per-column drift scores + magnitudes")
+                print(f"  ✓ Logged {per_column_count} per-column drift scores")
 
                 # Save Evidently data drift HTML report as artifact
                 snapshot = drift_results.get('snapshot')
