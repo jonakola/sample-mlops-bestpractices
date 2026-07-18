@@ -152,8 +152,13 @@ WHEN MATCHED AND target.ground_truth IS NULL THEN
 ---
 
 ### Step 10: Drift Report Generation & Storage
-**Component:** Evidently AI → MLflow → Athena (monitoring_responses)  
-**Description:** Evidently generates interactive HTML reports with drift visualizations (feature distributions, drift scores, statistical tests). Reports are logged to MLflow as artifacts. Summary metrics (drift detected, feature count, drift scores) are written to `monitoring_responses` Athena table for historical tracking.
+**Component:** Evidently AI (in-process) → MLflow (HTML artifact + metrics) + Athena `monitoring_responses` (JSON + scalar metrics)
+**Description:** The Lambda invokes Evidently AI **once** per drift run. Evidently's `snapshot` object holds the full report (per-feature drift scores, classification metrics, and a renderable HTML view). That single in-memory snapshot is then fanned out to three destinations without recomputation:
+1. Evidently's `snapshot.save_html()` writes the interactive HTML to Lambda's `/tmp`; the Lambda uploads it to MLflow via `mlflow.log_artifact()`. Evidently's numeric outputs are logged as MLflow metrics on the same run.
+2. Evidently's per-feature drift dict is serialized to JSON and its classification metrics are extracted to scalar fields; both go into a single `monitoring_responses` row (via SQS → writer Lambda → Iceberg INSERT).
+3. Evidently's drift verdict formats the SNS alert text.
+
+QuickSight later reads the same `monitoring_responses` row — so the numbers on the dashboard and the numbers on the MLflow run are guaranteed to match (both are the same Evidently output; no drift metric is recomputed anywhere downstream).
 
 **Key Details:**
 - Report format: Interactive HTML (Evidently)

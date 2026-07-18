@@ -72,11 +72,13 @@ After running all notebooks (1-4), your QuickSight dashboard will look like this
 
 ![QuickSight Dashboard](./Mlops-4.png)
 
+> **Where do these numbers come from?** Every drift and classification metric in the dashboard is produced by **Evidently AI** inside the scheduled drift Lambda (`fraud-detection-drift-monitor`). Evidently's output is written to the `monitoring_responses` Athena table; QuickSight reads that table directly. There is no separate drift computation in the SQL or in QuickSight — the same numbers are logged to MLflow on the same run, so the dashboard and any MLflow experiment view of the same `monitoring_run_id` are guaranteed to agree.
+
 The dashboard shows:
-- **Model performance metrics**: Accuracy, precision, recall, F1, ROC-AUC
-- **Drift detection trends**: Data drift and model drift over time
-- **Inference metrics**: Volume and latency
-- **Feature-level drift magnitudes**: Per-feature drift analysis — visualized as `drift_magnitude` (× past threshold; 1.0 = at threshold, ≥ 3.0 = severe). Test-agnostic across features regardless of which statistical test Evidently used (KS, Chi-square, Wasserstein, or Jensen-Shannon)
+- **Model performance metrics** (from Evidently `ClassificationPreset`): Accuracy, precision, recall, F1, ROC-AUC
+- **Drift detection trends** (from Evidently `DataDriftPreset` and `ClassificationPreset`): Data drift and model drift over time
+- **Inference metrics** (from raw `inference_responses` Athena table, not Evidently): Volume and latency
+- **Feature-level drift magnitudes** (from Evidently `DataDriftPreset`, normalized to `drift_magnitude` in `evidently_reports.py`): Per-feature drift analysis — visualized as `drift_magnitude` (× past threshold; 1.0 = at threshold, ≥ 3.0 = severe). Test-agnostic across features regardless of which statistical test Evidently picked per column (KS, Chi-square, Wasserstein, or Jensen-Shannon)
 
 ---
 
