@@ -72,11 +72,13 @@ After running all notebooks (1-4), your QuickSight dashboard will look like this
 
 ![QuickSight Dashboard](./Mlops-4.png)
 
+> **Where do these numbers come from?** Every drift and classification metric in the dashboard is produced by **Evidently AI** inside the scheduled drift Lambda (`fraud-detection-drift-monitor`). Evidently's output is written to the `monitoring_responses` Athena table; QuickSight reads that table directly. There is no separate drift computation in the SQL or in QuickSight — the same numbers are logged to MLflow on the same run, so the dashboard and any MLflow experiment view of the same `monitoring_run_id` are guaranteed to agree.
+
 The dashboard shows:
-- **Model performance metrics**: Accuracy, precision, recall, F1, ROC-AUC
-- **Drift detection trends**: Data drift and model drift over time
-- **Inference metrics**: Volume and latency
-- **Feature-level drift scores**: Per-feature drift analysis
+- **Model performance metrics** (from Evidently `ClassificationPreset`): Accuracy, precision, recall, F1, ROC-AUC
+- **Drift detection trends** (from Evidently `DataDriftPreset` and `ClassificationPreset`): Data drift and model drift over time
+- **Inference metrics** (from raw `inference_responses` Athena table, not Evidently): Volume and latency
+- **Feature-level drift magnitudes** (from Evidently `DataDriftPreset`, normalized to `drift_magnitude` in `evidently_reports.py`): Per-feature drift analysis — visualized as `drift_magnitude` (× past threshold; 1.0 = at threshold, ≥ 3.0 = severe). Test-agnostic across features regardless of which statistical test Evidently picked per column (KS, Chi-square, Wasserstein, or Jensen-Shannon)
 
 ---
 
@@ -119,9 +121,9 @@ QuickSight Q allows you to create custom charts by asking questions in plain Eng
 **Top drifting features over time:**
 ```
 Show me a time series chart of the top 5 drifted features over the last 30 days 
-with drift scores on the y-axis, grouped by day. Include a horizontal line at 
-the 0.2 threshold. Add a second chart below showing daily prediction volume. 
-Highlight days where more than 3 features crossed the drift threshold in red.
+with drift_magnitude on the y-axis, grouped by day. Include a horizontal line at 
+magnitude=1.0 (the drift threshold). Add a second chart below showing daily 
+prediction volume. Highlight days where more than 3 features had magnitude > 1.0 in red.
 ```
 
 **What it generates:**
@@ -134,8 +136,8 @@ Highlight days where more than 3 features crossed the drift threshold in red.
 **Feature drift severity distribution:**
 ```
 Create a heatmap showing which features drifted each day over the last 14 days. 
-Features on rows, dates on columns, color intensity by PSI score. Highlight 
-any cell with PSI > 50 in dark red.
+Features on rows, dates on columns, color intensity by drift_magnitude. Highlight 
+any cell with drift_magnitude > 3.0 in dark red (severe drift — 3× past threshold).
 ```
 
 **What it generates:**
@@ -146,7 +148,7 @@ any cell with PSI > 50 in dark red.
 
 **Drift score evolution by model version:**
 ```
-Show drift score trends comparing model version 1 vs version 2 over the last 
+Show drift_magnitude trends comparing model version 1 vs version 2 over the last 
 7 days. Use separate lines for each version. Add a trend line to show if 
 drift is improving or worsening after retraining.
 ```
@@ -266,7 +268,7 @@ versions over the last 14 days. Group by model version, color by severity
 
 1. **Be specific about time ranges**: "last 30 days" vs. "last week" vs. "since Jan 1"
 2. **Specify chart type**: line chart, bar chart, heatmap, Sankey, scatter plot
-3. **Define thresholds explicitly**: "0.2 threshold", ">10 percentage points", ">50 PSI"
+3. **Define thresholds explicitly using `drift_magnitude`**: ">1.0 magnitude (drifted)", ">3.0 magnitude (severe)", ">10 percentage points AUC drop", ">20% of features drifted"
 4. **Request color coding**: "highlight in red", "color green when above baseline"
 5. **Ask for multiple visuals**: "Add a second chart below", "with a table underneath"
 6. **Include statistical summaries**: "with mean and median", "add trend line"
