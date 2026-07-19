@@ -123,6 +123,9 @@ Drift magnitude tells you *what changed*; SHAP (from `notebooks/7_optional_shap_
 
 **Takeaway:** ranked by drift alone you'd chase `customer_gender`; ranked by drift **×** importance the real culprit is `num_transactions_24h`. That intersection is the story the dashboard is built to tell.
 
+> ⚠️ **QuickSight is not "discovering" what SHAP found — the alignment above is a property of the demo.**
+> QuickSight only visualizes Evidently's distance / p-value statistics. It has no access to the model and no notion of feature importance. `num_transactions_24h` shows as the worst-drifted feature because the demo drift config (`src/config/config.yaml` → `drift_generation.default_drift`) applies an additive `shift: 1` to it, and that feature is a PCA component with near-unit standard deviation (Kaggle's `V14`), so a +1 shift becomes a ~10× Wasserstein magnitude. Change that config — bump another feature's factor, or lower this one's shift — and the QuickSight ranking will reshuffle on the very next drift run. **The SHAP chart won't move**, because SHAP is a property of the trained model and doesn't care about the drift-generation config. The demo aligns the two by construction; real production drift has no such guarantee. Use the *methodology* (cross-reference drift with SHAP before prioritizing), not the alignment shown here, as the takeaway.
+
 ---
 
 ## Troubleshooting
