@@ -80,6 +80,51 @@ The dashboard shows:
 
 ---
 
+## Reading the Dashboard: A Worked Drift Story
+
+The dashboard has three sheets — **Model Drift**, **Data Drift**, and **Feature Drift** — laid out to be read top-down so you go from *symptom* → *cause* → *culprit* → *does it matter*. Full-page exports of each sheet are in this folder ([`Model_Drift_Trends.pdf`](Model_Drift_Trends.pdf), [`Data_Drift_Trends.pdf`](Data_Drift_Trends.pdf), [`Feature_Drift_Trends.pdf`](Feature_Drift_Trends.pdf)); the cropped panels below live in [`narrative/`](narrative/). All numbers are a real run of this repo against the demo data — the same Evidently output stored in `monitoring_responses`.
+
+### Sheet 1 — Model Drift: is the model still healthy?
+
+ROC-AUC dropped from the frozen baseline **~0.98** to **~0.48** (≈51% degradation); the model-drift verdict fired on every run. That's the alarm — the other two sheets explain it.
+
+![ROC-AUC baseline vs current](narrative/model_rocauc_baseline_vs_current.png)
+
+### Sheet 2 — Data Drift: did the inputs move?
+
+**~93% of features drifted** (share ≈ 0.9–1.0, ~28 of 30 columns), with alerts firing. Broad input drift is the expected precursor to a performance collapse.
+
+![Data drift share over time](narrative/data_drift_share_over_time.png)
+
+### Sheet 3 — Feature Drift: which columns, ranked by `drift_magnitude`
+
+Every column is ranked by **`drift_magnitude`** — a test-agnostic "× past threshold" number that stays comparable no matter which test Evidently picked per column. `num_transactions_24h` leads at **~11×**; the "Highest Drift Magnitude" KPI shows the worst single feature-run at **12.76×**.
+
+![Top drifted features by magnitude](narrative/feat_top15_drifted.png)
+
+The severity heatmap and distribution give the same ranking as bands (Low `<1.0` / Moderate `≥1.0` / Significant `≥3.0`):
+
+![Feature drift severity distribution](narrative/feat_severity_dist.png)
+
+> ⚠️ **These visuals use `drift_magnitude`, never raw `drift_score`.** Evidently picks a different test per column (KS p-value vs. Wasserstein distance), and those raw scores move in opposite directions on incomparable scales — so ranking or averaging raw `drift_score` across features is meaningless. Earlier versions of these screenshots (`DriftScore-Average.png`, `DriftScore-Sum.png`, `DriftScore-Variance-Population.png`, `Feature_drift_time.png`) plotted raw score and were dominated by a single mis-scaled feature reading ~1000×; they were **removed** because they told a false story.
+
+### Sheet 3 + SHAP — does the drift actually matter?
+
+Drift magnitude tells you *what changed*; SHAP (from `notebooks/7_optional_shap_explainability.ipynb`) tells you *what the model relies on*. Cross-referencing the two is what turns a list of anomalies into a prioritized action list.
+
+![SHAP feature importance](narrative/shap_feature_importance.png)
+
+| Feature | Drift magnitude | SHAP importance (rank) | Verdict |
+|---|---|---|---|
+| `num_transactions_24h` | **×10.9** (worst) | **0.294 (#2)** | 🔴 High-risk — top-2 model driver *and* most-drifted → primary suspect for the AUC drop |
+| `account_age_days` | ×2.1 | **0.365 (#1)** | 🔴 High-risk — the single most important feature is drifting |
+| `customer_age`, `transaction_amount` | ×2.4, ×2.3 | 0.104, 0.083 (#7, #8) | 🟠 Important and drifting — monitor / retrain |
+| `customer_gender` | ×4.9 (2nd-worst drift) | **0.001 (#30, last)** | 🟢 Low-risk noise — heavily drifted but the model ignores it |
+
+**Takeaway:** ranked by drift alone you'd chase `customer_gender`; ranked by drift **×** importance the real culprit is `num_transactions_24h`. That intersection is the story the dashboard is built to tell.
+
+---
+
 ## Troubleshooting
 
 | Issue | Fix |
@@ -100,7 +145,7 @@ The dashboard shows:
 
 ## Creating Custom Visualizations with Natural Language
 
-QuickSight Q allows you to create custom charts by asking questions in plain English. This is especially powerful for ad-hoc drift analysis and trend exploration beyond the pre-built 30-visual dashboard.
+QuickSight Q allows you to create custom charts by asking questions in plain English. This is especially powerful for ad-hoc drift analysis and trend exploration beyond the pre-built 32-visual dashboard.
 
 ![Build Visuals with Natural Language](./BuildVisualsWithNaturalLanguage.png)
 
@@ -279,7 +324,7 @@ versions over the last 14 days. Group by model version, color by severity
 | Custom time ranges (last 14 days, specific date range) | Standard 7/30-day lookback windows |
 | Comparing multiple model versions side-by-side | Tracking single deployed model |
 | Creating one-off reports for stakeholders | Ongoing governance and compliance |
-| Exploring correlations not in the 30 visuals | Established drift/performance metrics |
+| Exploring correlations not in the 32 visuals | Established drift/performance metrics |
 | Testing "what-if" threshold changes | Production alerting at configured thresholds |
 
 ---
