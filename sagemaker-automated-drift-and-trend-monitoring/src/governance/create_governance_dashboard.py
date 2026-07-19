@@ -14,8 +14,9 @@ Functions:
 - grant_feature_drift_view_permissions — Lake Formation grant on the view
 - create_feature_level_dataset     — dataset backed by the feature_drift_detail view
 - create_accuracy_dataset          — CustomSql join of inference_responses + ground_truth_updates
-- build_inference_visuals / build_drift_visuals / build_feature_drift_visuals /
-  build_feature_level_visuals       — pure-data Sheet 1-4 visual definitions
+- build_model_drift_visuals / build_data_drift_visuals / build_feature_drift_visuals
+                                    — pure-data visual definitions for the 3 sheets
+                                      (Model Drift 11, Data Drift 10, Feature Drift 11 = 32 total)
 - create_or_update_analysis        — QuickSight analysis via the Definition API
 - publish_dashboard                — QuickSight dashboard via the Definition API
 - get_dashboard_embed_url          — best-effort embed URL generation
@@ -940,6 +941,7 @@ SELECT
     m.model_version,
     m.model_package_arn,
     m.evaluation_snapshot_id,
+    m.training_snapshot_id,
     m.drifted_columns_count,
     m.drifted_columns_share,
     m.features_analyzed,
@@ -964,7 +966,7 @@ LEFT JOIN {resolved_database}.{resolved_inference_table} i
     -- 24-hour time-window approximation here, which missed rows when runs
     -- were >24h apart and double-counted when runs overlapped.
     ON i.monitoring_run_id = m.monitoring_run_id
-GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 ORDER BY m.monitoring_timestamp DESC
 '''
 
@@ -1093,6 +1095,7 @@ SELECT
     model_version,
     model_package_arn,
     evaluation_snapshot_id,
+    training_snapshot_id,
     endpoint_name,
     data_drift_detected,
     drifted_columns_count,
@@ -1613,7 +1616,7 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
                             {'NumericalMeasureField': {'FieldId': 'm6-avg-auc', 'Column': dcol('current_roc_auc'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
                             {'NumericalMeasureField': {'FieldId': 'm6-avg-acc', 'Column': dcol('accuracy'),        'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
                             {'NumericalMeasureField': {'FieldId': 'm6-drate',   'Column': dcol('model_drift_detected'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
-                            {'NumericalMeasureField': {'FieldId': 'm6-runs',    'Column': dcol('monitoring_run_id'),    'AggregationFunction': {'SimpleNumericalAggregation': 'COUNT'}}},
+                            {'CategoricalMeasureField': {'FieldId': 'm6-runs',    'Column': dcol('monitoring_run_id'),    'AggregationFunction': 'COUNT'}},
                         ],
                     }
                 }
@@ -1638,8 +1641,8 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
                             {'CategoricalDimensionField': {'FieldId': 'm7-arn',   'Column': dcol('model_package_arn')}},
                             {'CategoricalDimensionField': {'FieldId': 'm7-tsnap', 'Column': dcol('training_snapshot_id')}},
                             {'CategoricalDimensionField': {'FieldId': 'm7-esnap', 'Column': dcol('evaluation_snapshot_id')}},
-                            {'CategoricalDimensionField': {'FieldId': 'm7-ddd',   'Column': dcol('data_drift_detected')}},
-                            {'CategoricalDimensionField': {'FieldId': 'm7-mdd',   'Column': dcol('model_drift_detected')}},
+                            {'NumericalDimensionField': {'FieldId': 'm7-ddd',   'Column': dcol('data_drift_detected')}},
+                            {'NumericalDimensionField': {'FieldId': 'm7-mdd',   'Column': dcol('model_drift_detected')}},
                         ],
                         'Values': [
                             {'NumericalMeasureField': {'FieldId': 'm7-auc', 'Column': dcol('current_roc_auc'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
@@ -1680,7 +1683,7 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
                 'FieldWells': {
                     'BarChartAggregatedFieldWells': {
                         'Category': [{'DateDimensionField': {'FieldId': 'm9-date', 'Column': acol('inference_date'), 'DateGranularity': 'DAY'}}],
-                        'Values':   [{'NumericalMeasureField': {'FieldId': 'm9-cnt', 'Column': acol('inference_id'), 'AggregationFunction': {'SimpleNumericalAggregation': 'COUNT'}}}],
+                        'Values':   [{'CategoricalMeasureField': {'FieldId': 'm9-cnt', 'Column': acol('inference_id'), 'AggregationFunction': 'COUNT'}}],
                         'Colors':   [{'CategoricalDimensionField': {'FieldId': 'm9-cat', 'Column': acol('prediction_category')}}],
                     }
                 },
@@ -1905,7 +1908,7 @@ def build_data_drift_visuals() -> List[Dict[str, Any]]:
                             {'CategoricalDimensionField': {'FieldId': 'd8-ep',    'Column': dcol('endpoint_name')}},
                             {'CategoricalDimensionField': {'FieldId': 'd8-mv',    'Column': dcol('model_version')}},
                             {'CategoricalDimensionField': {'FieldId': 'd8-sev',   'Column': dcol('drift_severity')}},
-                            {'CategoricalDimensionField': {'FieldId': 'd8-ddd',   'Column': dcol('data_drift_detected')}},
+                            {'NumericalDimensionField': {'FieldId': 'd8-ddd',   'Column': dcol('data_drift_detected')}},
                         ],
                         'Values': [
                             {'NumericalMeasureField': {'FieldId': 'd8-share', 'Column': dcol('drifted_columns_share'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
@@ -2068,7 +2071,11 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
                     }
                 },
                 'ReferenceLines': magnitude_ref_line_1,
-                'PrimaryYAxisDisplayOptions': {'AxisOptions': {'AxisLabel': 'drift_magnitude (x threshold)'}},
+                # Y-axis title goes in PrimaryYAxisLabelOptions (a
+                # ChartAxisLabelOptions), NOT PrimaryYAxisDisplayOptions.AxisOptions
+                # — the latter has no AxisLabel field and botocore rejects the
+                # whole CreateDashboard call with a ParamValidationError.
+                'PrimaryYAxisLabelOptions': {'Visibility': 'VISIBLE', 'AxisLabelOptions': [{'CustomLabel': 'drift_magnitude (x threshold)'}]},
             }
         }
     }
@@ -2262,7 +2269,7 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
                         'FontConfiguration': {'FontSize': {'Relative': 'SMALL'}},
                     },
                 }],
-                'PrimaryYAxisDisplayOptions': {'AxisOptions': {'AxisLabel': 'p-value (LOWER = more drift)'}},
+                'PrimaryYAxisLabelOptions': {'Visibility': 'VISIBLE', 'AxisLabelOptions': [{'CustomLabel': 'p-value (LOWER = more drift)'}]},
             }
         }
     }
@@ -2293,7 +2300,7 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
                         'FontConfiguration': {'FontSize': {'Relative': 'SMALL'}},
                     },
                 }],
-                'PrimaryYAxisDisplayOptions': {'AxisOptions': {'AxisLabel': 'distance (HIGHER = more drift)'}},
+                'PrimaryYAxisLabelOptions': {'Visibility': 'VISIBLE', 'AxisLabelOptions': [{'CustomLabel': 'distance (HIGHER = more drift)'}]},
             }
         }
     }
