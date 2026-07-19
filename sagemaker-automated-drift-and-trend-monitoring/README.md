@@ -755,6 +755,14 @@ The three QuickSight sheets are designed to be read in order — **model → dat
 
 ![ROC-AUC baseline vs current](docs/screenshots/quicksight/narrative/model_rocauc_baseline_vs_current.png)
 
+**1a. Why accuracy alone would have hidden this failure.** The Model Drift sheet also tracks accuracy, precision, recall, and F1 as separate lines — and this is the visual that shows why you need *all four*, not just accuracy:
+
+![Model performance metrics: accuracy stays high while precision, recall, F1 collapse](docs/screenshots/quicksight/narrative/model_perf_accuracy_masks_zero_precision_recall.png)
+
+Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and F1 all sit at 0** (they overlap into a single line along the x-axis). If the dashboard reported only accuracy, an on-call engineer would have concluded "0.85 — nothing wrong here" and moved on. The ROC-AUC + precision + recall + F1 lines together reveal the truth: the model has silently **collapsed to predicting the majority class (`non-fraud`) on every transaction**. It looks accurate because ~99.8% of real credit-card transactions genuinely are non-fraud in the Kaggle dataset — but *zero actual fraud is being caught*.
+
+> **Why does this happen, and is it an artifact of the ground-truth simulator?** No — the simulator's flip logic is symmetric (`~df.loc[error_indices, 'actual_fraud']` in `simulate_ground_truth_from_athena.py:170` flips both directions). The collapse to `precision = recall = 0` comes from the model side: under drifted inputs, XGBoost's fraud probability drops below the `0.5` decision threshold on essentially every row (ROC-AUC ~0.48 confirms near-random behavior on the score), so **every prediction is `0`**. Once every prediction is a single class, `TP = FP = 0` — and precision (TP/(TP+FP)) and recall (TP/(TP+FN)) are both structurally zero regardless of what the ground-truth side does. Accuracy stays high because the ground truth is mostly `0` too, and matching `0 → 0` counts as correct. **This is the class of failure that dashboards must catch and single-metric monitoring will miss** — the drift alert in this solution therefore fires on `roc_auc_degradation`, not on accuracy.
+
 **2. The inputs shifted — the "why".** The data-drift sheet shows **~93% of features drifted** (share ≈ 0.9–1.0, ~28 of 30 columns) with alerts firing. Widespread input drift is exactly what you'd expect to precede a performance collapse.
 
 ![Data drift share over time](docs/screenshots/quicksight/narrative/data_drift_share_over_time.png)
