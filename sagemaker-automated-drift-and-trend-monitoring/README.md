@@ -778,6 +778,15 @@ The three QuickSight sheets are designed to be read in order — **model → dat
 
 **The payoff:** ranked by drift alone, you'd chase `customer_gender` (2nd-worst drift). Ranked by drift **×** SHAP importance, the real culprit is `num_transactions_24h` — high drift on a feature the model leans on hard, which coherently explains the performance drop in step 1. This is the difference between a dashboard that lists anomalies and one that tells you what to do about them.
 
+> ⚠️ **The QuickSight ranking above is not "discovering" what SHAP found — read this carefully before drawing conclusions from the alignment.**
+>
+> QuickSight only visualizes Evidently's distance / p-value statistics between the baseline and current distributions. It has no access to the trained model and no notion of feature importance. The reason `num_transactions_24h` ranks worst in the drift chart *and* ranks #2 in SHAP is a **property of this demo, not an emergent discovery**:
+>
+> - The `drift_generation.default_drift` block in `src/config/config.yaml` (lines ~295-316) is what determines the shape and magnitude of drift injected into the demo dataset. The author picked five features to drift and tuned the shift/factor per feature. `num_transactions_24h` gets an additive `shift: 1` — and because that feature is a PCA component with near-unit standard deviation (Kaggle's `V14`, renamed for readability — see `src/setup/download_kaggle_dataset.py:71`), a +1 shift moves the distribution by ~1σ. Evidently's normed Wasserstein turns that into a magnitude of ~10×. The other drifted features get multiplicative factors of 1.1×–1.2× on wider-range columns, which produce magnitudes of only ~2–4×. **The ranking you see in the chart falls straight out of these config choices.**
+> - SHAP importance is computed offline against the trained model in `notebooks/7_optional_shap_explainability.ipynb`. It reflects what the model actually relies on, and it doesn't change if you edit the drift config.
+> - **What happens if you change the config?** Edit `config.yaml` — bump `distance_from_home_km`'s factor from 1.2 → 1.5, or drop `num_transactions_24h`'s shift from 1 → 0.1 — and the QuickSight ranking will reshuffle to match your new config on the very next drift run. **The SHAP chart will not move**, because retuning drift generation doesn't retrain the model. That asymmetry is the point: SHAP tells you what mattered to the model regardless of what synthetic scenario you're simulating this month.
+> - **What this teaches.** The demo is set up so drift alignment with SHAP looks meaningful because the config author drifted a feature that also happens to be top-SHAP. In real production drift there's no reason those would line up. The right takeaway is the *methodology* — always cross-reference drift with SHAP before prioritizing — not "QuickSight tends to surface important features."
+
 ### Reading drift scores in the dashboards
 
 Two aggregations of the same `drift_score` column tell you different things — the current dashboard has both, and switching between them in QuickSight (the aggregation dropdown on any drift-score visual) is a first-class debugging tool:
