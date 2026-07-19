@@ -90,6 +90,14 @@ ROC-AUC dropped from the frozen baseline **~0.98** to **~0.48** (≈51% degradat
 
 ![ROC-AUC baseline vs current](narrative/model_rocauc_baseline_vs_current.png)
 
+**Accuracy alone would have hidden this.** Sheet 1 also plots accuracy, precision, recall, and F1 as separate lines over time — and the pattern is the reason this dashboard tracks all four rather than accuracy alone:
+
+![Accuracy stays high while precision, recall, F1 collapse](narrative/model_perf_accuracy_masks_zero_precision_recall.png)
+
+Accuracy sits flat at **~0.85** across the window, while **precision, recall, and F1 all sit at 0** (they overlap into a single line along the x-axis). Under drifted inputs, the model has silently collapsed to always predicting the majority class (`non-fraud`): every prediction is `0`, so `TP = FP = 0` and precision / recall are structurally zero. Accuracy stays high because the ground truth is also mostly `non-fraud` — matching `0 → 0` counts as "correct" even though *zero actual fraud is being caught*. If the dashboard reported only accuracy, an on-call engineer would have concluded "0.85 — nothing wrong here" and missed the collapse entirely. This is why the drift-alert threshold in `config.yaml` is on `roc_auc_degradation`, not on accuracy.
+
+> The collapse is a model-side effect, not a simulator artifact. The ground-truth simulator in `src/drift_monitoring/simulate_ground_truth_from_athena.py` (line 170) flips labels *symmetrically* — `~df.loc[error_indices, 'actual_fraud']` toggles both directions with equal probability. Precision and recall are zero because the *model* has stopped predicting `1` at all under drift (ROC-AUC ~0.48 confirms it's near-random on the raw scores), so there's nothing on the prediction side to flip *from* — every flip on the ground-truth side happens to a row already predicted `0`.
+
 ### Sheet 2 — Data Drift: did the inputs move?
 
 **~93% of features drifted** (share ≈ 0.9–1.0, ~28 of 30 columns), with alerts firing. Broad input drift is the expected precursor to a performance collapse.
