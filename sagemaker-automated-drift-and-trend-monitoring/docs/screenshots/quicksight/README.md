@@ -118,9 +118,15 @@ The severity heatmap and distribution give the same ranking as bands (Low `<1.0`
 
 ### Sheet 3 + SHAP — does the drift actually matter?
 
-Drift magnitude tells you *what changed*; SHAP (from `notebooks/7_optional_shap_explainability.ipynb`) tells you *what the model relies on*. Cross-referencing the two is what turns a list of anomalies into a prioritized action list.
+Drift magnitude tells you *what changed*; SHAP (from `notebooks/7_optional_shap_explainability.ipynb`) tells you *what the model relies on*. Cross-referencing the two is what turns a list of anomalies into a prioritized action list. Two SHAP views help — the bar chart for **magnitude of impact**, and the beeswarm for **direction of impact**:
 
-![SHAP feature importance](narrative/shap_feature_importance.png)
+![SHAP feature importance — mean absolute magnitude](narrative/shap_feature_importance.png)
+
+*Bar chart: mean absolute SHAP.* `account_age_days` (0.37) and `num_transactions_24h` (0.29) dominate — those are the two features the model relies on most on average. This chart is *unsigned*: it collapses positive and negative pushes into a single bar, so it says nothing about which direction a high or low value nudges predictions.
+
+![SHAP beeswarm — signed SHAP by feature value](narrative/SHAP-beeswarm-plot.png)
+
+*Beeswarm: signed SHAP per prediction, dots colored by feature value (blue = low, red = high).* For `account_age_days` (top row), red points cluster on the left and blue points cluster on the right — **older accounts push predictions away from fraud, newer accounts push toward fraud** (the inverse relationship you'd expect from domain intuition). `num_transactions_24h` (row 2) has color mixed at both extremes, indicating a non-monotonic relationship — consistent with it being a PCA-transformed feature (Kaggle's `V14`). The beeswarm answers "how will current input shifts translate into prediction shifts?", which the bar chart alone can't.
 
 | Feature | Drift magnitude | SHAP importance (rank) | Verdict |
 |---|---|---|---|
@@ -149,8 +155,12 @@ Drift magnitude tells you *what changed*; SHAP (from `notebooks/7_optional_shap_
 
 ## Cost
 
-- **QuickSight Enterprise**: $24/user/month
-- **Additional viewers** (read-only): $5/month (capped)
+**QuickSight only:**
+
+- **QuickSight Enterprise Author**: $24/user/month
+- **Additional Readers** (read-only): $5/month (capped at $500/month per group)
+
+**Full solution cost context:** QuickSight is only one line item in the total. The full stack (SageMaker AI **MLflow Apps** — usage-priced serverless, not the older EC2-backed MLflow Tracking Server, so no hourly `ml.*` instance charge for tracking — plus SageMaker Serverless Inference, Lambda, EventBridge, Athena, S3, SQS, SNS, and QuickSight) sits at **~$60/month directional** for a demo-scale deployment. See the [Cost section in the main README](../../../README.md#cost) and [`docs/ARCHITECTURE_STEPS.md`](../../ARCHITECTURE_STEPS.md#-configuration-files) for the per-service breakdown.
 
 ---
 

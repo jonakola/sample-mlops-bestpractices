@@ -683,10 +683,18 @@ Then re-launch the JupyterLab Space (the lifecycle script re-runs and recreates 
 **ML models degrade silently in production.** Most teams invest in training pipelines but leave inference monitoring as an afterthought. This solution closes that gap with an end-to-end, open-source MLOps system:
 
 - **Open-source SDKs** (MLflow, Evidently, scikit-learn) — portable across AWS/GCP/Azure/on-prem, no vendor lock-in
-- **Serverless cost profile** — scales to zero; ~$30–50/month for 1000 predictions/day vs. $200+/month for managed alternatives
+- **Serverless, usage-priced cost profile** — every compute component scales to zero when idle. See the [Cost](#cost) section below for a per-service breakdown.
 - **Production-grade** — handles delayed ground truth (typical in fraud), concept drift, multi-feature drift, and alerting
 - **Custom inference handler** — automatic prediction logging with zero added latency (fire-and-forget SQS → batched Lambda → Athena)
 - **Independent monitoring backends** — MLflow (per-run experiment tracking, Evidently HTML artifacts) and QuickSight (Athena-backed dashboards) both consume the same `monitoring_responses` table; use either, both, or neither depending on workload (see [Choosing a Monitoring Backend](#choosing-a-monitoring-backend))
+
+### Cost
+
+The full solution — including SageMaker AI **MLflow Apps** (usage-priced, serverless — replaces the older EC2-backed MLflow Tracking Server, so there is no hourly `ml.*` instance charge for tracking), SageMaker **Serverless Inference**, Lambda, EventBridge, Athena, S3, SQS, SNS, and QuickSight — costs in the range of **~$60/month** for a demo-scale deployment, depending on instance type and usage patterns. This figure is directional and will vary based on inference volume, data retention policies, and regional pricing.
+
+Every compute component here is serverless or usage-priced: serverless endpoints charge only for actual invocations (no baseline instance hours), MLflow Apps charge per API call, Lambdas execute on-demand, Athena queries run only when triggered, and EventBridge incurs no cost between scheduled runs. High-volume deployments scale linearly with actual work, with no upfront capacity planning or reserved instances required. Compared to always-on managed MLOps platforms that carry per-hour compute floors ($200+/month baseline before any inference), the same architecture scales from a much lower floor.
+
+For a per-service directional breakdown, see [`docs/ARCHITECTURE_STEPS.md`](docs/ARCHITECTURE_STEPS.md#-configuration-files) → **Cost (Monthly)** section. The cost estimates are based on pricing as of this writing — for latest prices see [Amazon SageMaker AI pricing](https://aws.amazon.com/sagemaker/ai/pricing/).
 
 ### Why Not SageMaker `DataCaptureConfig`?
 
@@ -773,9 +781,17 @@ Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and 
 
 > **Why `drift_magnitude` and not raw `drift_score`?** Evidently picks a different test per column (KS p-value for some, Wasserstein distance for others), and those raw scores move in opposite directions and live on incomparable scales. Ranking on raw score is meaningless across a mixed set of tests — see [drift_score vs drift_magnitude](#drift_score-vs-drift_magnitude--the-two-fields-and-which-one-to-trust). (An earlier version of these screenshots plotted raw `drift_score` and was dominated by a single mis-scaled feature reading ~1000; those misleading images have been removed in favor of the magnitude-based views here.)
 
-**4. Does the drift actually matter? Cross-reference SHAP.** Drift magnitude tells you *what changed*; SHAP (from [`7_optional_shap_explainability.ipynb`](notebooks/7_optional_shap_explainability.ipynb)) tells you *what the model relies on*. The intersection is what you act on.
+**4. Does the drift actually matter? Cross-reference SHAP.** Drift magnitude tells you *what changed*; SHAP (from [`7_optional_shap_explainability.ipynb`](notebooks/7_optional_shap_explainability.ipynb)) tells you *what the model relies on*. The intersection is what you act on. Two complementary SHAP views are worth looking at side by side:
 
-![SHAP feature importance](docs/screenshots/quicksight/narrative/shap_feature_importance.png)
+![SHAP feature importance — mean absolute magnitude](docs/screenshots/quicksight/narrative/shap_feature_importance.png)
+
+*Bar chart — mean absolute SHAP value per feature.* Answers "**how much** does this feature move the prediction on average?" `account_age_days` (0.37) and `num_transactions_24h` (0.29) dominate — those two are what the model relies on most. But this chart shows magnitude only; positive and negative pushes get collapsed into one bar, so it can't tell you *which direction* a high or low value nudges the prediction.
+
+![SHAP beeswarm — signed impact by feature value](docs/screenshots/quicksight/narrative/SHAP-beeswarm-plot.png)
+
+*Beeswarm plot — signed SHAP per prediction, colored by feature value (blue = low, red = high).* Answers "**in which direction** does this feature push?" Each dot is one prediction; horizontal position is the SHAP value (right = pushes toward fraud, left = pushes toward non-fraud). For `account_age_days`, red dots (high account age) cluster on the left and blue dots (low account age) cluster on the right — meaning **older accounts push predictions away from fraud, newer accounts push toward fraud**, the inverse relationship you'd expect from domain intuition. `num_transactions_24h` (row 2) shows a more mixed pattern with color present at both extremes — its relationship is non-monotonic, consistent with it being a PCA-transformed feature (Kaggle's V14 renamed for readability).
+
+**When you combine the two SHAP views with the drift chart:** the bar chart tells you the drifted feature is important, the beeswarm tells you *how* current input shifts translate into prediction shifts. If a drifted feature's beeswarm shows a strong monotonic pattern (like `account_age_days`), you can predict the direction of the ROC-AUC collapse; if it's non-monotonic, the failure mode is harder to reason about analytically and retraining is usually the answer.
 
 | Feature | Drift magnitude | SHAP importance (rank) | Verdict |
 |---|---|---|---|
