@@ -468,9 +468,9 @@ For high-volume real-time applications, you may want drift detection to run ever
 - **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Writes summary to `monitoring_responses` (Athena is the durable source of truth — QuickSight reads directly from here), optionally logs metrics + Evidently HTML reports to MLflow, sends SNS alert if drift exceeds thresholds. Lambda scopes its drift compute to fixed 7/30-day rolling windows (data drift / model drift respectively); the `monitoring_run_id` backfill runs after every Lambda invocation.
 
 ### Governance (Notebook 4)
-QuickSight dashboard with four sheets and **30 visuals** — each visual answers a specific "how is X drifting at Y granularity?" question. Every sheet ends with a raw source-data table so you can inspect the exact `monitoring_responses` / `inference_responses` / `feature_drift_detail` rows powering the charts.
+QuickSight dashboard with three sheets and **32 visuals** — each visual answers a specific "how is X drifting at Y granularity?" question. Every sheet ends with a raw source-data table so you can inspect the exact `monitoring_responses` / `inference_responses` / `feature_drift_detail` rows powering the charts.
 
-> 📊 **Creating Custom Visualizations**: Beyond the pre-built 30 visuals, QuickSight Q allows you to create custom charts using natural language queries. See the [QuickSight Natural Language Query Guide](docs/screenshots/quicksight/README.md#creating-custom-visualizations-with-natural-language) for sample queries like "Show me top 5 drifted features over the last 30 days with a threshold line" or "Create a Sankey diagram showing prediction distribution shifts".
+> 📊 **Creating Custom Visualizations**: Beyond the pre-built 32 visuals, QuickSight Q allows you to create custom charts using natural language queries. See the [QuickSight Natural Language Query Guide](docs/screenshots/quicksight/README.md#creating-custom-visualizations-with-natural-language) for sample queries like "Show me top 5 drifted features over the last 30 days with a threshold line" or "Create a Sankey diagram showing prediction distribution shifts".
 
 **Tab 1 — Model Drift Trends (11 visuals):**
 
@@ -490,14 +490,16 @@ QuickSight dashboard with four sheets and **30 visuals** — each visual answers
 - **Inference volume vs drift share correlation** (combo chart) — spikes in traffic often cause spurious drift on small feature subsets.
 - **Source-data table** — every `monitoring_responses` row with fields for cross-referencing.
 
-**Tab 3 — Feature Drift Trends (9 visuals):**
+**Tab 3 — Feature Drift Trends (11 visuals):**
 
-- **Per-feature trend**: drift-score timeline colored by feature, feature-drift heatmap over time (features × days), highest-current drift KPI.
-- **Ranking**: top-15 most-drifting features (avg score), severity distribution across top-15.
-- **Max feature drift score per run** — the *worst* feature per run, colored by model version. Moderate averages (Tab 2's D1) can hide one catastrophically-drifted feature; this visual makes the peak visible.
+- **Per-feature trend**: `drift_magnitude` timeline colored by feature (reference line at magnitude = 1.0), feature-drift-magnitude heatmap over time (features × days), highest-magnitude KPI.
+- **Ranking**: top-15 most-drifting features (avg `drift_magnitude`), severity distribution across top-15 (`Low <1.0` / `Moderate ≥1.0` / `Significant ≥3.0`).
+- **Max feature drift magnitude per run** — the *worst* feature per run, colored by model version. Moderate averages (Tab 2's D1) can hide one catastrophically-drifted feature; this visual makes the peak visible.
 - **Repeat-offender features** — count of runs each feature has been flagged in. Chronic drifters → retraining candidates. One-off spikes → data-quality issues.
 - **Cross-model heatmap** — feature × `model_version` pivot. "Is this feature drifting consistently across our retrained models, or was it a training-artifact of one specific version?"
-- **Per-feature detail table** — every run × feature × severity × model_version row for lookup.
+- **Raw `drift_score` — p-value tests** (KS / Chi-square, filtered to `drift_method` containing `p_value`): LOWER = more drift, reference line at 0.05. For auditing the underlying test statistic on features where Evidently chose a p-value test.
+- **Raw `drift_score` — distance tests** (Wasserstein / Jensen-Shannon / PSI, filtered to `drift_method` containing `distance`): HIGHER = more drift, reference line at 0.1. The distance-test counterpart — kept separate because raw scores from the two test families are not comparable.
+- **Per-feature detail table** — every run × feature showing both raw `drift_score` AND normalized `drift_magnitude` alongside `drift_method` and severity, so you can see the raw statistic and the test-agnostic number side by side.
 
 **How the tabs work together:**
 
@@ -681,10 +683,18 @@ Then re-launch the JupyterLab Space (the lifecycle script re-runs and recreates 
 **ML models degrade silently in production.** Most teams invest in training pipelines but leave inference monitoring as an afterthought. This solution closes that gap with an end-to-end, open-source MLOps system:
 
 - **Open-source SDKs** (MLflow, Evidently, scikit-learn) — portable across AWS/GCP/Azure/on-prem, no vendor lock-in
-- **Serverless cost profile** — scales to zero; ~$30–50/month for 1000 predictions/day vs. $200+/month for managed alternatives
+- **Serverless, usage-priced cost profile** — every compute component scales to zero when idle. See the [Cost](#cost) section below for a per-service breakdown.
 - **Production-grade** — handles delayed ground truth (typical in fraud), concept drift, multi-feature drift, and alerting
 - **Custom inference handler** — automatic prediction logging with zero added latency (fire-and-forget SQS → batched Lambda → Athena)
 - **Independent monitoring backends** — MLflow (per-run experiment tracking, Evidently HTML artifacts) and QuickSight (Athena-backed dashboards) both consume the same `monitoring_responses` table; use either, both, or neither depending on workload (see [Choosing a Monitoring Backend](#choosing-a-monitoring-backend))
+
+### Cost
+
+The full solution — including SageMaker AI **MLflow Apps** (usage-priced, serverless — replaces the older EC2-backed MLflow Tracking Server, so there is no hourly `ml.*` instance charge for tracking), SageMaker **Serverless Inference**, Lambda, EventBridge, Athena, S3, SQS, SNS, and QuickSight — costs in the range of **~$60/month** for a demo-scale deployment, depending on instance type and usage patterns. This figure is directional and will vary based on inference volume, data retention policies, and regional pricing.
+
+Every compute component here is serverless or usage-priced: serverless endpoints charge only for actual invocations (no baseline instance hours), MLflow Apps charge per API call, Lambdas execute on-demand, Athena queries run only when triggered, and EventBridge incurs no cost between scheduled runs. High-volume deployments scale linearly with actual work, with no upfront capacity planning or reserved instances required. Compared to always-on managed MLOps platforms that carry per-hour compute floors ($200+/month baseline before any inference), the same architecture scales from a much lower floor.
+
+For a per-service directional breakdown, see [`docs/ARCHITECTURE_STEPS.md`](docs/ARCHITECTURE_STEPS.md#-configuration-files) → **Cost (Monthly)** section. The cost estimates are based on pricing as of this writing — for latest prices see [Amazon SageMaker AI pricing](https://aws.amazon.com/sagemaker/ai/pricing/).
 
 ### Why Not SageMaker `DataCaptureConfig`?
 
@@ -745,6 +755,62 @@ Every drift run persists to Athena (`monitoring_responses` + `inference_response
 
 For QuickSight consumers, the same content is available as time-series visuals directly off `monitoring_responses` — no MLflow required. Screenshots of the Evidently reports live in `docs/screenshots/evidently/`; the QuickSight dashboard screenshots (drift-score aggregation views, feature-drift timeline) live in `docs/screenshots/quicksight/`.
 
+### The drift story, end to end (worked example)
+
+The three QuickSight sheets are designed to be read in order — **model → data → feature → (explainability)** — so an on-call engineer can go from "is the model still healthy?" to "which feature broke it, and does it actually matter?" in four glances. The screenshots below are a real run of this repo against the fraud-detection demo data. Full-page exports live in [`docs/screenshots/quicksight/`](docs/screenshots/quicksight/) ([`Model_Drift_Trends.pdf`](docs/screenshots/quicksight/Model_Drift_Trends.pdf), [`Data_Drift_Trends.pdf`](docs/screenshots/quicksight/Data_Drift_Trends.pdf), [`Feature_Drift_Trends.pdf`](docs/screenshots/quicksight/Feature_Drift_Trends.pdf)); the cropped panels are in [`docs/screenshots/quicksight/narrative/`](docs/screenshots/quicksight/narrative/).
+
+**1. The model degraded — start here.** ROC-AUC collapsed from the frozen baseline of **~0.98** to a current **~0.48** — roughly a **51% degradation**, and the model-drift verdict fired on 100% of runs. This is the symptom; the next two sheets explain the cause.
+
+![ROC-AUC baseline vs current](docs/screenshots/quicksight/narrative/model_rocauc_baseline_vs_current.png)
+
+**1a. Why accuracy alone would have hidden this failure.** The Model Drift sheet also tracks accuracy, precision, recall, and F1 as separate lines — and this is the visual that shows why you need *all four*, not just accuracy:
+
+![Model performance metrics: accuracy stays high while precision, recall, F1 collapse](docs/screenshots/quicksight/narrative/model_perf_accuracy_masks_zero_precision_recall.png)
+
+Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and F1 all sit at 0** (they overlap into a single line along the x-axis). If the dashboard reported only accuracy, an on-call engineer would have concluded "0.85 — nothing wrong here" and moved on. The ROC-AUC + precision + recall + F1 lines together reveal the truth: the model has silently **collapsed to predicting the majority class (`non-fraud`) on every transaction**. It looks accurate because ~99.8% of real credit-card transactions genuinely are non-fraud in the Kaggle dataset — but *zero actual fraud is being caught*.
+
+> **Why does this happen, and is it an artifact of the ground-truth simulator?** No — the simulator's flip logic is symmetric (`~df.loc[error_indices, 'actual_fraud']` in `simulate_ground_truth_from_athena.py:170` flips both directions). The collapse to `precision = recall = 0` comes from the model side: under drifted inputs, XGBoost's fraud probability drops below the `0.5` decision threshold on essentially every row (ROC-AUC ~0.48 confirms near-random behavior on the score), so **every prediction is `0`**. Once every prediction is a single class, `TP = FP = 0` — and precision (TP/(TP+FP)) and recall (TP/(TP+FN)) are both structurally zero regardless of what the ground-truth side does. Accuracy stays high because the ground truth is mostly `0` too, and matching `0 → 0` counts as correct. **This is the class of failure that dashboards must catch and single-metric monitoring will miss** — the drift alert in this solution therefore fires on `roc_auc_degradation`, not on accuracy.
+
+**2. The inputs shifted — the "why".** The data-drift sheet shows **~93% of features drifted** (share ≈ 0.9–1.0, ~28 of 30 columns) with alerts firing. Widespread input drift is exactly what you'd expect to precede a performance collapse.
+
+![Data drift share over time](docs/screenshots/quicksight/narrative/data_drift_share_over_time.png)
+
+**3. Which features, and how badly.** The feature sheet ranks every column by **`drift_magnitude`** — a test-agnostic "× past threshold" number (`1.0` = at threshold, higher = worse) that stays comparable across features no matter which statistical test Evidently auto-picked. `num_transactions_24h` is the worst offender at **~11× threshold**; the KPI tile confirms the single worst feature-run at **12.76×**.
+
+![Top drifted features by magnitude](docs/screenshots/quicksight/narrative/feat_top15_drifted.png)
+
+> **Why `drift_magnitude` and not raw `drift_score`?** Evidently picks a different test per column (KS p-value for some, Wasserstein distance for others), and those raw scores move in opposite directions and live on incomparable scales. Ranking on raw score is meaningless across a mixed set of tests — see [drift_score vs drift_magnitude](#drift_score-vs-drift_magnitude--the-two-fields-and-which-one-to-trust). (An earlier version of these screenshots plotted raw `drift_score` and was dominated by a single mis-scaled feature reading ~1000; those misleading images have been removed in favor of the magnitude-based views here.)
+
+**4. Does the drift actually matter? Cross-reference SHAP.** Drift magnitude tells you *what changed*; SHAP (from [`7_optional_shap_explainability.ipynb`](notebooks/7_optional_shap_explainability.ipynb)) tells you *what the model relies on*. The intersection is what you act on. Two complementary SHAP views are worth looking at side by side:
+
+![SHAP feature importance — mean absolute magnitude](docs/screenshots/quicksight/narrative/shap_feature_importance.png)
+
+*Bar chart — mean absolute SHAP value per feature.* Answers "**how much** does this feature move the prediction on average?" `account_age_days` (0.37) and `num_transactions_24h` (0.29) dominate — those two are what the model relies on most. But this chart shows magnitude only; positive and negative pushes get collapsed into one bar, so it can't tell you *which direction* a high or low value nudges the prediction.
+
+![SHAP beeswarm — signed impact by feature value](docs/screenshots/quicksight/narrative/SHAP-beeswarm-plot.png)
+
+*Beeswarm plot — signed SHAP per prediction, colored by feature value (blue = low, red = high).* Answers "**in which direction** does this feature push?" Each dot is one prediction; horizontal position is the SHAP value (right = pushes toward fraud, left = pushes toward non-fraud). For `account_age_days`, red dots (high account age) cluster on the left and blue dots (low account age) cluster on the right — meaning **older accounts push predictions away from fraud, newer accounts push toward fraud**, the inverse relationship you'd expect from domain intuition. `num_transactions_24h` (row 2) shows a more mixed pattern with color present at both extremes — its relationship is non-monotonic, consistent with it being a PCA-transformed feature (Kaggle's V14 renamed for readability).
+
+**When you combine the two SHAP views with the drift chart:** the bar chart tells you the drifted feature is important, the beeswarm tells you *how* current input shifts translate into prediction shifts. If a drifted feature's beeswarm shows a strong monotonic pattern (like `account_age_days`), you can predict the direction of the ROC-AUC collapse; if it's non-monotonic, the failure mode is harder to reason about analytically and retraining is usually the answer.
+
+| Feature | Drift magnitude | SHAP importance (rank) | Verdict |
+|---|---|---|---|
+| `num_transactions_24h` | **×10.9** (worst) | **0.294 (#2)** | 🔴 **High-risk** — a top-2 driver of the model is also the most-drifted feature. This is the primary suspect for the ROC-AUC collapse. |
+| `account_age_days` | ×2.1 | **0.365 (#1)** | 🔴 **High-risk** — the single most important feature is drifting. |
+| `customer_age`, `transaction_amount` | ×2.4, ×2.3 | 0.104, 0.083 (#7, #8) | 🟠 Important *and* drifting — monitor / retrain. |
+| `customer_gender` | ×4.9 (2nd-worst drift) | **0.001 (#30, last)** | 🟢 **Low-risk noise** — heavily drifted, but the model effectively ignores this feature, so the drift is unlikely to affect predictions. Don't waste a retraining cycle on it. |
+
+**The payoff:** ranked by drift alone, you'd chase `customer_gender` (2nd-worst drift). Ranked by drift **×** SHAP importance, the real culprit is `num_transactions_24h` — high drift on a feature the model leans on hard, which coherently explains the performance drop in step 1. This is the difference between a dashboard that lists anomalies and one that tells you what to do about them.
+
+> ⚠️ **The QuickSight ranking above is not "discovering" what SHAP found — read this carefully before drawing conclusions from the alignment.**
+>
+> QuickSight only visualizes Evidently's distance / p-value statistics between the baseline and current distributions. It has no access to the trained model and no notion of feature importance. The reason `num_transactions_24h` ranks worst in the drift chart *and* ranks #2 in SHAP is a **property of this demo, not an emergent discovery**:
+>
+> - The `drift_generation.default_drift` block in `src/config/config.yaml` (lines ~295-316) is what determines the shape and magnitude of drift injected into the demo dataset. The author picked five features to drift and tuned the shift/factor per feature. `num_transactions_24h` gets an additive `shift: 1` — and because that feature is a PCA component with near-unit standard deviation (Kaggle's `V14`, renamed for readability — see `src/setup/download_kaggle_dataset.py:71`), a +1 shift moves the distribution by ~1σ. Evidently's normed Wasserstein turns that into a magnitude of ~10×. The other drifted features get multiplicative factors of 1.1×–1.2× on wider-range columns, which produce magnitudes of only ~2–4×. **The ranking you see in the chart falls straight out of these config choices.**
+> - SHAP importance is computed offline against the trained model in `notebooks/7_optional_shap_explainability.ipynb`. It reflects what the model actually relies on, and it doesn't change if you edit the drift config.
+> - **What happens if you change the config?** Edit `config.yaml` — bump `distance_from_home_km`'s factor from 1.2 → 1.5, or drop `num_transactions_24h`'s shift from 1 → 0.1 — and the QuickSight ranking will reshuffle to match your new config on the very next drift run. **The SHAP chart will not move**, because retuning drift generation doesn't retrain the model. That asymmetry is the point: SHAP tells you what mattered to the model regardless of what synthetic scenario you're simulating this month.
+> - **What this teaches.** The demo is set up so drift alignment with SHAP looks meaningful because the config author drifted a feature that also happens to be top-SHAP. In real production drift there's no reason those would line up. The right takeaway is the *methodology* — always cross-reference drift with SHAP before prioritizing — not "QuickSight tends to surface important features."
+
 ### Reading drift scores in the dashboards
 
 Two aggregations of the same `drift_score` column tell you different things — the current dashboard has both, and switching between them in QuickSight (the aggregation dropdown on any drift-score visual) is a first-class debugging tool:
@@ -752,7 +818,10 @@ Two aggregations of the same `drift_score` column tell you different things — 
 - **Average drift score per feature** (dashboard default) — the standard "how bad is this feature on average" view. `credit_limit` at 5.8 for a month means it's chronically slightly-drifted. Best for prioritizing which feature to investigate first.
 - **Variance (population) of drift score per feature** — how *unstable* the drift is. Same feature with average 30 and variance 0.4 means "consistently drifts at ~30" (systematic shift, retraining candidate). Same feature with average 30 and variance 1090 means "some runs 0, some runs 95" (sporadic — likely a data-quality issue on specific days). QuickSight computes this natively: click the value field on the visual → **Aggregate** → **Variance (Population)**.
 
-For a systematic drift, Average is high AND Variance is low. For sporadic data-quality issues, Average is low AND Variance is high relative to it. Use both together when triaging.
+- **Average drift magnitude per feature** (dashboard default) — "how bad is this feature on average". `num_transactions_24h` at `10.9` for a month means it's chronically ~11× past threshold. Best for prioritizing which feature to investigate first.
+- **Variance (population) of drift magnitude per feature** — how *unstable* the drift is. Same feature with average 3 and variance 0.1 = consistent systematic drift at ~3× (retraining candidate). Average 3 and variance 12 = "some runs near threshold, some runs 8×" (sporadic — likely a data-quality issue on specific days). QuickSight computes this natively: click the value field on the visual → **Aggregate** → **Variance (Population)**.
+
+For systematic drift: Average is high AND Variance is low. For sporadic data-quality issues: Average is low AND Variance is high relative to it. Use both together when triaging.
 
 ### PSI math, briefly
 
